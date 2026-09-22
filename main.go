@@ -1,4 +1,4 @@
-// Command leer-chat is the TavernLab Go thin core (Plan v2 P0).
+// Command tavernlab is the TavernLab Go thin core (Plan v2 P0).
 //
 //   - Serves embedded vanilla-JS frontend (llama.cpp-style UX, rewritten).
 //   - Prompt Engine: blocks -> Context Budget Engine -> raw -> one-api.
@@ -7,6 +7,8 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"embed"
 	"encoding/json"
@@ -585,12 +587,134 @@ func main() {
 		writeJSON(w, map[string]any{"ok": true, "archived": name})
 	})
 
+	// ---- Ollama shim for the TavernLab Flutter app (single floor) ----
+	// The app speaks native Ollama API only: GET /api/tags, POST /api/chat,
+	// POST /api/generate. Everything reuses the assemble+forward chain, so
+	// Budget/MCP/Audit/JSONL all apply. Session is fixed to the single floor.
+	mux.HandleFunc("/api/tags", func(w http.ResponseWriter, r *http.Request) {
+		s := rt.get()
+		ids := upstreamModelIDs(client, s.Upstream, s.APIKey)
+		models := make([]map[string]any, 0, len(ids))
+		now := time.Now().Format(time.RFC3339)
+		for _, id := range ids {
+			models = append(models, map[string]any{
+				"name": id, "model": id, "modified_at": now,
+				"size": 0, "digest": "-",
+				"details": map[string]any{
+					"parent_model": "", "format": "", "family": "tavernlab",
+					"families": []string{"tavernlab"},
+					"parameter_size": "", "quantization_level": "",
+				},
+			})
+		}
+		if models == nil {
+			models = []map[string]any{}
+		}
+		writeJSON(w, map[string]any{"models": models})
+	})
+
+	mux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			http.Error(w, "method not allowed", 405)
+			return
+		}
+		s := rt.get()
+		var in struct {
+			Model    string `json:"model"`
+			Stream   bool   `json:"stream"`
+			Messages []struct {
+				Role    string `json:"role"`
+				Content string `json:"content"`
+			} `json:"messages"`
+		}
+		b, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(b, &in)
+		model := firstNonEmpty(in.Model, "auto-gemini")
+		turns := make([]map[string]string, 0, len(in.Messages))
+		for _, m := range in.Messages {
+			role := m.Role
+			if role != "user" && role != "assistant" && role != "system" {
+				role = "user"
+			}
+			turns = append(turns, map[string]string{"role": role, "content": m.Content})
+		}
+		if q := lastUserText(turns); q != "" {
+			_ = st.AppendChat(singleFloor, "user", q)
+			if all, err := st.LoadAll(singleFloor); err == nil {
+				turns = chatToTurns(singleFloor, all)
+			}
+		}
+		blocks := injectChat(loadBlocks(), turns)
+		memInfo := resolveMCP(r.Context(), s, blocks, turns)
+		res := engine.Assemble(blocks, cfg.Ctx)
+		upBody, _ := json.Marshal(map[string]any{"model": model, "messages": res.Messages, "stream": in.Stream})
+		auditID := time.Now().Format("20060102-150405.000")
+
+		if !in.Stream {
+			status, respBody, usage := proxy.Forward(client, s.Upstream, s.APIKey, upBody, false, nil, nil)
+			reply := replyText(respBody)
+			_ = st.SaveAudit(toAudit(auditID, model, res, upBody, respBody, usage, memInfo))
+			_ = st.AppendChat(singleFloor, "assistant", reply)
+			w.WriteHeader(status)
+			writeJSON(w, map[string]any{
+				"model": model, "created_at": time.Now().Format(time.RFC3339),
+				"message": map[string]any{"role": "assistant", "content": reply},
+				"done_reason": "stop", "done": true,
+			})
+			return
+		}
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "streaming unsupported", 500)
+			return
+		}
+		status, full := forwardOllamaStream(client, s.Upstream, s.APIKey, upBody, model, w, flusher)
+		_ = status
+		rebuilt, _ := json.Marshal(map[string]any{
+			"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": full}}},
+			"stream_rebuilt": true, "via": "ollama-shim",
+		})
+		_ = st.SaveAudit(toAudit(auditID, model, res, upBody, rebuilt, nil, memInfo))
+		_ = st.AppendChat(singleFloor, "assistant", full)
+	})
+
+	// POST /api/generate {"model":"...","prompt":"..."} -> {"response":title,"done":true}
+	// Powers the app's AI chat titles. Fail-open: stub title from prompt head.
+	mux.HandleFunc("/api/generate", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			http.Error(w, "method not allowed", 405)
+			return
+		}
+		s := rt.get()
+		var in struct {
+			Model  string `json:"model"`
+			Prompt string `json:"prompt"`
+		}
+		b, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(b, &in)
+		model := firstNonEmpty(in.Model, "auto-gemini")
+		title := stubTitle(in.Prompt)
+		upBody, _ := json.Marshal(map[string]any{
+			"model": model, "max_tokens": 256,
+			"messages": []map[string]any{{"role": "user", "content": in.Prompt}},
+		})
+		if _, respBody, _ := proxy.Forward(client, s.Upstream, s.APIKey, upBody, false, nil, nil); len(respBody) > 0 {
+			if t := strings.TrimSpace(replyText(respBody)); t != "" {
+				title = firstLine(t, 60)
+			}
+		}
+		writeJSON(w, map[string]any{
+			"model": model, "created_at": time.Now().Format(time.RFC3339),
+			"response": title, "done": true,
+		})
+	})
+
 	// Static frontend.
 	sub, _ := fs.Sub(webFS, "web")
 	mux.Handle("/", http.FileServer(http.FS(sub)))
 
 	addr := fmt.Sprintf("0.0.0.0:%d", cfg.Port)
-	log.Printf("leer-chat listening on %s (upstream=%s data=%s)", addr, cfg.Upstream, cfg.DataRoot)
+	log.Printf("tavernlab listening on %s (upstream=%s data=%s)", addr, cfg.Upstream, cfg.DataRoot)
 	log.Fatal(http.ListenAndServe(addr, mux))
 }
 
@@ -752,6 +876,139 @@ func atoiDefault(s string, d int) int {
 		return d
 	}
 	return n
+}
+
+// singleFloor is the one conversation the Flutter app ever sees.
+// Web UI shares it when settings.char matches (default Leer乐儿).
+const singleFloor = "Leer乐儿"
+
+// upstreamModelIDs lists upstream /v1/models ids ("" upstream -> empty).
+func upstreamModelIDs(client *http.Client, upstream, apiKey string) []string {
+	if strings.TrimSpace(upstream) == "" {
+		return nil
+	}
+	req, err := http.NewRequest("GET", strings.TrimRight(upstream, "/")+"/v1/models", nil)
+	if err != nil {
+		return nil
+	}
+	if apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	var m struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if json.Unmarshal(b, &m) != nil {
+		return nil
+	}
+	var ids []string
+	for _, d := range m.Data {
+		if d.ID != "" {
+			ids = append(ids, d.ID)
+		}
+	}
+	return ids
+}
+
+// forwardOllamaStream POSTs an SSE chat body upstream and relays it as Ollama
+// NDJSON chunks ({"message":{"content":...},"done":false} … {"done":true}).
+// Returns upstream status + full assistant text (for audit/JSONL).
+func forwardOllamaStream(client *http.Client, upstream, apiKey string, upBody []byte, model string, w http.ResponseWriter, flusher http.Flusher) (int, string) {
+	req, err := http.NewRequest("POST", strings.TrimRight(upstream, "/")+"/v1/chat/completions", bytes.NewReader(upBody))
+	if err != nil {
+		return 500, ""
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 502, ""
+	}
+	defer resp.Body.Close()
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(resp.StatusCode)
+	emit := func(content string, done bool) {
+		line, _ := json.Marshal(map[string]any{
+			"model": model, "created_at": time.Now().Format(time.RFC3339),
+			"message":     map[string]any{"role": "assistant", "content": content},
+			"done_reason": map[string]any(nil), "done": done,
+		})
+		// Ollama omits done_reason until the end; keep key absent when streaming.
+		if !done {
+			line, _ = json.Marshal(map[string]any{
+				"model": model, "created_at": time.Now().Format(time.RFC3339),
+				"message": map[string]any{"role": "assistant", "content": content},
+				"done":    false,
+			})
+		} else {
+			line, _ = json.Marshal(map[string]any{
+				"model": model, "created_at": time.Now().Format(time.RFC3339),
+				"message": map[string]any{"role": "assistant", "content": ""},
+				"done_reason": "stop", "done": true,
+			})
+		}
+		_, _ = w.Write(append(line, '\n'))
+		flusher.Flush()
+	}
+	var full strings.Builder
+	sc := bufio.NewScanner(resp.Body)
+	sc.Buffer(make([]byte, 1024*1024), 1024*1024)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if payload == "" || payload == "[DONE]" {
+			continue
+		}
+		var chunk struct {
+			Choices []struct {
+				Delta struct {
+					Content string `json:"content"`
+				} `json:"delta"`
+			} `json:"choices"`
+		}
+		if json.Unmarshal([]byte(payload), &chunk) != nil {
+			continue
+		}
+		for _, c := range chunk.Choices {
+			if c.Delta.Content != "" {
+				full.WriteString(c.Delta.Content)
+				emit(c.Delta.Content, false)
+			}
+		}
+	}
+	emit("", true)
+	return resp.StatusCode, full.String()
+}
+
+// stubTitle falls back to the prompt head when the title LLM call fails.
+func stubTitle(prompt string) string { return firstLine(prompt, 40) }
+
+func firstLine(s string, n int) string {
+	s = strings.TrimSpace(s)
+	if i := strings.Index(s, "\n"); i >= 0 {
+		s = s[:i]
+	}
+	r := []rune(strings.TrimSpace(s))
+	if len(r) > n {
+		return string(r[:n]) + "…"
+	}
+	if s == "" {
+		return "新对话"
+	}
+	return s
 }
 
 // lastUserText returns the latest user utterance from chat turns.

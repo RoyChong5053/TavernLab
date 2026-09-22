@@ -1,10 +1,17 @@
-// leer-chat P1 frontend: vanilla JS, no build (rclone-friendly).
+// TavernLab P1 frontend: vanilla JS, no build (rclone-friendly).
 // Layout: left sidebar nav (llama.cpp-style) + one page at a time.
 // Chat is default. Avatar <img> plays animated webp natively.
 const $ = (s) => document.querySelector(s);
 const store = {
-  get(k, d) { try { const v = localStorage.getItem('leerchat.' + k); return v === null ? d : JSON.parse(v); } catch { return d; } },
-  set(k, v) { localStorage.setItem('leerchat.' + k, JSON.stringify(v)); },
+  // renamed leerchat.* -> tavernlab.*; old keys still read as fallback
+  get(k, d) {
+    try {
+      let v = localStorage.getItem('tavernlab.' + k);
+      if (v === null) v = localStorage.getItem('leerchat.' + k);
+      return v === null ? d : JSON.parse(v);
+    } catch { return d; }
+  },
+  set(k, v) { localStorage.setItem('tavernlab.' + k, JSON.stringify(v)); },
 };
 let blocks = [];
 const settings = Object.assign(

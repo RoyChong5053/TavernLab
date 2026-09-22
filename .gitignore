@@ -3,4 +3,23 @@ data/chats/
 data/settings.json
 .vectra_cache/
 leer-chat
+tavernlab
 *.log
+
+# Android app build artifacts / signing / generated
+android_app/build/
+android_app/android/build/
+android_app/.dart_tool/
+android_app/.flutter-plugins
+android_app/.flutter-plugins-dependencies
+android_app/android/key.properties
+android_app/android/local.properties
+android_app/android/.gradle/
+android_app/windows/flutter/ephemeral/
+android_app/linux/flutter/ephemeral/
+android_app/macos/Flutter/ephemeral/
+android_app/ios/Flutter/ephemeral/
+android_app/android_app.iml
+android_app/*.apk
+# upstream design-source bundles (not build inputs)
+android_app/assets/*.zip

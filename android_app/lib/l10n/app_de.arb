@@ -1,0 +1,401 @@
+{
+    "@@locale": "de",
+    "appTitle": "Ollama",
+    "@appTitle": {
+        "description": "Title of the application",
+        "context": "Visible in the side bar"
+    },
+    "optionNewChat": "Neuer Chat",
+    "@optionNewChat": {
+        "description": "Text displayed for new chat option",
+        "context": "Visible in the side bar"
+    },
+    "optionSettings": "Einstellungen",
+    "@optionSettings": {
+        "description": "Text displayed for settings option",
+        "context": "Visible in the side bar"
+    },
+    "optionNoChatFound": "Keine Chats gefunden",
+    "@optionNoChatFound": {
+        "description": "Text displayed when no chats are found",
+        "context": "Visible in the side bar"
+    },
+    "tipPrefix": "Tipp: ",
+    "@tipPrefix": {
+        "description": "Prefix for tips",
+        "context": "Visible in the sidebar"
+    },
+    "tip0": "Bearbeite Nachrichten durch langes Tippen",
+    "@tip0": {
+        "description": "First tip displayed in the sidebar",
+        "context": "Visible in the sidebar"
+    },
+    "tip1": "Lösche Nachrichten durch Doppeltippen",
+    "@tip1": {
+        "description": "Second tip displayed in the sidebar",
+        "context": "Visible in the sidebar"
+    },
+    "tip2": "Das Thema kann in den Einstellungen geändert werden",
+    "@tip2": {
+        "description": "Third tip displayed in the sidebar",
+        "context": "Visible in the sidebar"
+    },
+    "tip3": "Wähle ein multimodales Modell zum Anhängen von Bildern",
+    "@tip3": {
+        "description": "Fourth tip displayed in the sidebar",
+        "context": "Visible in the sidebar"
+    },
+    "tip4": "Chats werden automatisch gespeichert",
+    "@tip4": {
+        "description": "Fifth tip displayed in the sidebar",
+        "context": "Visible in the sidebar"
+    },
+    "takeImage": "Bild Aufnehmen",
+    "@takeImage": {
+        "description": "Text displayed for take image button",
+        "context": "Visible in attachment menu"
+    },
+    "uploadImage": "Bild Hochladen",
+    "@uploadImage": {
+        "description": "Text displayed for image upload button",
+        "context": "Visible in attachment menu"
+    },
+    "notAValidImage": "Kein gültiges Bild",
+    "@notAValidImage": {
+        "description": "Text displayed when an image is not valid",
+        "context": "Visible in the chat view"
+    },
+    "imageOnlyConversation": "Nur Bild Unterhaltung",
+    "@imageOnlyConversation": {
+        "description": "Title, if 'Generate Title' is executed on a conversation with no text messages",
+        "context": "Visible in the chat view"
+    },
+    "messageInputPlaceholder": "Nachricht",
+    "@messageInputPlaceholder": {
+        "description": "Placeholder text for message input",
+        "context": "Visible in the chat view"
+    },
+    "noModelSelected": "Kein Modell ausgewählt",
+    "@noModelSelected": {
+        "description": "Text displayed when no model is selected",
+        "context": "Visible in the chat view"
+    },
+    "noHostSelected": "Kein Host ausgewählt, öffne zum Auswählen die Einstellungen",
+    "@noSelectedHost": {
+        "description": "Text displayed when no host is selected",
+        "context": "Visible in the chat view, opens the settings dialog when clicked"
+    },
+    "noSelectedModel": "<selektor>",
+    "@noSelectedModel": {
+        "description": "Text displayed when no model is selected",
+        "context": "Visible in the chat view, opens the model dialog when clicked"
+    },
+    "newChatTitle": "Unbenannter Chat",
+    "@newChatTitle": {
+        "description": "Title of a new chat",
+        "context": "Visible in the new chat dialog"
+    },
+    "modelDialogAddModel": "Hinzufügen",
+    "@modelDialogAddModel": {
+        "description": "Text displayed for add model button",
+        "context": "Visible in the model dialog"
+    },
+    "modelDialogAddSteps": "Das Hinzufügen von Modellen wird nicht unterstützt. Gehe zu deinem Host-PC und füge dort Modelle hinzu.",
+    "@modelDialogAddSteps": {
+        "description": "Steps to add a new model",
+        "context": "Visible in the model dialog"
+    },
+    "deleteDialogTitle": "Chat löschen",
+    "@deleteDialogTitle": {
+        "description": "Title of the delete dialog",
+        "context": "Visible in the delete dialog"
+    },
+    "deleteDialogDescription": "Bist du sicher, dass du fortfahren möchtest? Dies wird alle Erinnerungen dieses Chats löschen und kann nicht rückgängig gemacht werden.\nUm diesen Dialog zu deaktivieren, besuche die Einstellungen.",
+    "@deleteDialogDescription": {
+        "description": "Description of the delete dialog",
+        "context": "Visible in the delete dialog"
+    },
+    "deleteDialogDelete": "Löschen",
+    "@deleteDialogDelete": {
+        "description": "Text displayed for delete button, should be capitalized",
+        "context": "Visible in the delete dialog"
+    },
+    "deleteDialogCancel": "Abbrechen",
+    "@deleteDialogCancel": {
+        "description": "Text displayed for cancel button, should be capitalized",
+        "context": "Visible in the delete dialog"
+    },
+    "dialogEnterNewTitle": "Gib bitte einen neuen Titel ein",
+    "@dialogEnterNewTitle": {
+        "description": "Text displayed as description for new title input",
+        "context": "Visible in the rename dialog"
+    },
+    "dialogEditMessageTitle": "Nachricht bearbeiten",
+    "@dialogEditMessageTitle": {
+        "description": "Title of the edit message dialog",
+        "context": "Visible in the edit message dialog"
+    },
+    "settingsTitleBehavior": "Verhalten",
+    "@settingsTitleBehavior": {
+        "description": "Title of the behavior settings section",
+        "context": "Visible in the settings view"
+    },
+    "settingsTitleInterface": "Oberfläche",
+    "@settingsTitleInterface": {
+        "description": "Title of the interface settings section",
+        "context": "Visible in the settings view"
+    },
+    "settingsTitleExport": "Exportieren",
+    "@settingsTitleExport": {
+        "description": "Title of the export settings section",
+        "context": "Visible in the settings view"
+    },
+    "settingsTitleContact": "Kontakt",
+    "@settingsTitleContact": {
+        "description": "Title of the contact settings section",
+        "context": "Visible in the settings view"
+    },
+    "settingsHost": "Host",
+    "@settingsHost": {
+        "description": "Text displayed as description for host input",
+        "context": "Visible in the settings view"
+    },
+    "settingsHostValid": "Gültiger Host",
+    "@settingsHostValid": {
+        "description": "Text displayed when the host is valid",
+        "context": "Visible in the settings view"
+    },
+    "settingsHostChecking": "Host wird Überprüft",
+    "@settingsHostChecking": {
+        "description": "Text displayed when the host is being checked",
+        "context": "Visible in the settings view"
+    },
+    "settingsHostInvalid": "Fehler: {type, select, url{Ungültige URL} host{Ungültiger Host} timeout{Request Fehlgeschlagen. Server Fehler} other{Request Fehlgeschlagen}}",
+    "@settingsHostInvalid": {
+        "description": "Text displayed when the host is invalid",
+        "context": "Visible in the settings view",
+        "placeholders": {
+            "type": {
+                "type": "String",
+                "description": "Type of the issue, either 'url' or 'other' (preferably 'host')"
+            }
+        }
+    },
+    "settingsHostHeaderTitle": "Host-Header festlegen",
+    "@settingsHostHeader": {
+        "description": "Text displayed as description for host header input",
+        "context": "Visible in the settings view"
+    },
+    "settingsHostHeaderInvalid": "Der eingegebene Text ist kein gültiges Header-JSON-Objekt",
+    "@settingsHostHeaderInvalid": {
+        "description": "Text displayed when the host header is invalid",
+        "context": "Visible in the settings view"
+    },
+    "settingsHostInvalidDetailed": "{type, select, url{Die eingegebene URL ist ungültig. Es handelt sich nicht um ein standardisiertes URL-Format.} other{Der eingegebene Host ist ungültig. Er kann nicht erreicht werden. Bitte überprüfe den Host und versuche es erneut.}}",
+    "@settingsHostInvalidDetailed": {
+        "description": "Text displayed when the host is invalid",
+        "context": "Visible in the settings view",
+        "placeholders": {
+            "type": {
+                "type": "String",
+                "description": "Type of the issue, either 'url' or 'other' (preferably 'host')"
+            }
+        }
+    },
+    "settingsSystemMessage": "Systemnachricht",
+    "@settingsSystemMessage": {
+        "description": "Text displayed as description for system message input",
+        "context": "Visible in the settings view"
+    },
+    "settingsDisableMarkdown": "Markdown deaktivieren",
+    "@settingsDisableMarkdown": {
+        "description": "Text displayed as description for disable markdown toggle",
+        "context": "Visible in the settings view"
+    },
+    "settingsBehaviorNotUpdatedForOlderChats": "Verhaltenseinstellungen werden nicht für ältere Chats aktualisiert. Starte einen neuen, um die Änderungen anzuwenden.",
+    "@settingsBehaviorNotUpdatedForOlderChats": {
+        "description": "Text displayed when behavior settings are not updated for older chats",
+        "context": "Visible in the settings view"
+    },
+    "settingsGenerateTitles": "Titel generieren",
+    "@settingsGenerateTitles": {
+        "description": "Text displayed as description for generate titles toggle",
+        "context": "Visible in the settings view"
+    },
+    "settingsAskBeforeDelete": "Vor Löschung des Chats fragen",
+    "@settingsAskBeforeDelete": {
+        "description": "Text displayed as description for ask before deletion toggle",
+        "context": "Visible in the settings view"
+    },
+    "settingsResetOnModelChange": "Zurücksetzen bei Modelländerung",
+    "@settingsResetOnModelChange": {
+        "description": "Text displayed as description for reset on model change toggle",
+        "context": "Visible in the settings view"
+    },
+    "settingsEnableEditing": "Nachrichtenbearbeitung aktivieren",
+    "@settingsEnableEditing": {
+        "description": "Text displayed as description for enable editing toggle",
+        "context": "Visible in the settings view"
+    },
+    "settingsShowTips": "Tipps in der Seitenleiste anzeigen",
+    "@settingsShowTips": {
+        "description": "Text displayed as description for show tips toggle",
+        "context": "Visible in the settings view"
+    },
+    "settingsShowModelTags": "Model-Tags anzeigen",
+    "@settingsShowModelTags": {
+        "description": "Text displayed as description for show model tags toggle",
+        "context": "Visible in the settings view"
+    },
+    "settingsBrightnessSystem": "System",
+    "@settingsBrightnessSystem": {
+        "description": "Text displayed as description for system brightness option",
+        "context": "Visible in the settings view"
+    },
+    "settingsBrightnessLight": "Hell",
+    "@settingsBrightnessLight": {
+        "description": "Text displayed as description for light brightness option",
+        "context": "Visible in the settings view"
+    },
+    "settingsBrightnessDark": "Dunkel",
+    "@settingsBrightnessDark": {
+        "description": "Text displayed as description for dark brightness option",
+        "context": "Visible in the settings view"
+    },
+    "settingsBrightnessRestartTitle": "Neustart Erforderlich",
+    "@settingsBrightnessRestartTitle": {
+        "description": "Title of the restart required dialog",
+        "context": "Visible in the settings view"
+    },
+    "settingsBrightnessRestartDescription": "Das Ändern des Themas erfordert einen Neustart.\nMöchtest du jetzt neu starten oder die Aktion abbrechen?",
+    "@settingsBrightnessRestartDescription": {
+        "description": "Description of the restart required dialog",
+        "context": "Visible in the settings view"
+    },
+    "settingsBrightnessRestartRestart": "Neustarten",
+    "@settingsBrightnessRestartRestart": {
+        "description": "Text displayed for restart button, should be capitalized",
+        "context": "Visible in the settings view"
+    },
+    "settingsBrightnessRestartCancel": "Abbrechen",
+    "@settingsBrightnessRestartCancel": {
+        "description": "Text displayed for cancel button, should be capitalized",
+        "context": "Visible in the settings view"
+    },
+    "settingsExportChats": "Chats exportieren",
+    "@settingsExportChats": {
+        "description": "Text displayed as description for export chats button",
+        "context": "Visible in the settings view"
+    },
+    "settingsImportChats": "Chats importieren",
+    "@settingsImportChats": {
+        "description": "Text displayed as description for import chats button",
+        "context": "Visible in the settings view"
+    },
+    "settingsImportChatsTitle": "Importieren",
+    "@settingsImportChatsTitle": {
+        "description": "Title of the import dialog",
+        "context": "Visible in the settings view"
+    },
+    "settingsImportChatsDescription": "Der folgende Schritt importiert die Chats aus der ausgewählten Datei. Dadurch werden die aktuellen Chats überschrieben.\nMöchtest du fortfahren?",
+    "@settingsImportChatsDescription": {
+        "description": "Description of the import dialog",
+        "context": "Visible in the settings view"
+    },
+    "settingsImportChatsImport": "Importieren und Löschen",
+    "@settingsImportChatsImport": {
+        "description": "Text displayed for import button, should be capitalized",
+        "context": "Visible in the settings view"
+    },
+    "settingsImportChatsCancel": "Abbrechen",
+    "@settingsImportChatsCancel": {
+        "description": "Text displayed for cancel button, should be capitalized",
+        "context": "Visible in the settings view"
+    },
+    "settingsImportChatsSuccess": "Chats erfolgreich importiert",
+    "@settingsImportChatsSuccess": {
+        "description": "Text displayed when chats are imported successfully",
+        "context": "Visible in the settings view"
+    },
+    "settingsUpdateCheck": "Nach Updates suchen",
+    "@settingsUpdateCheck": {
+        "description": "Text displayed as description for check for updates button",
+        "context": "Visible in the settings view"
+    },
+    "settingsUpdateChecking": "Suchen nach Updates ...",
+    "@settingsUpdateChecking": {
+        "description": "Text displayed while looking for updates",
+        "context": "Visible in the settings view"
+    },
+    "settingsUpdateLatest": "Du verwendest die neueste Version",
+    "@settingsUpdateLatest": {
+        "description": "Text displayed when the app is up to date",
+        "context": "Visible in the settings view"
+    },
+    "settingsUpdateAvailable": "Update verfügbar (v{version})",
+    "@settingsUpdateAvailable": {
+        "description": "Text displayed when an update is available",
+        "context": "Visible in the settings view",
+        "placeholders": {
+            "version": {
+                "type": "String",
+                "description": "Version number of the available update"
+            }
+        }
+    },
+    "settingsUpdateRateLimit": "Kann nicht überprüfen, API-Anforderungslimit",
+    "@settingsUpdateRateLimit": {
+        "description": "Text displayed when the API rate limit is exceeded",
+        "context": "Visible in the settings view"
+    },
+    "settingsUpdateIssue": "Ein Problem ist aufgetreten",
+    "@settingsUpdateIssue": {
+        "description": "Text displayed when an issue occurs while checking for updates",
+        "context": "Visible in the settings view"
+    },
+    "settingsUpdateDialogTitle": "Neue Version verfügbar",
+    "@settingsUpdateDialogTitle": {
+        "description": "Title of the update dialog",
+        "context": "Visible in the settings view"
+    },
+    "settingsUpdateDialogDescription": "Eine neue Version von Ollama ist verfügbar. Möchtest du sie jetzt herunterladen und installieren?",
+    "@settingsUpdateDialogDescription": {
+        "description": "Description of the update dialog",
+        "context": "Visible in the settings view"
+    },
+    "settingsUpdateChangeLog": "Versionshinweise",
+    "@settingsUpdateChangeLog": {
+        "description": "Text displayed as description for change log button",
+        "context": "Visible in the settings view"
+    },
+    "settingsUpdateDialogUpdate": "Aktualisieren",
+    "@settingsUpdateDialogUpdate": {
+        "description": "Text displayed for update button, should be capitalized",
+        "context": "Visible in the settings view"
+    },
+    "settingsUpdateDialogCancel": "Abbrechen",
+    "@settingsUpdateDialogCancel": {
+        "description": "Text displayed for cancel button, should be capitalized",
+        "context": "Visible in the settings view"
+    },
+    "settingsCheckForUpdates": "Beim Einstellungs-Öffnen Updates suchen",
+    "@settingsCheckForUpdates": {
+        "description": "Text displayed as description for check for updates toggle",
+        "context": "Visible in the settings view"
+    },
+    "settingsGithub": "GitHub",
+    "@settingsGithub": {
+        "description": "Text displayed as description for GitHub button",
+        "context": "Visible in the settings view"
+    },
+    "settingsReportIssue": "Einen Fehler melden",
+    "@settingsReportIssue": {
+        "description": "Text displayed as description for report issue button",
+        "context": "Visible in the settings view"
+    },
+    "settingsMainDeveloper": "Hauptentwickler",
+    "@settingsMainDeveloper": {
+        "description": "Text displayed as description for main developer button",
+        "context": "Visible in the settings view"
+    }
+}
