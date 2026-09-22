@@ -30,6 +30,7 @@ type Audit struct {
 	Raw       map[string]any `json:"raw_request"`
 	ReplyText string         `json:"reply_text,omitempty"`
 	Upstream  map[string]any `json:"upstream_usage,omitempty"`
+	Memory    map[string]any `json:"memory,omitempty"` // mcp recall: query/collection/hits/error
 }
 
 // BlockRow mirrors engine.BlockUsage for storage.

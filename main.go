@@ -7,6 +7,7 @@
 package main
 
 import (
+	"context"
 	"embed"
 	"encoding/json"
 	"flag"
@@ -18,11 +19,15 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/RoyChong5053/TavernLab/internal/engine"
 	"github.com/RoyChong5053/TavernLab/internal/expression"
+	"github.com/RoyChong5053/TavernLab/internal/mcp"
+	"github.com/RoyChong5053/TavernLab/internal/memory"
 	"github.com/RoyChong5053/TavernLab/internal/proxy"
+	"github.com/RoyChong5053/TavernLab/internal/settings"
 	"github.com/RoyChong5053/TavernLab/internal/store"
 )
 
@@ -32,21 +37,93 @@ var webFS embed.FS
 type Config struct {
 	Port          int
 	DataRoot      string
-	Upstream      string // one-api base URL
+	Upstream      string // one-api base URL (startup snapshot; live value in runtimeSettings)
 	APIKey        string
 	DefaultBlocks []engine.Block
 	Ctx           engine.ContextConfig
 }
 
+// runtimeSettings is the live config: edited via PUT /api/settings,
+// persisted to data/settings.json (0600, git-ignored — holds the API key).
+type runtimeSettings struct {
+	mu  sync.RWMutex
+	cur settings.Settings
+}
+
+func (r *runtimeSettings) get() settings.Settings {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.cur
+}
+
+func (r *runtimeSettings) setUpstream(u string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.cur.Upstream = u
+}
+
+func (r *runtimeSettings) setAPIKey(k string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.cur.APIKey = k
+}
+
+// update merges a PUT body (empty api_key = keep) and persists.
+func (r *runtimeSettings) update(root string, patch map[string]any) settings.Settings {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if v, ok := patch["upstream"].(string); ok && v != "" {
+		r.cur.Upstream = v
+	}
+	if v, ok := patch["api_key"].(string); ok && v != "" {
+		r.cur.APIKey = v
+	}
+	if v, ok := patch["rerank_url"].(string); ok && v != "" {
+		r.cur.RerankURL = v
+	}
+	if v, ok := patch["mcp_url"].(string); ok && v != "" {
+		r.cur.MCPURL = v
+	}
+	if v, ok := patch["mcp_collection"]; ok {
+		if s, ok := v.(string); ok {
+			r.cur.MCPCollection = s
+		}
+	}
+	if v, ok := patch["mcp_enabled"].(bool); ok {
+		r.cur.MCPEnabled = v
+	}
+	if v, ok := patch["mcp_topk"].(float64); ok && v > 0 {
+		r.cur.MCPTopK = int(v)
+	}
+	if v, ok := patch["mcp_threshold"].(float64); ok {
+		r.cur.MCPThreshold = v
+	}
+	_ = settings.Save(root, r.cur) // best-effort; key stays usable in memory regardless
+	return r.cur
+}
+
 func main() {
 	port := flag.Int("port", 8080, "listen port")
 	data := flag.String("data", "data", "data root (rclone this dir)")
-	upstream := flag.String("upstream", "http://127.0.0.1:3000", "one-api base URL")
+	upstream := flag.String("upstream", "", "one-api base URL (overrides settings file)")
+	apiKey := flag.String("apikey", "", "one-api key (overrides env ONEAPI_KEY / settings file)")
 	flag.Parse()
 
+	// Runtime settings: flags > env > data/settings.json > built-in defaults.
+	file := settings.Load(*data)
+	rt := &runtimeSettings{cur: file}
+	if *upstream != "" {
+		rt.setUpstream(*upstream)
+	}
+	if *apiKey != "" {
+		rt.setAPIKey(*apiKey)
+	} else if k := os.Getenv("ONEAPI_KEY"); k != "" {
+		rt.setAPIKey(k)
+	}
+
 	cfg := Config{
-		Port: *port, DataRoot: *data, Upstream: *upstream,
-		APIKey:        os.Getenv("ONEAPI_KEY"),
+		Port: *port, DataRoot: *data, Upstream: rt.get().Upstream,
+		APIKey:        rt.get().APIKey,
 		DefaultBlocks: engine.DefaultBlocks(),
 		Ctx:           engine.DefaultConfig(),
 	}
@@ -56,7 +133,77 @@ func main() {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, map[string]any{"ok": true, "time": time.Now().Format(time.RFC3339), "upstream": cfg.Upstream})
+		s := rt.get()
+		writeJSON(w, map[string]any{"ok": true, "time": time.Now().Format(time.RFC3339), "upstream": s.Upstream, "key_set": s.APIKey != ""})
+	})
+
+	// Runtime settings (data/settings.json, 0600, git-ignored).
+	// GET masks the key; PUT merges, empty api_key = keep old.
+	mux.HandleFunc("/api/settings", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case "GET":
+			s := rt.get()
+			writeJSON(w, map[string]any{
+				"upstream": s.Upstream, "api_key_set": s.APIKey != "",
+				"api_key_hint": settings.Mask(s.APIKey), "rerank_url": s.RerankURL,
+				"mcp_url": s.MCPURL, "mcp_collection": s.MCPCollection,
+				"mcp_enabled": s.MCPEnabled, "mcp_topk": s.MCPTopK, "mcp_threshold": s.MCPThreshold,
+			})
+		case "PUT":
+			b, _ := io.ReadAll(r.Body)
+			var patch map[string]any
+			if err := json.Unmarshal(b, &patch); err != nil {
+				http.Error(w, "bad settings json", 400)
+				return
+			}
+			s := rt.update(cfg.DataRoot, patch)
+			writeJSON(w, map[string]any{"ok": true, "upstream": s.Upstream, "api_key_set": s.APIKey != "", "api_key_hint": settings.Mask(s.APIKey)})
+		default:
+			http.Error(w, "method not allowed", 405)
+		}
+	})
+
+	// Model list, proxied through the backend so the browser never sees the key.
+	mux.HandleFunc("/api/models", func(w http.ResponseWriter, r *http.Request) {
+		s := rt.get()
+		req, err := http.NewRequest("GET", strings.TrimRight(s.Upstream, "/")+"/v1/models", nil)
+		if err != nil {
+			http.Error(w, "build models request failed", 500)
+			return
+		}
+		if s.APIKey != "" {
+			req.Header.Set("Authorization", "Bearer "+s.APIKey)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			http.Error(w, "upstream unreachable: "+err.Error(), 502)
+			return
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(resp.StatusCode)
+		_, _ = w.Write(b)
+	})
+
+	// Memory test probe: POST {"query":"..."} -> MCP chunks (for the Memory page button).
+	mux.HandleFunc("/api/memory/search", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			http.Error(w, "method not allowed", 405)
+			return
+		}
+		var in struct {
+			Query string `json:"query"`
+		}
+		b, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(b, &in)
+		s := rt.get()
+		hits, err := mcp.New(s.MCPURL).Search(r.Context(), in.Query, s.MCPCollection, s.MCPTopK, s.MCPThreshold)
+		if err != nil {
+			writeJSON(w, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		writeJSON(w, map[string]any{"ok": true, "collection": firstNonEmpty(s.MCPCollection, "(server default)"), "hits": hits})
 	})
 
 	// Blocks CRUD (file-backed): data/presets/default.json
@@ -100,6 +247,7 @@ func main() {
 	}
 
 	// Dry-run assemble: blocks -> raw + per-block tokens + dropped. No LLM call.
+	// Also resolves mcp blocks so Preview shows exactly what the model would get.
 	mux.HandleFunc("/api/assemble", func(w http.ResponseWriter, r *http.Request) {
 		var in struct {
 			Blocks  []engine.Block       `json:"blocks"`
@@ -119,20 +267,28 @@ func main() {
 			ctx = cfg.Ctx
 		}
 		blocks = injectChat(blocks, in.Chat)
+		memInfo := resolveMCP(r.Context(), rt.get(), blocks, in.Chat)
 		res := engine.Assemble(blocks, ctx)
-		writeJSON(w, res)
+		out := map[string]any{
+			"messages": res.Messages, "blocks": res.Blocks, "total_tokens": res.TotalTok,
+			"budget_tokens": res.BudgetTok, "dropped": res.Dropped, "prompt_text": res.PromptText,
+			"memory": memInfo,
+		}
+		writeJSON(w, out)
 	})
 
 	// Chat completions: assemble then forward to one-api, save audit.
 	mux.HandleFunc("/v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
+		s := rt.get()
 		body, _ := io.ReadAll(r.Body)
 		var in struct {
-			Model    any                `json:"model"`
-			Messages []map[string]any   `json:"messages"`
-			Stream   bool               `json:"stream"`
-			Session  string             `json:"session"`
-			Blocks   []engine.Block     `json:"blocks"`
+			Model    any                  `json:"model"`
+			Messages []map[string]any     `json:"messages"`
+			Stream   bool                 `json:"stream"`
+			Session  string               `json:"session"`
+			Blocks   []engine.Block       `json:"blocks"`
 			Context  engine.ContextConfig `json:"context"`
+			Chat     []map[string]string  `json:"chat"`
 		}
 		_ = json.Unmarshal(body, &in)
 		blocks := in.Blocks
@@ -143,10 +299,12 @@ func main() {
 		if ctx.MaxTokens == 0 {
 			ctx = cfg.Ctx
 		}
+		blocks = injectChat(blocks, in.Chat)
 		// If caller passed raw messages (classic path), wrap as chat block content.
 		if len(in.Messages) > 0 {
 			blocks = injectRawMessages(blocks, in.Messages)
 		}
+		memInfo := resolveMCP(r.Context(), s, blocks, in.Chat)
 		res := engine.Assemble(blocks, ctx)
 
 		// Build upstream body from assembled messages.
@@ -162,22 +320,32 @@ func main() {
 			_ = s
 		}
 
+		session := in.Session
+		if session == "" {
+			session = "main"
+		}
+		if q := lastUserText(in.Chat); q != "" {
+			_ = st.AppendChat(session, "user", q) // P1 JSONL persistence
+		}
+
 		if in.Stream {
 			flusher, ok := w.(http.Flusher)
 			if !ok {
 				http.Error(w, "streaming unsupported", 500)
 				return
 			}
-			status, rebuilt, _ := proxy.Forward(client, cfg.Upstream, cfg.APIKey, upBody, true, w, flusher)
+			status, rebuilt, _ := proxy.Forward(client, s.Upstream, s.APIKey, upBody, true, w, flusher)
 			_ = status
-			_ = st.SaveAudit(toAudit(auditID, model, res, upBody, rebuilt, nil))
+			_ = st.SaveAudit(toAudit(auditID, model, res, upBody, rebuilt, nil, memInfo))
+			_ = st.AppendChat(session, "assistant", rebuiltText(rebuilt))
 			return
 		}
-		status, respBody, usage := proxy.Forward(client, cfg.Upstream, cfg.APIKey, upBody, false, nil, nil)
+		status, respBody, usage := proxy.Forward(client, s.Upstream, s.APIKey, upBody, false, nil, nil)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
 		_, _ = w.Write(respBody)
-		_ = st.SaveAudit(toAudit(auditID, model, res, upBody, respBody, usage))
+		_ = st.SaveAudit(toAudit(auditID, model, res, upBody, respBody, usage, memInfo))
+		_ = st.AppendChat(session, "assistant", replyText(respBody))
 	})
 
 	// Expression classify: reply -> avatar label (rule + local reranker).
@@ -220,8 +388,7 @@ func main() {
 			return
 		}
 		base := filepath.Join(cfg.DataRoot, "characters", name)
-		if len(parts) == 2 && parts[1] == "avatar" && r.Method == "PUT" {
-			// multipart file=...  or raw body; save as avatar.webp (browser
+		if len(parts) == 2 && parts[1] == "avatar" && r.Method == "PUT" {			// multipart file=...  or raw body; save as avatar.webp (browser
 			// <img> plays animated webp natively, mp4 loop comes later).
 			_ = os.MkdirAll(base, 0o755)
 			var src io.Reader = r.Body
@@ -261,6 +428,25 @@ func main() {
 			writeJSON(w, map[string]any{"ok": true, "avatar_url": "/chars/" + name + "/" + fname})
 			return
 		}
+		if len(parts) == 2 && parts[1] == "meta" && r.Method == "PUT" {
+			// Per-character prefs: {"avatar_px": 64}. Stored in
+			// data/characters/<name>/meta.json (rclone-friendly).
+			b, _ := io.ReadAll(r.Body)
+			var meta map[string]any
+			if err := json.Unmarshal(b, &meta); err != nil {
+				http.Error(w, "bad meta json", 400)
+				return
+			}
+			_ = os.MkdirAll(base, 0o755)
+			cur := loadCharMeta(base)
+			if v, ok := meta["avatar_px"].(float64); ok && v >= 24 && v <= 480 {
+				cur["avatar_px"] = int(v)
+			}
+			mb, _ := json.MarshalIndent(cur, "", "  ")
+			_ = os.WriteFile(filepath.Join(base, "meta.json"), mb, 0o644)
+			writeJSON(w, map[string]any{"ok": true, "meta": cur})
+			return
+		}
 		// detail
 		avatarURL := ""
 		for _, cand := range []string{"avatar.webp", "avatar.png", "avatar.jpg", "avatar.gif"} {
@@ -280,7 +466,14 @@ func main() {
 		if exprs == nil {
 			exprs = []string{}
 		}
-		writeJSON(w, map[string]any{"name": name, "avatar_url": avatarURL, "expressions": exprs})
+		meta := loadCharMeta(base)
+		avatarPx := 48
+		if v, ok := meta["avatar_px"].(float64); ok && v >= 24 {
+			avatarPx = int(v)
+		} else if v, ok := meta["avatar_px"].(int); ok && v >= 24 {
+			avatarPx = v
+		}
+		writeJSON(w, map[string]any{"name": name, "avatar_url": avatarURL, "expressions": exprs, "avatar_px": avatarPx})
 	})
 	mux.Handle("/chars/", http.StripPrefix("/chars/", http.FileServer(http.Dir(filepath.Join(cfg.DataRoot, "characters")))))
 
@@ -366,7 +559,7 @@ func injectRawMessages(blocks []engine.Block, msgs []map[string]any) []engine.Bl
 	return injectChat(blocks, []map[string]string{{"role": "chat", "content": sb.String()}})
 }
 
-func toAudit(id string, model any, res engine.AssembleResult, upBody, respBody []byte, usage map[string]any) store.Audit {
+func toAudit(id string, model any, res engine.AssembleResult, upBody, respBody []byte, usage map[string]any, mem map[string]any) store.Audit {
 	var raw map[string]any
 	_ = json.Unmarshal(upBody, &raw)
 	var resp map[string]any
@@ -393,5 +586,130 @@ func toAudit(id string, model any, res engine.AssembleResult, upBody, respBody [
 		ID: id, Time: time.Now().Format(time.RFC3339), Model: mName,
 		Budget: res.BudgetTok, TotalTok: res.TotalTok, Blocks: rows,
 		Dropped: res.Dropped, Raw: raw, ReplyText: reply, Upstream: usage,
+		Memory: mem,
 	}
+}
+
+// firstNonEmpty picks the first non-blank string (for UI fallbacks).
+func firstNonEmpty(ss ...string) string {
+	for _, s := range ss {
+		if strings.TrimSpace(s) != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+// loadCharMeta reads data/characters/<name>/meta.json ({} when absent).
+func loadCharMeta(base string) map[string]any {
+	meta := map[string]any{}
+	b, err := os.ReadFile(filepath.Join(base, "meta.json"))
+	if err != nil {
+		return meta
+	}
+	_ = json.Unmarshal(b, &meta)
+	if meta == nil {
+		meta = map[string]any{}
+	}
+	return meta
+}
+
+// lastUserText returns the latest user utterance from chat turns.
+func lastUserText(chat []map[string]string) string {
+	for i := len(chat) - 1; i >= 0; i-- {
+		if chat[i]["role"] == "user" && strings.TrimSpace(chat[i]["content"]) != "" {
+			return chat[i]["content"]
+		}
+	}
+	return ""
+}
+
+// resolveMCP fills enabled mcp-source blocks by searching rag-mcp-server with
+// the latest user utterance. Fail-open: errors are recorded, chat continues.
+// Returns an audit-friendly summary (also served by /api/assemble preview).
+func resolveMCP(ctx context.Context, s settings.Settings, blocks []engine.Block, chat []map[string]string) map[string]any {
+	info := map[string]any{"enabled": false}
+	if !s.MCPEnabled {
+		return info
+	}
+	info["enabled"] = true
+	info["collection"] = firstNonEmpty(s.MCPCollection, "(server default)")
+	query := lastUserText(chat)
+	info["query"] = query
+	if query == "" {
+		info["hits"] = 0
+		return info
+	}
+	cli := mcp.New(firstNonEmpty(s.MCPURL, "http://192.168.10.2:8199"))
+	// Bound the recall so a hung MCP never stalls a chat turn.
+	type res struct {
+		hits []memory.Hit
+		err  error
+	}
+	ch := make(chan res, 1)
+	go func() {
+		h, err := cli.Search(ctx, query, s.MCPCollection, s.MCPTopK, s.MCPThreshold)
+		ch <- res{h, err}
+	}()
+	var hits []memory.Hit
+	select {
+	case r := <-ch:
+		if r.err != nil {
+			info["error"] = r.err.Error()
+			info["hits"] = 0
+			return info
+		}
+		hits = r.hits
+	case <-time.After(20 * time.Second):
+		info["error"] = "mcp search timeout (20s)"
+		info["hits"] = 0
+		return info
+	}
+	text := mcp.Format(hits)
+	for i := range blocks {
+		if blocks[i].Source.Type == "mcp" && blocks[i].Enabled {
+			if strings.Contains(blocks[i].Template, "{{rag}}") {
+				blocks[i].Content = strings.ReplaceAll(blocks[i].Template, "{{rag}}", text)
+			} else {
+				blocks[i].Content = text
+			}
+		}
+	}
+	info["hits"] = len(hits)
+	if len(hits) > 0 {
+		top := hits[0]
+		info["top"] = map[string]any{"score": top.Score, "source": top.Source, "excerpt": excerpt(top.Text, 160)}
+	}
+	return info
+}
+
+func excerpt(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…"
+}
+
+// replyText extracts the assistant text from a non-stream upstream body.
+func replyText(respBody []byte) string {
+	var resp map[string]any
+	_ = json.Unmarshal(respBody, &resp)
+	if resp == nil {
+		return ""
+	}
+	if ch, ok := resp["choices"].([]any); ok && len(ch) > 0 {
+		if m, ok := ch[0].(map[string]any); ok {
+			if msg, ok := m["message"].(map[string]any); ok {
+				s, _ := msg["content"].(string)
+				return s
+			}
+		}
+	}
+	return ""
+}
+
+// rebuiltText extracts assistant text from the stream-rebuilt audit body.
+func rebuiltText(rebuilt []byte) string {
+	return replyText(rebuilt)
 }

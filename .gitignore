@@ -1,5 +1,6 @@
 data/audit/
 data/chats/
+data/settings.json
 .vectra_cache/
 leer-chat
 *.log

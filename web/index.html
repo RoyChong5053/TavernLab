@@ -37,7 +37,8 @@
           <div class="chat-sub" id="chat-sub">Prompt IDE · 16k自适应预算</div>
         </div>
         <div class="chat-head-actions">
-          <label>模型 <input id="model" value="default" size="10"></label>
+          <label>模型 <input id="model" value="" size="14" list="model-list" placeholder="下拉选择…" autocomplete="off"></label>
+          <datalist id="model-list"></datalist>
           <label>会话 <input id="session" value="main" size="7"></label>
           <label class="stream"><input type="checkbox" id="stream"> 流式</label>
         </div>
@@ -63,6 +64,10 @@
             <input id="char-name" placeholder="角色名，如 Leer乐儿" size="16">
             <label class="filebtn">上传头像 <input type="file" id="char-file" accept=".webp,.png,.jpg,.jpeg,.gif" hidden></label>
           </div>
+          <div class="row">
+            <label>头像大小 <input id="char-avatar-px" type="range" min="32" max="240" step="4" value="48" style="width:140px"> <span id="char-avatar-px-v" class="meta">48px</span></label>
+            <button id="btn-avatar-size">保存大小</button>
+          </div>
           <div id="char-expr" class="meta"></div>
         </div>
       </div>
@@ -73,10 +78,20 @@
       <div id="budget" class="glass budget"></div>
       <div class="row">
         <button id="btn-assemble">试算 Assemble</button>
+        <button id="btn-preview">👁 Preview（模拟试算）</button>
         <button id="btn-save-blocks">保存</button>
         <button id="btn-reload-blocks">重载</button>
       </div>
+      <p class="meta">拖动卡片可排序（order 自动重写）。Preview = 当前编辑器状态的模拟试算；Audit = 真实发出的 raw 数据，两者不同。</p>
       <div id="blocks"></div>
+      <div id="preview-modal" class="modal hidden">
+        <div class="modal-box glass">
+          <div class="row modal-hd"><b>👁 Preview · 模拟试算（非账单，token 为估算）</b><button id="btn-preview-close">✕</button></div>
+          <div id="preview-memory" class="meta"></div>
+          <div id="preview-blocks" class="meta"></div>
+          <pre id="preview-text" class="preview-text"></pre>
+        </div>
+      </div>
     </section>
     <!-- AUDIT -->
     <section class="page" id="page-audit">
@@ -88,28 +103,40 @@
       </div>
       <pre id="audit" class="glass audit"></pre>
     </section>
-    <!-- MEMORY (P2 stub) -->
+    <!-- MEMORY -->
     <section class="page" id="page-memory">
-      <h2>Memory <small>P2：Distilled / Vectra只读 / MCP-Qdrant 统一 MemorySource</small></h2>
-      <div class="glass pad">
-        <div class="row"><label>Vectra collection <input id="mem-vectra" value="default" size="12"></label>
-        <label>MCP collection <input id="mem-mcp" value="personal_memory" size="14"></label></div>
-        <div class="row"><label><input type="checkbox" id="mem-mcp-on"> RAG走MCP-Qdrant（高端/LOQ）</label>
-        <label>top-k <input id="mem-topk" type="number" value="10" style="width:56px"></label></div>
-        <p class="meta">本页P1只存偏好（localStorage），P2 接入真正的检索 + 8-turn distilled。</p>
+      <h2>Memory <small>MCP-RAG 每轮自动检索你的发言注入 rag_mcp block</small></h2>
+      <div class="glass pad form">
+        <label>MCP 地址 <input id="mem-url" size="28" placeholder="http://192.168.10.2:8199"></label>
+        <label>Collection ID（空=服务端默认 global_memory） <input id="mem-collection" size="18" placeholder="空=默认"></label>
+        <div class="row">
+          <label>top-k <input id="mem-topk" type="number" value="10" style="width:56px"></label>
+          <label>threshold（-1=服务端默认） <input id="mem-threshold" type="number" step="0.01" value="-1" style="width:64px"></label>
+          <label><input type="checkbox" id="mem-enabled"> 每轮自动检索</label>
+        </div>
+        <div class="row">
+          <input id="mem-test-q" size="30" placeholder="测试查询，如：我上周睡眠咋样">
+          <button id="btn-mem-test">测试检索</button>
+          <button id="btn-mem-save" class="primary">保存</button>
+        </div>
+        <pre id="mem-test-out" class="preview-text">MCP 直连测试结果显示在这里。</pre>
+        <p class="meta">开关只决定“自动注不注入”；测试按钮随时手查。命中明细每轮记进 Audit → memory 字段。</p>
       </div>
     </section>
     <!-- SETTINGS -->
     <section class="page" id="page-settings">
       <h2>设置</h2>
       <div class="glass pad form">
-        <label>上游 One-API <input id="set-upstream" size="30" placeholder="http://127.0.0.1:3000"></label>
+        <label>上游 One-API <input id="set-upstream" size="30" placeholder="http://192.168.10.2:3000"></label>
+        <label>API Key <input id="set-apikey" type="password" size="30" placeholder="空=保持不变" autocomplete="off"></label>
+        <span id="set-key-state" class="meta"></span>
         <label>总预算 max_tokens <input id="set-max" type="number" value="16384" style="width:90px"></label>
         <label>回复预留 response_reserve <input id="set-reserve" type="number" value="4096" style="width:90px"></label>
         <label>保底轮数 <input id="set-minrounds" type="number" value="4" style="width:60px"></label>
         <label>Reranker（表情判定） <input id="set-rerank" size="26" value="http://127.0.0.1:11437"></label>
-        <div class="row"><button id="btn-settings-save" class="primary">保存偏好</button></div>
-        <p class="meta">偏好存浏览器 localStorage；上游地址只读显示（以后端启动参数为准）。</p>
+        <label>本机头像缩放 <input id="set-avatar-zoom" type="number" step="0.1" min="0.5" max="2" value="1" style="width:60px">（只影响本设备）</label>
+        <div class="row"><button id="btn-settings-save" class="primary">保存偏好</button><button id="btn-models-refresh">刷新模型列表</button></div>
+        <p class="meta">upstream/key 存后端 data/settings.json（0600，不进 git）；其余存浏览器 localStorage。</p>
       </div>
     </section>
   </main>
