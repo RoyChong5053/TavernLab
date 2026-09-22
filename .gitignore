@@ -1,6 +1,10 @@
 data/audit/
 data/chats/
 data/settings.json
+data/characters/
+data/presets/default.json
+data/memory/
+data/vectra/
 .vectra_cache/
 leer-chat
 tavernlab
