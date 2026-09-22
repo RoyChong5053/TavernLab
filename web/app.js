@@ -8,7 +8,7 @@ const store = {
 };
 let blocks = [];
 const settings = Object.assign(
-  { max_tokens: 16384, response_reserve: 4096, recent_chat_min_turns: 4, rerank_url: 'http://127.0.0.1:11437', char: 'Leer乐儿' },
+  { max_tokens: 16384, response_reserve: 4096, recent_chat_min_turns: 4, rerank_url: 'http://127.0.0.1:11437', char: 'Leer乐儿', model: '', stream: false, visible_turns: 10, user_name: 'RoyChong' },
   store.get('settings', {}),
 );
 
@@ -90,7 +90,8 @@ function ctxCfg() {
 async function assemble() {
   const r = await fetch('/api/assemble', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ blocks, context: ctxCfg(), chat: chatTurns() }),
+    // session set: full history slides server-side; what the model gets == preview
+    body: JSON.stringify({ blocks, context: ctxCfg(), session: settings.char }),
   });
   const res = await r.json();
   $('#budget').innerHTML = `<b>${res.total_tokens}</b> / ${res.budget_tokens} tokens · dropped: ${(res.dropped || []).join(', ') || '无'}` +
@@ -99,10 +100,10 @@ async function assemble() {
 }
 
 /* ---------- chat ---------- */
-function chatTurns() {
-  return [...document.querySelectorAll('#chat .msg')].map((m) => ({ role: m.dataset.role || 'user', content: m.querySelector('.body').textContent }));
-}
-function addMsg(role, text, who) {
+// Display window only: DOM holds the recent N turns; full context slides
+// server-side out of the JSONL, so window size never affects the model.
+let historyShown = 0; // messages already rendered (for "load earlier")
+function renderMsg(role, text, who, prepend) {
   const d = document.createElement('div');
   d.className = 'msg ' + (role === 'user' ? 'user' : role === 'assistant' ? 'ai' : 'sys');
   d.dataset.role = role;
@@ -113,10 +114,32 @@ function addMsg(role, text, who) {
   b.className = 'body';
   b.textContent = text;
   d.append(w, b);
-  $('#chat').appendChild(d);
-  d.scrollIntoView({ block: 'end' });
+  const box = $('#chat');
+  if (prepend && box.firstChild) box.insertBefore(d, box.firstChild);
+  else { box.appendChild(d); d.scrollIntoView({ block: 'end' }); }
   return d;
 }
+function addMsg(role, text, who) { return renderMsg(role, text, who, false); }
+async function loadHistory() {
+  historyShown = 0;
+  $('#chat').innerHTML = '';
+  await loadEarlier();
+  const box = $('#chat');
+  box.scrollTop = box.scrollHeight;
+}
+async function loadEarlier() {
+  const q = new URLSearchParams({ session: settings.char, limit: settings.visible_turns, before: historyShown });
+  const j = await (await fetch('/api/history?' + q)).json();
+  const msgs = j.messages || [];
+  if (!msgs.length) { $('#btn-earlier').textContent = '没有更早了'; return; }
+  const box = $('#chat');
+  const oldH = box.scrollHeight;
+  [...msgs].reverse().forEach((m) => renderMsg(m.role, m.text, null, true));
+  historyShown += msgs.length;
+  box.scrollTop = box.scrollHeight - oldH;
+  $('#btn-earlier').textContent = j.has_more ? '↑ 加载更早' : '没有更早了';
+}
+$('#btn-earlier').onclick = loadEarlier;
 async function classifyAndBadge(text) {
   try {
     const r = await fetch('/api/expression/classify', {
@@ -134,8 +157,9 @@ async function send() {
   if (!text) return;
   addMsg('user', text);
   ta.value = '';
-  const stream = $('#stream').checked;
-  const body = { model: $('#model').value, session: $('#session').value, stream, blocks, context: ctxCfg(), chat: chatTurns() };
+  // New path: only the fresh message goes over the wire; context slides server-side.
+  const stream = !!settings.stream;
+  const body = { model: settings.model || undefined, session: settings.char, text, stream, blocks, context: ctxCfg() };
   if (stream) {
     const r = await fetch('/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     const reader = r.body.getReader();
@@ -190,6 +214,21 @@ $('#btn-save-blocks').onclick = async () => {
   assemble();
 };
 $('#btn-reload-blocks').onclick = loadBlocks;
+
+/* ---------- export / archive (ST new-chat workflow) ---------- */
+$('#btn-export').onclick = () => {
+  const q = new URLSearchParams({ session: settings.char, user: settings.user_name || 'user' });
+  window.open('/api/export?' + q, '_blank');
+};
+$('#btn-archive').onclick = async () => {
+  if (!confirm(`归档「${settings.char}」当前楼并另起新楼？归档文件进 data/chats/archive/，可随时导出。`)) return;
+  const j = await (await fetch('/api/archive', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ session: settings.char }),
+  })).json();
+  if (j.ok) { addMsg('sys', j.archived ? `已归档：${j.archived}，新楼开始。` : '当前楼是空的，直接开聊。'); loadHistory(); }
+  else addMsg('sys', '归档失败。');
+};
 
 /* ---------- audit ---------- */
 async function refreshAudit() {
@@ -258,8 +297,8 @@ $('#btn-avatar-size').onclick = async () => {
   if (j.meta) { charAvatarPx = px; applyAvatarSize(); }
 };
 $('#btn-char-refresh').onclick = refreshChars;
-$('#char-list').onchange = (e) => { $('#char-name').value = e.target.value; settings.char = e.target.value; store.set('settings', settings); viewChar(); syncChatHead(); };
-$('#btn-char-new').onclick = () => { const n = $('#char-name').value.trim(); if (n) { settings.char = n; store.set('settings', settings); viewChar(); syncChatHead(); } };
+$('#char-list').onchange = (e) => { $('#char-name').value = e.target.value; settings.char = e.target.value; store.set('settings', settings); viewChar(); syncChatHead(); loadHistory(); };
+$('#btn-char-new').onclick = () => { const n = $('#char-name').value.trim(); if (n) { settings.char = n; store.set('settings', settings); viewChar(); syncChatHead(); loadHistory(); } };
 $('#char-file').onchange = async (e) => {
   const f = e.target.files[0];
   if (!f) return;
@@ -311,23 +350,28 @@ $('#btn-mem-test').onclick = async () => {
   } catch (e) { $('#mem-test-out').textContent = '失败：' + e; }
 };
 
-/* ---------- models ---------- */
+/* ---------- models (settings page; persisted, survives refresh) ---------- */
 async function refreshModels() {
   try {
     const j = await (await fetch('/api/models')).json();
     const ids = (j.data || []).map((m) => m.id).filter(Boolean);
-    $('#model-list').innerHTML = ids.map((id) => `<option value="${id}">`).join('');
-    const cur = $('#model').value;
-    if ((!cur || cur === 'default') && ids.length) $('#model').value = ids[0];
+    const sel = $('#set-model');
+    sel.innerHTML = ids.map((id) => `<option value="${id}">${id}</option>`).join('');
+    if (ids.includes(settings.model)) sel.value = settings.model;
+    else if (ids.length) { sel.value = ids[0]; settings.model = ids[0]; store.set('settings', settings); }
   } catch { /* 上游未通时静默 */ }
 }
 $('#btn-models-refresh').onclick = refreshModels;
+$('#set-model').onchange = (e) => { settings.model = e.target.value; store.set('settings', settings); };
 
 /* ---------- settings ---------- */
 $('#set-max').value = settings.max_tokens;
 $('#set-reserve').value = settings.response_reserve;
 $('#set-minrounds').value = settings.recent_chat_min_turns;
 $('#set-rerank').value = settings.rerank_url;
+$('#set-stream').checked = !!settings.stream;
+$('#set-visible').value = settings.visible_turns || 10;
+$('#set-user').value = settings.user_name || '';
 $('#set-avatar-zoom').value = avatarZoom();
 $('#set-avatar-zoom').onchange = (e) => { store.set('avatarZoom', +e.target.value || 1); applyAvatarSize(); };
 $('#btn-settings-save').onclick = async () => {
@@ -335,6 +379,10 @@ $('#btn-settings-save').onclick = async () => {
   settings.response_reserve = +$('#set-reserve').value || 4096;
   settings.recent_chat_min_turns = +$('#set-minrounds').value || 4;
   settings.rerank_url = $('#set-rerank').value.trim() || settings.rerank_url;
+  settings.stream = $('#set-stream').checked;
+  settings.visible_turns = Math.min(200, Math.max(5, +$('#set-visible').value || 10));
+  settings.user_name = $('#set-user').value.trim() || 'user';
+  settings.model = $('#set-model').value || settings.model;
   store.set('settings', settings);
   // server-side: upstream / key / rerank (empty key = keep)
   await fetch('/api/settings', {
@@ -357,3 +405,4 @@ refreshChars();
 loadServerSettings();
 refreshModels();
 applyAvatarSize();
+loadHistory();

@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -253,6 +254,7 @@ func main() {
 			Blocks  []engine.Block       `json:"blocks"`
 			Context engine.ContextConfig `json:"context"`
 			Chat    []map[string]string  `json:"chat"`
+			Session string               `json:"session"` // when set, full history slides server-side
 		}
 		b, _ := io.ReadAll(r.Body)
 		if len(b) > 0 {
@@ -266,8 +268,14 @@ func main() {
 		if ctx.MaxTokens == 0 {
 			ctx = cfg.Ctx
 		}
-		blocks = injectChat(blocks, in.Chat)
-		memInfo := resolveMCP(r.Context(), rt.get(), blocks, in.Chat)
+		turns := in.Chat
+		if in.Session != "" {
+			if all, err := st.LoadAll(in.Session); err == nil {
+				turns = chatToTurns(store.CleanSession(in.Session), all)
+			}
+		}
+		blocks = injectChat(blocks, turns)
+		memInfo := resolveMCP(r.Context(), rt.get(), blocks, turns)
 		res := engine.Assemble(blocks, ctx)
 		out := map[string]any{
 			"messages": res.Messages, "blocks": res.Blocks, "total_tokens": res.TotalTok,
@@ -286,9 +294,10 @@ func main() {
 			Messages []map[string]any     `json:"messages"`
 			Stream   bool                 `json:"stream"`
 			Session  string               `json:"session"`
+			Text     string               `json:"text"` // new path: single fresh user message
 			Blocks   []engine.Block       `json:"blocks"`
 			Context  engine.ContextConfig `json:"context"`
-			Chat     []map[string]string  `json:"chat"`
+			Chat     []map[string]string  `json:"chat"` // legacy: explicit turns (assemble/preview compat)
 		}
 		_ = json.Unmarshal(body, &in)
 		blocks := in.Blocks
@@ -299,12 +308,22 @@ func main() {
 		if ctx.MaxTokens == 0 {
 			ctx = cfg.Ctx
 		}
-		blocks = injectChat(blocks, in.Chat)
+		session := store.CleanSession(firstNonEmpty(in.Session, "main"))
+		// New path: frontend sends only the fresh message; full context slides
+		// server-side out of the (possibly thousands of turns) JSONL so the DOM
+		// window size never affects what the model sees.
+		turns := in.Chat
+		if userText := strings.TrimSpace(in.Text); userText != "" {
+			_ = st.AppendChat(session, "user", userText)
+			all, _ := st.LoadAll(session)
+			turns = chatToTurns(session, all)
+		}
+		blocks = injectChat(blocks, turns)
 		// If caller passed raw messages (classic path), wrap as chat block content.
 		if len(in.Messages) > 0 {
 			blocks = injectRawMessages(blocks, in.Messages)
 		}
-		memInfo := resolveMCP(r.Context(), s, blocks, in.Chat)
+		memInfo := resolveMCP(r.Context(), s, blocks, turns)
 		res := engine.Assemble(blocks, ctx)
 
 		// Build upstream body from assembled messages.
@@ -320,12 +339,11 @@ func main() {
 			_ = s
 		}
 
-		session := in.Session
-		if session == "" {
-			session = "main"
-		}
-		if q := lastUserText(in.Chat); q != "" {
-			_ = st.AppendChat(session, "user", q) // P1 JSONL persistence
+		// Legacy path (no Text): user turn arrived inside in.Chat, persist it.
+		if strings.TrimSpace(in.Text) == "" {
+			if q := lastUserText(in.Chat); q != "" {
+				_ = st.AppendChat(session, "user", q)
+			}
 		}
 
 		if in.Stream {
@@ -512,6 +530,61 @@ func main() {
 		writeJSON(w, a)
 	})
 
+	// Chat history: GET /api/history?session=<char>&limit=10&before=0
+	// Sliding window over data/chats/<session>.jsonl (newest last).
+	// `before` = messages already shown (for "load earlier").
+	mux.HandleFunc("/api/history", func(w http.ResponseWriter, r *http.Request) {
+		session := store.CleanSession(r.URL.Query().Get("session"))
+		limit := atoiDefault(r.URL.Query().Get("limit"), 10)
+		before := atoiDefault(r.URL.Query().Get("before"), 0)
+		msgs, total, err := st.Tail(session, limit, before)
+		if err != nil {
+			http.Error(w, "history read failed", 500)
+			return
+		}
+		writeJSON(w, map[string]any{"session": session, "total": total, "messages": msgs, "has_more": total-before-limit > 0})
+	})
+
+	// Export timeline md (same shape as raw_chat_timeline_process.py output so it
+	// feeds the RAG pipeline directly): GET /api/export?session=<char>&user=RoyChong
+	// Header: "# A & B Chat: YYYY-MM-DD ~ YYYY-MM-DD", rows: "**Name** [ts]: text".
+	mux.HandleFunc("/api/export", func(w http.ResponseWriter, r *http.Request) {
+		session := store.CleanSession(r.URL.Query().Get("session"))
+		userName := strings.TrimSpace(r.URL.Query().Get("user"))
+		if userName == "" {
+			userName = "user"
+		}
+		msgs, err := st.LoadAll(session)
+		if err != nil {
+			http.Error(w, "export read failed", 500)
+			return
+		}
+		md := timelineMD(session, userName, msgs)
+		w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
+		w.Header().Set("Content-Disposition", "attachment; filename=\""+session+" (timeline).md\"")
+		_, _ = w.Write([]byte(md))
+	})
+
+	// Archive ("new chat" in ST terms): POST /api/archive {"session":"..."}
+	// Seals current jsonl into chats/archive/ and starts a fresh one.
+	mux.HandleFunc("/api/archive", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			http.Error(w, "method not allowed", 405)
+			return
+		}
+		var in struct {
+			Session string `json:"session"`
+		}
+		b, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(b, &in)
+		name, err := st.Archive(in.Session)
+		if err != nil {
+			http.Error(w, "archive failed: "+err.Error(), 500)
+			return
+		}
+		writeJSON(w, map[string]any{"ok": true, "archived": name})
+	})
+
 	// Static frontend.
 	sub, _ := fs.Sub(webFS, "web")
 	mux.Handle("/", http.FileServer(http.FS(sub)))
@@ -612,6 +685,73 @@ func loadCharMeta(base string) map[string]any {
 		meta = map[string]any{}
 	}
 	return meta
+}
+
+// chatToTurns maps stored rows to engine turns. Assistant rows carry the
+// character name so long histories stay attributable after export.
+func chatToTurns(session string, msgs []store.ChatMessage) []map[string]string {
+	turns := make([]map[string]string, 0, len(msgs))
+	for _, m := range msgs {
+		role := m.Role
+		if role != "user" && role != "assistant" && role != "system" {
+			role = "user"
+		}
+		content := m.Text
+		if role == "assistant" {
+			content = session + ": " + m.Text
+		}
+		turns = append(turns, map[string]string{"role": role, "content": content})
+	}
+	return turns
+}
+
+// timelineMD renders stored rows in raw_chat_timeline_process.py timeline
+// shape: "# A & B Chat: YYYY-MM-DD ~ YYYY-MM-DD" + "**Name** [ts]: text".
+func timelineMD(session, userName string, msgs []store.ChatMessage) string {
+	speakers := map[string]bool{}
+	label := func(role string) string {
+		if role == "assistant" {
+			return session
+		}
+		return userName
+	}
+	for _, m := range msgs {
+		speakers[label(m.Role)] = true
+	}
+	names := make([]string, 0, len(speakers))
+	for n := range speakers {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	span := func(t string) string {
+		if ts, err := time.Parse(time.RFC3339, t); err == nil {
+			return ts.Format("2006-01-02 15:04")
+		}
+		return t
+	}
+	var sb strings.Builder
+	if len(msgs) > 0 {
+		start := span(msgs[0].Time)[:10]
+		end := span(msgs[len(msgs)-1].Time)[:10]
+		sb.WriteString("# " + strings.Join(names, " & ") + " Chat: " + start + " ~ " + end + "\n")
+	} else {
+		sb.WriteString("# " + session + " Chat: (empty)\n")
+	}
+	for _, m := range msgs {
+		sb.WriteString("\n**" + label(m.Role) + "** [" + span(m.Time) + "]: " + m.Text + "\n")
+	}
+	return sb.String()
+}
+
+func atoiDefault(s string, d int) int {
+	if s == "" {
+		return d
+	}
+	var n int
+	if _, err := fmt.Sscanf(s, "%d", &n); err != nil {
+		return d
+	}
+	return n
 }
 
 // lastUserText returns the latest user utterance from chat turns.
