@@ -273,7 +273,7 @@ func main() {
 		turns := in.Chat
 		if in.Session != "" {
 			if all, err := st.LoadAll(in.Session); err == nil {
-				turns = chatToTurns(store.CleanSession(in.Session), all)
+				turns = chatToTurns(all)
 			}
 		}
 		blocks = injectChat(blocks, turns)
@@ -318,7 +318,7 @@ func main() {
 		if userText := strings.TrimSpace(in.Text); userText != "" {
 			_ = st.AppendChat(session, "user", userText)
 			all, _ := st.LoadAll(session)
-			turns = chatToTurns(session, all)
+			turns = chatToTurns(all)
 		}
 		blocks = injectChat(blocks, turns)
 		// If caller passed raw messages (classic path), wrap as chat block content.
@@ -641,7 +641,7 @@ func main() {
 		if q := lastUserText(turns); q != "" {
 			_ = st.AppendChat(singleFloor, "user", q)
 			if all, err := st.LoadAll(singleFloor); err == nil {
-				turns = chatToTurns(singleFloor, all)
+				turns = chatToTurns(all)
 			}
 		}
 		blocks := injectChat(loadBlocks(), turns)
@@ -811,20 +811,18 @@ func loadCharMeta(base string) map[string]any {
 	return meta
 }
 
-// chatToTurns maps stored rows to engine turns. Assistant rows carry the
-// character name so long histories stay attributable after export.
-func chatToTurns(session string, msgs []store.ChatMessage) []map[string]string {
+// chatToTurns maps stored rows to engine turns. Assistant content is passed
+// through verbatim (no name prefix) — prefixing used to teach the model to
+// emit "角色名: " in its own replies; attribution for export comes from
+// timelineMD instead, which reads the JSONL directly.
+func chatToTurns(msgs []store.ChatMessage) []map[string]string {
 	turns := make([]map[string]string, 0, len(msgs))
 	for _, m := range msgs {
 		role := m.Role
 		if role != "user" && role != "assistant" && role != "system" {
 			role = "user"
 		}
-		content := m.Text
-		if role == "assistant" {
-			content = session + ": " + m.Text
-		}
-		turns = append(turns, map[string]string{"role": role, "content": content})
+		turns = append(turns, map[string]string{"role": role, "content": m.Text})
 	}
 	return turns
 }
