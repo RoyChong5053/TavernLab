@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/RoyChong5053/TavernLab/internal/engine"
+	"github.com/RoyChong5053/TavernLab/internal/expression"
 	"github.com/RoyChong5053/TavernLab/internal/proxy"
 	"github.com/RoyChong5053/TavernLab/internal/store"
 )
@@ -177,6 +178,21 @@ func main() {
 		w.WriteHeader(status)
 		_, _ = w.Write(respBody)
 		_ = st.SaveAudit(toAudit(auditID, model, res, upBody, respBody, usage))
+	})
+
+	// Expression classify: reply -> avatar label (rule + local reranker).
+	// POST {"text":"...","rerank_url":"http://127.0.0.1:11437"}
+	mux.HandleFunc("/api/expression/classify", func(w http.ResponseWriter, r *http.Request) {
+		var in struct {
+			Text      string `json:"text"`
+			RerankURL string `json:"rerank_url"`
+		}
+		b, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(b, &in)
+		if in.RerankURL == "" {
+			in.RerankURL = "http://127.0.0.1:11437"
+		}
+		writeJSON(w, expression.Classify(client, in.RerankURL, in.Text))
 	})
 
 	// Audit list + detail + replay.
