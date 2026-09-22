@@ -7,49 +7,113 @@
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
-<header class="topbar glass">
-  <div class="brand">🍺 leer-chat <span class="sub">Prompt IDE · P0</span></div>
-  <div class="top-actions">
-    <label>模型 <input id="model" value="default" size="12"></label>
-    <label>会话 <input id="session" value="main" size="8"></label>
-    <button id="btn-assemble">Assemble</button>
-    <button id="btn-send" class="primary">Send</button>
-    <label class="stream"><input type="checkbox" id="stream"> stream</label>
-  </div>
-</header>
-<main class="layout">
-  <section class="col glass" id="col-blocks">
-    <h2>Blocks <small>order=位置 priority=压缩顺序</small></h2>
-    <div id="budget"></div>
-    <div id="blocks"></div>
-    <div class="row">
-      <button id="btn-save-blocks">Save blocks</button>
-      <button id="btn-reload-blocks">Reload</button>
+<button id="hamburger" aria-label="菜单">☰</button>
+<div class="shell">
+  <aside class="sidebar glass" id="sidebar">
+    <div class="brand">🍺 leer-chat <span class="sub">P1 · IDE</span></div>
+    <nav class="nav">
+      <button data-page="chat" class="on">💬 聊天</button>
+      <button data-page="chars">👤 角色</button>
+      <button data-page="blocks">🧱 Blocks</button>
+      <button data-page="audit">🔍 Audit</button>
+      <button data-page="memory">🧠 Memory</button>
+      <button data-page="settings">⚙️ 设置</button>
+    </nav>
+    <div class="side-foot">
+      <div id="health" class="health">…</div>
+      <div class="hint">Go thin core · data/可rclone</div>
     </div>
-  </section>
-  <section class="col glass" id="col-chat">
-    <h2>Chat</h2>
-    <div id="chat"></div>
-    <div class="composer">
-      <textarea id="input" rows="3" placeholder="输入消息…"></textarea>
-      <button id="btn-send2" class="primary">➤</button>
-    </div>
-  </section>
-  <section class="col glass" id="col-audit">
-    <h2>Audit <small>每次raw+tokens</small></h2>
-    <div class="row">
-      <button id="btn-audit-list">刷新</button>
-      <select id="audit-list"></select>
-      <button id="btn-audit-view">查看</button>
-    </div>
-    <pre id="audit"></pre>
-  </section>
-</main>
-<nav class="mobilebar glass">
-  <button data-tab="col-blocks">Blocks</button>
-  <button data-tab="col-chat" class="on">Chat</button>
-  <button data-tab="col-audit">Audit</button>
-</nav>
+  </aside>
+  <main class="content">
+    <!-- CHAT (default) -->
+    <section class="page on" id="page-chat">
+      <div class="chat-head glass">
+        <img id="chat-avatar" class="avatar" alt="角色头像" src="">
+        <div class="chat-head-info">
+          <div class="chat-name-row">
+            <strong id="chat-char-name">Leer乐儿</strong>
+            <span id="expr-badge" class="expr-badge" title="最近一次表情判定">·</span>
+          </div>
+          <div class="chat-sub" id="chat-sub">Prompt IDE · 16k自适应预算</div>
+        </div>
+        <div class="chat-head-actions">
+          <label>模型 <input id="model" value="default" size="10"></label>
+          <label>会话 <input id="session" value="main" size="7"></label>
+          <label class="stream"><input type="checkbox" id="stream"> 流式</label>
+        </div>
+      </div>
+      <div class="glass chat-box"><div id="chat"></div></div>
+      <div class="composer glass">
+        <textarea id="input" rows="2" placeholder="输入消息…（Enter发送 / Shift+Enter换行）"></textarea>
+        <button id="btn-send" class="primary">➤</button>
+      </div>
+    </section>
+    <!-- CHARACTERS -->
+    <section class="page" id="page-chars">
+      <h2>角色 <small>头像支持动态 webp（浏览器原生播放），表情包以后接 Expression Router</small></h2>
+      <div class="row">
+        <select id="char-list"></select>
+        <button id="btn-char-new">新建</button>
+        <button id="btn-char-refresh">刷新</button>
+      </div>
+      <div class="char-detail glass">
+        <img id="char-avatar" class="avatar big" alt="头像预览">
+        <div>
+          <div class="row">
+            <input id="char-name" placeholder="角色名，如 Leer乐儿" size="16">
+            <label class="filebtn">上传头像 <input type="file" id="char-file" accept=".webp,.png,.jpg,.jpeg,.gif" hidden></label>
+          </div>
+          <div id="char-expr" class="meta"></div>
+        </div>
+      </div>
+    </section>
+    <!-- BLOCKS -->
+    <section class="page" id="page-blocks">
+      <h2>Blocks <small>order=位置 priority=压缩顺序</small></h2>
+      <div id="budget" class="glass budget"></div>
+      <div class="row">
+        <button id="btn-assemble">试算 Assemble</button>
+        <button id="btn-save-blocks">保存</button>
+        <button id="btn-reload-blocks">重载</button>
+      </div>
+      <div id="blocks"></div>
+    </section>
+    <!-- AUDIT -->
+    <section class="page" id="page-audit">
+      <h2>Audit <small>每次生成存 raw+tokens，可 Replay</small></h2>
+      <div class="row">
+        <button id="btn-audit-list">刷新</button>
+        <select id="audit-list"></select>
+        <button id="btn-audit-view">查看</button>
+      </div>
+      <pre id="audit" class="glass audit"></pre>
+    </section>
+    <!-- MEMORY (P2 stub) -->
+    <section class="page" id="page-memory">
+      <h2>Memory <small>P2：Distilled / Vectra只读 / MCP-Qdrant 统一 MemorySource</small></h2>
+      <div class="glass pad">
+        <div class="row"><label>Vectra collection <input id="mem-vectra" value="default" size="12"></label>
+        <label>MCP collection <input id="mem-mcp" value="personal_memory" size="14"></label></div>
+        <div class="row"><label><input type="checkbox" id="mem-mcp-on"> RAG走MCP-Qdrant（高端/LOQ）</label>
+        <label>top-k <input id="mem-topk" type="number" value="10" style="width:56px"></label></div>
+        <p class="meta">本页P1只存偏好（localStorage），P2 接入真正的检索 + 8-turn distilled。</p>
+      </div>
+    </section>
+    <!-- SETTINGS -->
+    <section class="page" id="page-settings">
+      <h2>设置</h2>
+      <div class="glass pad form">
+        <label>上游 One-API <input id="set-upstream" size="30" placeholder="http://127.0.0.1:3000"></label>
+        <label>总预算 max_tokens <input id="set-max" type="number" value="16384" style="width:90px"></label>
+        <label>回复预留 response_reserve <input id="set-reserve" type="number" value="4096" style="width:90px"></label>
+        <label>保底轮数 <input id="set-minrounds" type="number" value="4" style="width:60px"></label>
+        <label>Reranker（表情判定） <input id="set-rerank" size="26" value="http://127.0.0.1:11437"></label>
+        <div class="row"><button id="btn-settings-save" class="primary">保存偏好</button></div>
+        <p class="meta">偏好存浏览器 localStorage；上游地址只读显示（以后端启动参数为准）。</p>
+      </div>
+    </section>
+  </main>
+</div>
 <script src="app.js"></script>
 </body>
 </html>

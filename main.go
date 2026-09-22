@@ -195,6 +195,95 @@ func main() {
 		writeJSON(w, expression.Classify(client, in.RerankURL, in.Text))
 	})
 
+	// Characters: list/detail/avatar(expressions come later with webp).
+	// Data layout: data/characters/<name>/avatar.* + expressions/<label>.webp
+	mux.HandleFunc("/api/characters", func(w http.ResponseWriter, r *http.Request) {
+		root := filepath.Join(cfg.DataRoot, "characters")
+		es, _ := os.ReadDir(root)
+		var names []string
+		for _, e := range es {
+			if e.IsDir() {
+				names = append(names, e.Name())
+			}
+		}
+		if names == nil {
+			names = []string{}
+		}
+		writeJSON(w, map[string]any{"characters": names})
+	})
+	mux.HandleFunc("/api/characters/", func(w http.ResponseWriter, r *http.Request) {
+		rest := strings.TrimPrefix(r.URL.Path, "/api/characters/")
+		parts := strings.SplitN(rest, "/", 2)
+		name := parts[0]
+		if name == "" || strings.Contains(name, "..") {
+			http.Error(w, "bad name", 400)
+			return
+		}
+		base := filepath.Join(cfg.DataRoot, "characters", name)
+		if len(parts) == 2 && parts[1] == "avatar" && r.Method == "PUT" {
+			// multipart file=...  or raw body; save as avatar.webp (browser
+			// <img> plays animated webp natively, mp4 loop comes later).
+			_ = os.MkdirAll(base, 0o755)
+			var src io.Reader = r.Body
+			fname := "avatar.webp"
+			if strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/") {
+				f, h, err := r.FormFile("file")
+				if err != nil {
+					http.Error(w, "need file field", 400)
+					return
+				}
+				defer f.Close()
+				src = f
+				if n := strings.ToLower(h.Filename); strings.HasSuffix(n, ".png") {
+					fname = "avatar.png"
+				} else if strings.HasSuffix(n, ".jpg") || strings.HasSuffix(n, ".jpeg") {
+					fname = "avatar.jpg"
+				} else if strings.HasSuffix(n, ".gif") {
+					fname = "avatar.gif"
+				}
+			}
+			dst, err := os.Create(filepath.Join(base, fname))
+			if err != nil {
+				http.Error(w, "save failed", 500)
+				return
+			}
+			defer dst.Close()
+			if _, err := io.Copy(dst, src); err != nil {
+				http.Error(w, "save failed", 500)
+				return
+			}
+			// remove sibling avatar.* so detail has one canonical file
+			for _, alt := range []string{"avatar.webp", "avatar.png", "avatar.jpg", "avatar.gif"} {
+				if alt != fname {
+					_ = os.Remove(filepath.Join(base, alt))
+				}
+			}
+			writeJSON(w, map[string]any{"ok": true, "avatar_url": "/chars/" + name + "/" + fname})
+			return
+		}
+		// detail
+		avatarURL := ""
+		for _, cand := range []string{"avatar.webp", "avatar.png", "avatar.jpg", "avatar.gif"} {
+			if _, err := os.Stat(filepath.Join(base, cand)); err == nil {
+				avatarURL = "/chars/" + name + "/" + cand
+				break
+			}
+		}
+		var exprs []string
+		if es, err := os.ReadDir(filepath.Join(base, "expressions")); err == nil {
+			for _, e := range es {
+				if !e.IsDir() {
+					exprs = append(exprs, "expressions/"+e.Name())
+				}
+			}
+		}
+		if exprs == nil {
+			exprs = []string{}
+		}
+		writeJSON(w, map[string]any{"name": name, "avatar_url": avatarURL, "expressions": exprs})
+	})
+	mux.Handle("/chars/", http.StripPrefix("/chars/", http.FileServer(http.Dir(filepath.Join(cfg.DataRoot, "characters")))))
+
 	// Audit list + detail + replay.
 	mux.HandleFunc("/api/audit", func(w http.ResponseWriter, r *http.Request) {
 		ids, _ := st.ListAudits()
