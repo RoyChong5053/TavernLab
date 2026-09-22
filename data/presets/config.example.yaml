@@ -1,0 +1,7 @@
+port: 8080
+upstream: http://127.0.0.1:3000
+# ONEAPI_KEY via env ONEAPI_KEY
+context:
+  max_tokens: 16384
+  response_reserve: 4096
+  recent_chat_min_turns: 4

@@ -1,0 +1,5 @@
+data/audit/
+data/chats/
+.vectra_cache/
+leer-chat
+*.log

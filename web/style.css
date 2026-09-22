@@ -1,0 +1,35 @@
+:root{--bg:#0b0e14;--glass:rgba(255,255,255,.07);--line:rgba(255,255,255,.12);--txt:#e8ecf3;--mut:#9aa4b2;--acc:#7dd3fc}
+*{box-sizing:border-box}
+body{margin:0;background:radial-gradient(1200px 600px at 20% -10%,#1e293b,transparent),var(--bg);color:var(--txt);font:14px/1.5 system-ui,sans-serif;height:100vh;display:flex;flex-direction:column}
+.glass{background:var(--glass);backdrop-filter:blur(18px) saturate(1.4);-webkit-backdrop-filter:blur(18px) saturate(1.4);border:1px solid var(--line);border-radius:16px}
+.topbar{margin:10px;padding:10px 14px;display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}
+.brand{font-weight:700}.brand .sub{color:var(--mut);font-weight:400;font-size:12px}
+.top-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+input,textarea,select{background:rgba(0,0,0,.35);color:var(--txt);border:1px solid var(--line);border-radius:10px;padding:6px 8px}
+button{background:rgba(255,255,255,.1);color:var(--txt);border:1px solid var(--line);border-radius:10px;padding:6px 12px;cursor:pointer}
+button.primary{background:var(--acc);color:#06222e;border:none;font-weight:700}
+.layout{flex:1;display:grid;grid-template-columns:320px 1fr 360px;gap:10px;padding:0 10px;min-height:0}
+.col{padding:12px;overflow:auto;min-height:0}
+.col h2{margin:0 0 8px;font-size:15px}.col h2 small{color:var(--mut);font-weight:400}
+#chat{display:flex;flex-direction:column;gap:8px;margin-bottom:10px}
+.msg{padding:8px 10px;border-radius:12px;border:1px solid var(--line);white-space:pre-wrap}
+.msg.user{background:rgba(125,211,252,.12);align-self:flex-end}
+.msg.ai{background:rgba(255,255,255,.05)}
+.msg.sys{color:var(--mut);font-size:12px}
+.composer{display:flex;gap:8px;position:sticky;bottom:0}
+.composer textarea{flex:1;resize:none}
+.block{border:1px solid var(--line);border-radius:12px;padding:8px;margin-bottom:8px;background:rgba(0,0,0,.25)}
+.block .hd{display:flex;justify-content:space-between;align-items:center;gap:6px}
+.block input[type=number]{width:56px}
+.block textarea{width:100%;margin-top:6px}
+.block .meta{color:var(--mut);font-size:12px}
+#audit{white-space:pre-wrap;font-size:12px;max-height:60vh;overflow:auto}
+.mobilebar{display:none}
+@media(max-width:900px){
+  .layout{grid-template-columns:1fr}
+  .col{display:none}
+  .col.on{display:block}
+  #col-chat{display:block}
+  .mobilebar{display:flex;gap:8px;margin:10px;padding:8px;justify-content:space-around}
+  .mobilebar .on{background:var(--acc);color:#06222e}
+}

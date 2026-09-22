@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>leer-chat · Prompt IDE</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar glass">
+  <div class="brand">🍺 leer-chat <span class="sub">Prompt IDE · P0</span></div>
+  <div class="top-actions">
+    <label>模型 <input id="model" value="default" size="12"></label>
+    <label>会话 <input id="session" value="main" size="8"></label>
+    <button id="btn-assemble">Assemble</button>
+    <button id="btn-send" class="primary">Send</button>
+    <label class="stream"><input type="checkbox" id="stream"> stream</label>
+  </div>
+</header>
+<main class="layout">
+  <section class="col glass" id="col-blocks">
+    <h2>Blocks <small>order=位置 priority=压缩顺序</small></h2>
+    <div id="budget"></div>
+    <div id="blocks"></div>
+    <div class="row">
+      <button id="btn-save-blocks">Save blocks</button>
+      <button id="btn-reload-blocks">Reload</button>
+    </div>
+  </section>
+  <section class="col glass" id="col-chat">
+    <h2>Chat</h2>
+    <div id="chat"></div>
+    <div class="composer">
+      <textarea id="input" rows="3" placeholder="输入消息…"></textarea>
+      <button id="btn-send2" class="primary">➤</button>
+    </div>
+  </section>
+  <section class="col glass" id="col-audit">
+    <h2>Audit <small>每次raw+tokens</small></h2>
+    <div class="row">
+      <button id="btn-audit-list">刷新</button>
+      <select id="audit-list"></select>
+      <button id="btn-audit-view">查看</button>
+    </div>
+    <pre id="audit"></pre>
+  </section>
+</main>
+<nav class="mobilebar glass">
+  <button data-tab="col-blocks">Blocks</button>
+  <button data-tab="col-chat" class="on">Chat</button>
+  <button data-tab="col-audit">Audit</button>
+</nav>
+<script src="app.js"></script>
+</body>
+</html>
