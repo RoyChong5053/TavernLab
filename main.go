@@ -1684,14 +1684,17 @@ func runDistill(ctx context.Context, st *store.Store, client *http.Client, root 
 		meta.LastIndex = 0
 	}
 	fresh := all[meta.LastIndex:]
-	if len(fresh) == 0 && force && len(all) > 0 {
+	timeline := distill.FormatTimeline(session, s.UserName, fresh)
+	// A forced run re-distills the tail even when the cursor is already at the
+	// end (e.g. only distilled_memory rows are new), so "立即蒸馏" never no-ops.
+	if timeline == "" && force && len(all) > 0 {
 		start := len(all) - interval*2
 		if start < 0 {
 			start = 0
 		}
 		fresh = all[start:]
+		timeline = distill.FormatTimeline(session, s.UserName, fresh)
 	}
-	timeline := distill.FormatTimeline(session, s.UserName, fresh)
 	if timeline == "" {
 		return "", fmt.Errorf("没有可蒸馏的新消息")
 	}
