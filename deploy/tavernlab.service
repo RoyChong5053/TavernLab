@@ -1,0 +1,20 @@
+[Unit]
+Description=TavernLab (Go thin core + web UI)
+Documentation=https://github.com/RoyChong5053/TavernLab
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=roychong
+Group=roychong
+WorkingDirectory=/home/roychong/app/TavernLab
+ExecStart=/home/roychong/app/TavernLab/tavernlab -port 8888 -data /home/roychong/app/TavernLab/data
+Restart=always
+RestartSec=3
+# Logs also flow through the in-app Logs page (/api/logs).
+StandardOutput=append:/home/roychong/app/TavernLab/tavernlab.log
+StandardError=append:/home/roychong/app/TavernLab/tavernlab.log
+
+[Install]
+WantedBy=multi-user.target

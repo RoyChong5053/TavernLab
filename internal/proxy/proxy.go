@@ -7,11 +7,23 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/RoyChong5053/TavernLab/internal/obs"
 )
+
+// truncate caps a string for log/error output.
+func truncate(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…"
+}
 
 // ChatRequest is the minimal OpenAI chat body we accept.
 type ChatRequest struct {
@@ -48,13 +60,31 @@ func Forward(client *http.Client, upstream, apiKey string, body []byte, stream b
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	// Upstream rejected the request (auth/quota/bad model): surface it as an
+	// SSE error event instead of an empty stream the UI can't explain.
+	if resp.StatusCode >= 400 {
+		b, _ := io.ReadAll(resp.Body)
+		obs.Warn("upstream stream error", map[string]any{"status": resp.StatusCode, "body": truncate(string(b), 300)})
+		payload, _ := json.Marshal(map[string]any{"error": map[string]any{"status": resp.StatusCode, "message": truncate(string(b), 500)}})
+		_, _ = fmt.Fprintf(w, "data: %s\n\n", payload)
+		if flusher != nil {
+			flusher.Flush()
+		}
+		return resp.StatusCode, payload, nil
+	}
 	var full strings.Builder
 	sc := bufio.NewScanner(resp.Body)
 	sc.Buffer(make([]byte, 1024*1024), 1024*1024)
 	for sc.Scan() {
 		line := sc.Text()
+		if strings.TrimSpace(line) == "" {
+			continue // keep exactly one blank separator per event
+		}
 		_, _ = w.Write([]byte(line + "\n\n"))
-		flusher.Flush()
+		if flusher != nil {
+			flusher.Flush()
+		}
 		if strings.HasPrefix(line, "data:") {
 			payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 			if payload == "" || payload == "[DONE]" {
@@ -75,7 +105,7 @@ func Forward(client *http.Client, upstream, apiKey string, body []byte, stream b
 		}
 	}
 	rebuilt, _ := json.Marshal(map[string]any{
-		"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": full.String()}}},
+		"choices":        []map[string]any{{"message": map[string]any{"role": "assistant", "content": full.String()}}},
 		"stream_rebuilt": true, "time": time.Now().Format(time.RFC3339),
 	})
 	return resp.StatusCode, rebuilt, nil

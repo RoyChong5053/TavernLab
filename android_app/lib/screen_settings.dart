@@ -91,7 +91,8 @@ class _ScreenSettingsState extends State<ScreenSettings> {
     super.initState();
     WidgetsFlutterBinding.ensureInitialized();
 
-    checkHost();
+    // Do NOT probe the host on entry (it blocks the page for seconds).
+    // The user runs the check explicitly via the Test button.
     updatesSupported(setState, true);
     if (prefs!.getBool("checkUpdateOnSettingsOpen") ?? false) {
       checkUpdate(setState);
@@ -206,7 +207,19 @@ class _ScreenSettingsState extends State<ScreenSettings> {
                               },
                               icon: const Icon(Icons.add_rounded)),
                           suffixIcon: useHost
-                              ? const SizedBox.shrink()
+                              ? IconButton(
+                                  onPressed: () {
+                                    HapticFeedback.selectionClick();
+                                    checkHost();
+                                  },
+                                  tooltip: "Test 连接",
+                                  icon: hostLoading
+                                      ? Transform.scale(
+                                          scale: 0.5,
+                                          child:
+                                              const CircularProgressIndicator())
+                                      : const Icon(Icons.wifi_tethering_rounded),
+                                )
                               : (hostLoading
                                   ? Transform.scale(
                                       scale: 0.5,

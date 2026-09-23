@@ -26,10 +26,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/RoyChong5053/TavernLab/internal/distill"
 	"github.com/RoyChong5053/TavernLab/internal/engine"
 	"github.com/RoyChong5053/TavernLab/internal/expression"
 	"github.com/RoyChong5053/TavernLab/internal/mcp"
 	"github.com/RoyChong5053/TavernLab/internal/memory"
+	"github.com/RoyChong5053/TavernLab/internal/obs"
 	"github.com/RoyChong5053/TavernLab/internal/proxy"
 	"github.com/RoyChong5053/TavernLab/internal/settings"
 	"github.com/RoyChong5053/TavernLab/internal/store"
@@ -118,12 +120,31 @@ func (r *runtimeSettings) update(root string, patch map[string]any) settings.Set
 			r.cur.NtfyTopic = s
 		}
 	}
+	if v, ok := patch["distill_enabled"].(bool); ok {
+		r.cur.DistillEnabled = v
+	}
+	if v, ok := patch["distill_interval"].(float64); ok && v > 0 {
+		r.cur.DistillInterval = int(v)
+	}
+	if v, ok := patch["distill_max_chars"].(float64); ok && v > 0 {
+		r.cur.DistillMaxChars = int(v)
+	}
+	if v, ok := patch["distill_model"]; ok {
+		if s, ok := v.(string); ok {
+			r.cur.DistillModel = s
+		}
+	}
+	if v, ok := patch["distill_prompt"]; ok {
+		if s, ok := v.(string); ok {
+			r.cur.DistillPrompt = s
+		}
+	}
 	_ = settings.Save(root, r.cur) // best-effort; key stays usable in memory regardless
 	return r.cur
 }
 
 func main() {
-	port := flag.Int("port", 8080, "listen port")
+	port := flag.Int("port", 8888, "listen port")
 	data := flag.String("data", "data", "data root (rclone this dir)")
 	upstream := flag.String("upstream", "", "one-api base URL (overrides settings file)")
 	apiKey := flag.String("apikey", "", "one-api key (overrides env ONEAPI_KEY / settings file)")
@@ -150,13 +171,67 @@ func main() {
 	st := store.New(cfg.DataRoot)
 	st.MigrateLegacyChats()
 	client := &http.Client{Timeout: 10 * time.Minute}
-	events := newHub()
+	events = newHub()
 
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		s := rt.get()
 		writeJSON(w, map[string]any{"ok": true, "time": time.Now().Format(time.RFC3339), "upstream": s.Upstream, "key_set": s.APIKey != ""})
+	})
+
+	// Runtime logs (ring buffer) + live SSE stream, backed by internal/obs.
+	mux.HandleFunc("/api/logs", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case "GET":
+			limit := atoiDefault(r.URL.Query().Get("limit"), 200)
+			writeJSON(w, map[string]any{"level": string(obs.GetLevel()), "entries": obs.Recent(limit)})
+		case "PUT":
+			b, _ := io.ReadAll(r.Body)
+			var in struct {
+				Level string `json:"level"`
+			}
+			_ = json.Unmarshal(b, &in)
+			if in.Level != "" {
+				obs.SetLevel(obs.Level(in.Level))
+			}
+			writeJSON(w, map[string]any{"ok": true, "level": string(obs.GetLevel())})
+		default:
+			http.Error(w, "method not allowed", 405)
+		}
+	})
+	mux.HandleFunc("/api/logs/stream", func(w http.ResponseWriter, r *http.Request) {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "streaming unsupported", 500)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("X-Accel-Buffering", "no")
+		ch, unsub := obs.Subscribe()
+		defer unsub()
+		_, _ = io.WriteString(w, ": connected\n\n")
+		flusher.Flush()
+		ctx := r.Context()
+		keep := time.NewTicker(25 * time.Second)
+		defer keep.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case e, ok := <-ch:
+				if !ok {
+					return
+				}
+				b, _ := json.Marshal(e)
+				_, _ = fmt.Fprintf(w, "event: log\ndata: %s\n\n", b)
+				flusher.Flush()
+			case <-keep.C:
+				_, _ = io.WriteString(w, ": ping\n\n")
+				flusher.Flush()
+			}
+		}
 	})
 
 	// Runtime settings (data/settings.json, 0600, git-ignored).
@@ -172,6 +247,9 @@ func main() {
 				"mcp_enabled": s.MCPEnabled, "mcp_topk": s.MCPTopK, "mcp_threshold": s.MCPThreshold,
 				"current_char": s.CurrentChar, "user_name": s.UserName,
 				"ntfy_url": s.NtfyURL, "ntfy_topic": s.NtfyTopic,
+				"distill_enabled": s.DistillEnabled, "distill_interval": s.DistillInterval,
+				"distill_max_chars": s.DistillMaxChars, "distill_model": s.DistillModel,
+				"distill_prompt": s.DistillPrompt, "distill_prompt_default": distill.DefaultPrompt,
 			})
 		case "PUT":
 			b, _ := io.ReadAll(r.Body)
@@ -208,6 +286,43 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(resp.StatusCode)
 		_, _ = w.Write(b)
+	})
+
+	// Distilled Memory: current fact sheet + run-now trigger.
+	mux.HandleFunc("/api/distilled", func(w http.ResponseWriter, r *http.Request) {
+		s := rt.get()
+		session := store.CleanSession(firstNonEmpty(r.URL.Query().Get("session"), s.CurrentChar, "main"))
+		sheet := distill.Load(cfg.DataRoot, session)
+		prompt := s.DistillPrompt
+		if prompt == "" {
+			prompt = distill.DefaultPrompt
+		}
+		writeJSON(w, map[string]any{
+			"session": session, "sheet": sheet, "meta": distill.LoadMeta(cfg.DataRoot, session),
+			"enabled": s.DistillEnabled, "interval": s.DistillInterval,
+			"max_chars": s.DistillMaxChars, "model": s.DistillModel,
+			"prompt": prompt, "default_prompt": distill.DefaultPrompt,
+		})
+	})
+	mux.HandleFunc("/api/distilled/run", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			http.Error(w, "method not allowed", 405)
+			return
+		}
+		var in struct {
+			Session string `json:"session"`
+		}
+		b, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(b, &in)
+		s := rt.get()
+		session := store.CleanSession(firstNonEmpty(in.Session, s.CurrentChar, "main"))
+		sheet, err := runDistill(r.Context(), st, client, cfg.DataRoot, s, session, true)
+		if err != nil {
+			obs.Warn("distill failed", map[string]any{"session": session, "error": err.Error()})
+			writeJSON(w, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		writeJSON(w, map[string]any{"ok": true, "sheet": sheet})
 	})
 
 	// Memory test probe: POST {"query":"..."} -> MCP chunks (for the Memory page button).
@@ -385,13 +500,15 @@ func main() {
 				return
 			}
 			status, rebuilt, _ := proxy.Forward(client, s.Upstream, s.APIKey, upBody, true, w, flusher)
-			_ = status
 			_ = st.SaveAudit(toAudit(auditID, model, res, upBody, rebuilt, nil, memInfo))
-			if reply := strings.TrimSpace(rebuiltText(rebuilt)); reply != "" {
+			reply := strings.TrimSpace(rebuiltText(rebuilt))
+			logTurn("chat.stream", status, model, session, res, reply, memInfo)
+			if reply != "" {
 				msg, _ := st.AppendChat(session, "assistant", reply)
 				events.publish(session, msg)
 				publishNtfy(s, msg)
 			}
+			maybeDistill(st, client, cfg.DataRoot, s, session)
 			return
 		}
 		status, respBody, usage := proxy.Forward(client, s.Upstream, s.APIKey, upBody, false, nil, nil)
@@ -399,11 +516,17 @@ func main() {
 		w.WriteHeader(status)
 		_, _ = w.Write(respBody)
 		_ = st.SaveAudit(toAudit(auditID, model, res, upBody, respBody, usage, memInfo))
-		if reply := strings.TrimSpace(replyText(respBody)); reply != "" {
+		reply := strings.TrimSpace(replyText(respBody))
+		logTurn("chat", status, model, session, res, reply, memInfo)
+		if status >= 400 {
+			obs.Warn("upstream error", map[string]any{"path": "/v1/chat/completions", "status": status, "body": excerpt(string(respBody), 300)})
+		}
+		if reply != "" {
 			msg, _ := st.AppendChat(session, "assistant", reply)
 			events.publish(session, msg)
 			publishNtfy(s, msg)
 		}
+		maybeDistill(st, client, cfg.DataRoot, s, session)
 	})
 
 	// Expression classify: reply -> avatar label (rule + local reranker).
@@ -816,10 +939,15 @@ func main() {
 			status, respBody, usage := proxy.Forward(client, s.Upstream, s.APIKey, upBody, false, nil, nil)
 			reply := replyText(respBody)
 			_ = st.SaveAudit(toAudit(auditID, model, res, upBody, respBody, usage, memInfo))
+			logTurn("app.request", status, model, session, res, reply, memInfo)
+			if status >= 400 {
+				obs.Warn("upstream error", map[string]any{"path": "/api/chat", "status": status, "body": excerpt(string(respBody), 300)})
+			}
 			if strings.TrimSpace(reply) != "" {
 				msg, _ := st.AppendChat(session, "assistant", reply)
 				events.publish(session, msg)
 			}
+			maybeDistill(st, client, cfg.DataRoot, s, session)
 			w.WriteHeader(status)
 			writeJSON(w, map[string]any{
 				"model": model, "created_at": time.Now().Format(time.RFC3339),
@@ -834,16 +962,17 @@ func main() {
 			return
 		}
 		status, full := forwardOllamaStream(client, s.Upstream, s.APIKey, upBody, model, w, flusher)
-		_ = status
 		rebuilt, _ := json.Marshal(map[string]any{
 			"choices":        []map[string]any{{"message": map[string]any{"role": "assistant", "content": full}}},
 			"stream_rebuilt": true, "via": "ollama-shim",
 		})
 		_ = st.SaveAudit(toAudit(auditID, model, res, upBody, rebuilt, nil, memInfo))
+		logTurn("app.stream", status, model, session, res, strings.TrimSpace(full), memInfo)
 		if strings.TrimSpace(full) != "" {
 			msg, _ := st.AppendChat(session, "assistant", full)
 			events.publish(session, msg)
 		}
+		maybeDistill(st, client, cfg.DataRoot, s, session)
 	})
 
 	// POST /api/generate {"model":"...","prompt":"..."} -> {"response":title,"done":true}
@@ -882,8 +1011,9 @@ func main() {
 	mux.Handle("/", http.FileServer(http.FS(sub)))
 
 	addr := fmt.Sprintf("0.0.0.0:%d", cfg.Port)
+	obs.Info("tavernlab listening", map[string]any{"addr": addr, "upstream": cfg.Upstream, "data": cfg.DataRoot})
 	log.Printf("tavernlab listening on %s (upstream=%s data=%s)", addr, cfg.Upstream, cfg.DataRoot)
-	log.Fatal(http.ListenAndServe(addr, mux))
+	log.Fatal(http.ListenAndServe(addr, obs.Middleware(mux)))
 }
 
 func writeJSON(w http.ResponseWriter, v any) {
@@ -987,7 +1117,7 @@ func chatToTurns(msgs []store.ChatMessage) []engine.Message {
 	for _, m := range msgs {
 		role := m.Role
 		if role != "user" && role != "assistant" && role != "system" {
-			role = "user"
+			continue // e.g. distilled_memory: recorded in JSONL, injected as a block
 		}
 		turns = append(turns, engine.Message{Role: role, Content: m.Text})
 	}
@@ -1099,6 +1229,9 @@ func timelineMD(session, userName string, msgs []store.ChatMessage) string {
 		return userName
 	}
 	for _, m := range msgs {
+		if m.Role != "user" && m.Role != "assistant" {
+			continue // distilled_memory rows are memory, not dialogue
+		}
 		speakers[label(m.Role)] = true
 	}
 	names := make([]string, 0, len(speakers))
@@ -1121,6 +1254,9 @@ func timelineMD(session, userName string, msgs []store.ChatMessage) string {
 		sb.WriteString("# " + session + " Chat: (empty)\n")
 	}
 	for _, m := range msgs {
+		if m.Role != "user" && m.Role != "assistant" {
+			continue
+		}
 		sb.WriteString("\n**" + label(m.Role) + "** [" + span(m.Time) + "]: " + m.Text + "\n")
 	}
 	return sb.String()
@@ -1333,6 +1469,154 @@ func resolveMCP(ctx context.Context, s settings.Settings, blocks []engine.Block,
 		info["top"] = map[string]any{"score": top.Score, "source": top.Source, "excerpt": excerpt(top.Text, 160)}
 	}
 	return info
+}
+
+// logTurn emits one structured line per generation so the Logs page shows
+// exactly what happened even when the client gets nothing.
+func logTurn(kind string, status int, model any, session string, res engine.AssembleResult, reply string, mem map[string]any) {
+	fields := map[string]any{
+		"kind": kind, "status": status, "model": fmt.Sprint(model), "session": session,
+		"tier": res.Tier, "tokens": res.TotalTok, "overflow": res.Overflow,
+		"reply_len": len(reply),
+	}
+	if mem != nil {
+		fields["mcp_hits"] = mem["hits"]
+		if e, ok := mem["error"]; ok {
+			fields["mcp_error"] = e
+		}
+	}
+	lvl := obs.LevelInfo
+	if status >= 400 || reply == "" {
+		lvl = obs.LevelWarn
+	}
+	obs.Log(lvl, "turn", fields)
+}
+
+var (
+	distillMu   sync.Mutex
+	distillBusy = map[string]bool{}
+	events      = newHub()
+)
+
+// maybeDistill fires a background distillation once enough fresh user turns
+// have accumulated. Never blocks the chat path.
+func maybeDistill(st *store.Store, client *http.Client, root string, s settings.Settings, session string) {
+	if !s.DistillEnabled {
+		return
+	}
+	interval := s.DistillInterval
+	if interval <= 0 {
+		interval = 8
+	}
+	all, err := st.LoadAll(session)
+	if err != nil {
+		return
+	}
+	meta := distill.LoadMeta(root, session)
+	if meta.LastIndex > len(all) {
+		meta.LastIndex = 0
+	}
+	turns := 0
+	for _, m := range all[meta.LastIndex:] {
+		if m.Role == "user" {
+			turns++
+		}
+	}
+	if turns < interval {
+		return
+	}
+	distillMu.Lock()
+	busy := distillBusy[session]
+	if !busy {
+		distillBusy[session] = true
+	}
+	distillMu.Unlock()
+	if busy {
+		return
+	}
+	go func() {
+		defer func() {
+			distillMu.Lock()
+			delete(distillBusy, session)
+			distillMu.Unlock()
+		}()
+		if _, err := runDistill(context.Background(), st, client, root, s, session, false); err != nil {
+			obs.Warn("distill failed", map[string]any{"session": session, "error": err.Error()})
+		}
+	}()
+}
+
+// runDistill performs one distillation pass and records the result.
+func runDistill(ctx context.Context, st *store.Store, client *http.Client, root string, s settings.Settings, session string, force bool) (string, error) {
+	interval := s.DistillInterval
+	if interval <= 0 {
+		interval = 8
+	}
+	maxChars := s.DistillMaxChars
+	if maxChars <= 0 {
+		maxChars = 2000
+	}
+	all, err := st.LoadAll(session)
+	if err != nil {
+		return "", err
+	}
+	meta := distill.LoadMeta(root, session)
+	if meta.LastIndex > len(all) {
+		meta.LastIndex = 0
+	}
+	fresh := all[meta.LastIndex:]
+	if len(fresh) == 0 && force && len(all) > 0 {
+		start := len(all) - interval*2
+		if start < 0 {
+			start = 0
+		}
+		fresh = all[start:]
+	}
+	timeline := distill.FormatTimeline(session, s.UserName, fresh)
+	if timeline == "" {
+		return "", fmt.Errorf("没有可蒸馏的新消息")
+	}
+	prev := distill.Load(root, session)
+	promptTpl := s.DistillPrompt
+	if promptTpl == "" {
+		promptTpl = distill.DefaultPrompt
+	}
+	prompt := applyMacros(promptTpl, time.Now(), firstNonEmpty(s.UserName, "user"))
+	prompt = strings.ReplaceAll(prompt, "{{maxchars}}", fmt.Sprint(maxChars))
+	prompt = strings.ReplaceAll(prompt, "{{words}}", fmt.Sprint(maxChars))
+	model := firstNonEmpty(s.DistillModel, "auto-gemini")
+	upBody, _ := json.Marshal(map[string]any{
+		"model":  model,
+		"stream": false,
+		"messages": []map[string]any{
+			{"role": "system", "content": prompt},
+			{"role": "user", "content": distill.BuildUser(prev, timeline)},
+		},
+	})
+	status, respBody, _ := proxy.Forward(client, s.Upstream, s.APIKey, upBody, false, nil, nil)
+	if status >= 400 {
+		return "", fmt.Errorf("上游 HTTP %d: %s", status, excerpt(string(respBody), 200))
+	}
+	sheet := strings.TrimSpace(replyText(respBody))
+	if sheet == "" {
+		return "", fmt.Errorf("上游返回空事实表")
+	}
+	if err := distill.Save(root, session, sheet); err != nil {
+		return "", err
+	}
+	meta.LastRun = time.Now().Format(time.RFC3339)
+	meta.LastIndex = len(all)
+	meta.Runs++
+	meta.UserTurns = 0
+	meta.LastStatus = "ok"
+	_ = distill.SaveMeta(root, session, meta)
+	// Record the sheet itself in the chat JSONL as its own role so the
+	// injected memory is auditable alongside the conversation.
+	if msg, err := st.AppendChat(session, "distilled_memory", sheet); err == nil {
+		events.publish(session, msg)
+	}
+	obs.Info("distill ok", map[string]any{"session": session, "chars": len(sheet), "runs": meta.Runs, "model": model})
+	return sheet, nil
 }
 
 func excerpt(s string, n int) string {

@@ -10,13 +10,13 @@
 #   scripts/serve.sh attach     # attach to the tmux session (Ctrl-b d to detach)
 #   scripts/serve.sh logs       # tail -f tavernlab.log
 #
-# Env overrides: PORT (8080) DATA (./data) SESSION (tavernlab)
+# Env overrides: PORT (8888) DATA (./data) SESSION (tavernlab)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-PORT="${PORT:-8080}"
+PORT="${PORT:-8888}"
 DATA="${DATA:-$ROOT/data}"
 SESSION="${SESSION:-tavernlab}"
 BIN="$ROOT/tavernlab"

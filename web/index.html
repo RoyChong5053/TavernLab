@@ -19,6 +19,7 @@
       <button data-page="blocks">🧱 Blocks</button>
       <button data-page="audit">🔍 Audit</button>
       <button data-page="memory">🧠 Memory</button>
+      <button data-page="logs">🪵 Logs</button>
       <button data-page="settings">⚙️ 设置</button>
     </nav>
     <div class="side-foot">
@@ -41,7 +42,12 @@
         <div id="chat"></div>
       </div>
       <div class="composer glass">
-        <textarea id="input" rows="2" placeholder="输入消息…（Enter发送 / Shift+Enter换行）"></textarea>
+        <button id="btn-attach" class="icon-btn" title="上传图片">＋</button>
+        <input type="file" id="img-file" accept="image/*" multiple hidden>
+        <div class="composer-main">
+          <div id="img-preview" class="img-preview hidden"></div>
+          <textarea id="input" rows="2" placeholder="输入消息…（Enter发送 / Shift+Enter换行）"></textarea>
+        </div>
         <button id="btn-send" class="primary">➤</button>
       </div>
     </section>
@@ -123,6 +129,41 @@
         <pre id="mem-test-out" class="preview-text">MCP 直连测试结果显示在这里。</pre>
         <p class="meta">开关只决定“自动注不注入”；测试按钮随时手查。命中明细每轮记进 Audit → memory 字段。</p>
       </div>
+      <div class="glass pad form">
+        <b>Distilled Memory <small class="meta">（移植自 ST Distilled-Memory：把最近对话蒸馏成带日期的事实表，注入 distilled block，并以 distilled_memory 记录进 chat.jsonl）</small></b>
+        <div class="row">
+          <label class="meta"><input type="checkbox" id="dmem-enabled"> 自动蒸馏</label>
+          <label>每 <input id="dmem-interval" type="number" min="1" value="8" style="width:56px"> 个用户轮</label>
+          <label>上限 <input id="dmem-maxchars" type="number" min="200" value="2000" style="width:80px"> 字</label>
+          <label>模型 <input id="dmem-model" size="14" placeholder="空=主模型"></label>
+          <button id="btn-dmem-run" class="primary">立即蒸馏</button>
+          <button id="btn-dmem-save">保存</button>
+          <span id="dmem-meta" class="meta">—</span>
+        </div>
+        <textarea id="dmem-prompt" rows="6" placeholder="蒸馏提示词（留空用内置默认）"></textarea>
+        <div class="row"><button id="btn-dmem-prompt-reset">恢复默认提示词</button><button id="btn-dmem-prompt-view">查看已保存事实表</button></div>
+        <pre id="dmem-out" class="preview-text">当前事实表显示在这里。</pre>
+      </div>
+    </section>
+    <!-- LOGS -->
+    <section class="page" id="page-logs">
+      <h2>Logs <small>运行时日志：请求/上游/错误/蒸馏，静默失败不再是黑盒</small></h2>
+      <div class="row">
+        <button id="btn-log-refresh">刷新</button>
+        <label class="meta"><input type="checkbox" id="log-live" checked> 实时</label>
+        <label class="meta">级别
+          <select id="log-level">
+            <option value="debug">debug</option>
+            <option value="info" selected>info</option>
+            <option value="warn">warn</option>
+            <option value="error">error</option>
+          </select>
+        </label>
+        <label class="meta"><input type="checkbox" id="log-autoscroll" checked> 自动滚动</label>
+        <button id="btn-log-copy">复制</button>
+        <span id="log-state" class="meta">—</span>
+      </div>
+      <pre id="log-view" class="glass audit">正在加载…</pre>
     </section>
     <!-- SETTINGS -->
     <section class="page" id="page-settings">
@@ -166,6 +207,7 @@
     </section>
   </main>
 </div>
+<div id="toast-wrap"></div>
 <script src="app.js"></script>
 </body>
 </html>

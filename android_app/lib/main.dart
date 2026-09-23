@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -32,8 +33,8 @@ import 'package:flutter_displaymode/flutter_displaymode.dart';
 
 // use host or not, if false dialog is shown
 const useHost = true;
-// host of ollama, must be accessible from the client, without trailing slash, will always be accepted as valid
-const fixedHost = "http://100.116.75.51:8080";
+// host of tavernlab, must be accessible from the client, without trailing slash, will always be accepted as valid
+const fixedHost = "http://192.168.100.78:8888";
 // use model or not, if false selector is shown
 const useModel = true;
 // model name as string, must be valid ollama model!
@@ -50,6 +51,11 @@ const allowMultipleChats = false;
 SharedPreferences? prefs;
 ThemeData? theme;
 ThemeData? themeDark;
+
+// Global messenger so background helpers (sync/SSE) can surface errors.
+final GlobalKey<ScaffoldMessengerState> messengerKey =
+    GlobalKey<ScaffoldMessengerState>();
+StreamSubscription<String>? eventSub;
 
 String? model;
 String? host;
@@ -140,7 +146,45 @@ Future<void> syncFromServer(Function? setState) async {
     chatUuid = null;
     if (setState != null) setState(() {});
     HapticFeedback.lightImpact();
-  } catch (_) {}
+  } catch (e) {
+    // No longer silent: tell the user why Sync did nothing.
+    messengerKey.currentState?.showSnackBar(SnackBar(
+      content: Text("Sync 失败：$e（host=$host）"),
+      showCloseIcon: true,
+      duration: const Duration(seconds: 6),
+    ));
+  }
+}
+
+/// Subscribe to server-side live events so the app picks up messages written
+/// by the web UI (or background distillation) without manual Sync.
+void startEvents(Function? setState) {
+  eventSub?.cancel();
+  if (host == null) return;
+  () async {
+    try {
+      final req = http.Request(
+          "GET",
+          Uri.parse("$host/api/events?session=${Uri.encodeComponent(currentChar)}"));
+      req.headers["Accept"] = "text/event-stream";
+      final resp = await http.Client().send(req);
+      eventSub = resp.stream
+          .transform(utf8.decoder)
+          .transform(const LineSplitter())
+          .listen((line) {
+        if (line.startsWith("data:")) {
+          try {
+            final m = jsonDecode(line.substring(5).trim());
+            if (m is Map && m["role"] != null) {
+              syncFromServer(setState);
+            }
+          } catch (_) {}
+        }
+      }, onError: (_) {}, cancelOnError: false);
+    } catch (_) {
+      // SSE unsupported/unreachable: Sync button remains the fallback.
+    }
+  }();
 }
 
 /// Character picker backed by GET /api/characters.
@@ -188,6 +232,7 @@ Future<void> chooseCharacter(BuildContext context, Function setState) async {
                     if (name == currentChar) return;
                     await setCurrentChar(name);
                     await syncFromServer(setState);
+                    startEvents(setState);
                   },
                 );
               }),
@@ -262,6 +307,7 @@ class _AppState extends State<App> {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
+        scaffoldMessengerKey: messengerKey,
         localizationsDelegates: AppLocalizations.localizationsDelegates,
         supportedLocales: AppLocalizations.supportedLocales,
         localeListResolutionCallback: (deviceLocales, supportedLocales) {
@@ -472,6 +518,7 @@ class _MainAppState extends State<MainApp> {
         } else {
           currentChar = prefs!.getString("currentChar") ?? currentChar;
           syncFromServer(setState);
+          startEvents(setState);
         }
       },
     );
@@ -1002,9 +1049,7 @@ class _MainAppState extends State<MainApp> {
                         );
                         setState(() {});
                       },
-                      onAttachmentPressed: (!multimodal)
-                          ? null
-                          : () {
+                      onAttachmentPressed: () {
                               HapticFeedback.selectionClick();
                               if (!chatAllowed || model == null) return;
                               if (Platform.isWindows ||
@@ -1016,7 +1061,6 @@ class _MainAppState extends State<MainApp> {
                                     .pickFiles(type: FileType.image)
                                     .then((files) async {
                                   if (files.isEmpty) return;
-                                  if (!multimodal) return;
 
                                   final picked = files.first;
                                   var encoded = base64.encode(

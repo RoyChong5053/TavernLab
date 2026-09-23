@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/RoyChong5053/TavernLab/internal/distill"
 	"github.com/RoyChong5053/TavernLab/internal/engine"
 )
 
@@ -108,6 +109,16 @@ func renderBlocks(root, session, userName string, blocks []engine.Block) []engin
 			}
 		case "static":
 			out[i].Content = rendered
+		case "distilled":
+			sheet := distill.Load(root, session)
+			if sheet == "" {
+				continue // leave unresolved; engine will drop it
+			}
+			if strings.Contains(rendered, "{{distilled}}") {
+				out[i].Content = strings.ReplaceAll(rendered, "{{distilled}}", sheet)
+			} else {
+				out[i].Content = sheet
+			}
 		default:
 			// mcp/vectra/distilled are resolved elsewhere; keep any resolved
 			// Content the caller already set (e.g. preview overrides).
