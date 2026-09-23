@@ -638,6 +638,7 @@ async function loadServerSettings() {
     $('#mem-url').value = s.mcp_url || '';
     $('#mem-collection').value = s.mcp_collection || '';
     $('#mem-topk').value = s.mcp_topk ?? 10;
+    $('#mem-timeout').value = s.mcp_timeout ?? 120;
     $('#mem-threshold').value = s.mcp_threshold ?? -1;
     $('#mem-enabled').checked = !!s.mcp_enabled;
     if (s.current_char && s.current_char !== settings.char) { settings.char = s.current_char; store.set('settings', settings); }
@@ -654,6 +655,7 @@ async function saveMemory(silent) {
       mcp_url: $('#mem-url').value.trim(),
       mcp_collection: $('#mem-collection').value.trim(),
       mcp_topk: +$('#mem-topk').value || 10,
+      mcp_timeout: +$('#mem-timeout').value || 120,
       mcp_threshold: +$('#mem-threshold').value,
       mcp_enabled: $('#mem-enabled').checked,
     }),
@@ -662,7 +664,7 @@ async function saveMemory(silent) {
   if (!silent) toast('Memory 设置已保存');
 }
 $('#btn-mem-save').onclick = () => asyncAction($('#btn-mem-save'), () => saveMemory(false));
-['mem-url', 'mem-collection', 'mem-topk', 'mem-threshold', 'mem-enabled'].forEach((id) => {
+['mem-url', 'mem-collection', 'mem-topk', 'mem-timeout', 'mem-threshold', 'mem-enabled'].forEach((id) => {
   const el = document.getElementById(id); if (el) el.addEventListener('change', () => saveMemory(true).catch((e) => toast('Memory 保存失败：' + e.message, 'err')));
 });
 $('#btn-mem-test').onclick = async () => {

@@ -13,6 +13,7 @@ import (
 	"embed"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"image"
@@ -105,6 +106,9 @@ func (r *runtimeSettings) update(root string, patch map[string]any) settings.Set
 	}
 	if v, ok := patch["mcp_topk"].(float64); ok && v > 0 {
 		r.cur.MCPTopK = int(v)
+	}
+	if v, ok := patch["mcp_timeout"].(float64); ok && v > 0 {
+		r.cur.MCPTimeout = int(v)
 	}
 	if v, ok := patch["mcp_threshold"].(float64); ok {
 		r.cur.MCPThreshold = v
@@ -253,7 +257,7 @@ func main() {
 				"upstream": s.Upstream, "api_key_set": s.APIKey != "",
 				"api_key_hint": settings.Mask(s.APIKey), "rerank_url": s.RerankURL,
 				"mcp_url": s.MCPURL, "mcp_collection": s.MCPCollection,
-				"mcp_enabled": s.MCPEnabled, "mcp_topk": s.MCPTopK, "mcp_threshold": s.MCPThreshold,
+				"mcp_enabled": s.MCPEnabled, "mcp_topk": s.MCPTopK, "mcp_timeout": s.MCPTimeout, "mcp_threshold": s.MCPThreshold,
 				"current_char": s.CurrentChar, "user_name": s.UserName,
 				"ntfy_url": s.NtfyURL, "ntfy_topic": s.NtfyTopic,
 				"distill_enabled": s.DistillEnabled, "distill_interval": s.DistillInterval,
@@ -349,7 +353,7 @@ func main() {
 		b, _ := io.ReadAll(r.Body)
 		_ = json.Unmarshal(b, &in)
 		s := rt.get()
-		hits, err := mcp.New(s.MCPURL).Search(r.Context(), in.Query, s.MCPCollection, s.MCPTopK, s.MCPThreshold)
+		hits, err := searchMCP(r.Context(), s, in.Query)
 		if err != nil {
 			writeJSON(w, map[string]any{"ok": false, "error": err.Error()})
 			return
@@ -1519,6 +1523,26 @@ func lastUserText(chat []engine.Message) string {
 	return ""
 }
 
+func mcpTimeout(s settings.Settings) time.Duration {
+	seconds := s.MCPTimeout
+	if seconds <= 0 {
+		seconds = 120
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func searchMCP(ctx context.Context, s settings.Settings, query string) ([]memory.Hit, error) {
+	timeout := mcpTimeout(s)
+	searchCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	hits, err := mcp.NewWithTimeout(firstNonEmpty(s.MCPURL, "http://192.168.10.2:8199"), timeout).
+		Search(searchCtx, query, s.MCPCollection, s.MCPTopK, s.MCPThreshold)
+	if err != nil && errors.Is(err, context.DeadlineExceeded) {
+		return nil, fmt.Errorf("mcp search timeout (%s): %w", timeout, err)
+	}
+	return hits, err
+}
+
 // resolveMCP fills enabled mcp-source blocks by searching rag-mcp-server with
 // the latest user utterance. Fail-open: errors are recorded, chat continues.
 // Returns an audit-friendly summary (also served by /api/assemble preview).
@@ -1535,28 +1559,9 @@ func resolveMCP(ctx context.Context, s settings.Settings, blocks []engine.Block,
 		info["hits"] = 0
 		return info
 	}
-	cli := mcp.New(firstNonEmpty(s.MCPURL, "http://192.168.10.2:8199"))
-	// Bound the recall so a hung MCP never stalls a chat turn.
-	type res struct {
-		hits []memory.Hit
-		err  error
-	}
-	ch := make(chan res, 1)
-	go func() {
-		h, err := cli.Search(ctx, query, s.MCPCollection, s.MCPTopK, s.MCPThreshold)
-		ch <- res{h, err}
-	}()
-	var hits []memory.Hit
-	select {
-	case r := <-ch:
-		if r.err != nil {
-			info["error"] = r.err.Error()
-			info["hits"] = 0
-			return info
-		}
-		hits = r.hits
-	case <-time.After(20 * time.Second):
-		info["error"] = "mcp search timeout (20s)"
+	hits, err := searchMCP(ctx, s, query)
+	if err != nil {
+		info["error"] = err.Error()
 		info["hits"] = 0
 		return info
 	}

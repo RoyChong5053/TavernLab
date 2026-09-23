@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -19,15 +20,24 @@ import (
 	"github.com/RoyChong5053/TavernLab/internal/memory"
 )
 
+const DefaultTimeout = 120 * time.Second
+
 // Client talks to http(s)://host:port/mcp.
 type Client struct {
 	BaseURL string
 	HTTP    *http.Client
 }
 
-// New builds a client with a sane default timeout.
+// New builds a client with the default timeout.
 func New(baseURL string) *Client {
-	return &Client{BaseURL: strings.TrimRight(baseURL, "/"), HTTP: &http.Client{Timeout: 30 * time.Second}}
+	return NewWithTimeout(baseURL, DefaultTimeout)
+}
+
+func NewWithTimeout(baseURL string, timeout time.Duration) *Client {
+	if timeout <= 0 {
+		timeout = DefaultTimeout
+	}
+	return &Client{BaseURL: strings.TrimRight(baseURL, "/"), HTTP: &http.Client{Timeout: timeout}}
 }
 
 var resultHead = regexp.MustCompile(`(?m)^--- Result \d+ \(score: ([\d.]+)\) ---\n?`)
@@ -63,12 +73,21 @@ func (c *Client) Search(ctx context.Context, query, collection string, topK int,
 		return nil, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		detail := strings.TrimSpace(string(body))
+		if detail == "" {
+			detail = resp.Status
+		}
+		return nil, fmt.Errorf("mcp http error: %s", detail)
+	}
 	var rpc struct {
 		Result *struct {
 			Content []struct {
 				Type string `json:"type"`
 				Text string `json:"text"`
 			} `json:"content"`
+			IsError bool `json:"isError"`
 		} `json:"result"`
 		Error *struct {
 			Message string `json:"message"`
@@ -88,6 +107,13 @@ func (c *Client) Search(ctx context.Context, query, collection string, topK int,
 		if c.Type == "text" {
 			text.WriteString(c.Text)
 		}
+	}
+	if rpc.Result.IsError {
+		detail := strings.TrimSpace(text.String())
+		if detail == "" {
+			detail = "tool call failed"
+		}
+		return nil, fmt.Errorf("mcp tool error: %s", detail)
 	}
 	return splitResults(text.String()), nil
 }

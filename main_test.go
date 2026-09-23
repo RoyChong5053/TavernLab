@@ -1,12 +1,17 @@
 package main
 
 import (
+	"context"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/RoyChong5053/TavernLab/internal/engine"
+	"github.com/RoyChong5053/TavernLab/internal/settings"
 	"github.com/RoyChong5053/TavernLab/internal/store"
 )
 
@@ -78,5 +83,45 @@ func TestMigrateLegacyChats(t *testing.T) {
 	msgs, _ := st.LoadAll("旧角色")
 	if len(msgs) != 1 || msgs[0].Text != "老数据" {
 		t.Fatalf("legacy migration failed: %v", msgs)
+	}
+}
+
+func TestResolveMCPTimeoutCancelsRequest(t *testing.T) {
+	handlerDone := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer close(handlerDone)
+		select {
+		case <-r.Context().Done():
+		case <-time.After(2 * time.Second):
+		}
+	}))
+	defer srv.Close()
+
+	s := settings.Settings{
+		MCPEnabled:   true,
+		MCPURL:       srv.URL,
+		MCPTimeout:   1,
+		MCPTopK:      10,
+		MCPThreshold: -1,
+	}
+	blocks := []engine.Block{{
+		ID: "rag_mcp", Enabled: true,
+		Source:   engine.Source{Type: "mcp"},
+		Template: "{{rag}}",
+	}}
+	started := time.Now()
+	info := resolveMCP(context.Background(), s, blocks, []engine.Message{{Role: "user", Content: "query"}})
+	if elapsed := time.Since(started); elapsed > 1500*time.Millisecond {
+		t.Fatalf("MCP timeout was not honored: %s", elapsed)
+	}
+
+	errText, _ := info["error"].(string)
+	if !strings.Contains(errText, "mcp search timeout") {
+		t.Fatalf("expected timeout error, got %v", info)
+	}
+	select {
+	case <-handlerDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("test server handler did not finish")
 	}
 }

@@ -118,6 +118,7 @@
         <label>Collection ID（空=服务端默认 global_memory） <input id="mem-collection" size="18" placeholder="空=默认"></label>
         <div class="row">
           <label>top-k <input id="mem-topk" type="number" value="10" style="width:56px"></label>
+          <label>timeout（秒） <input id="mem-timeout" type="number" min="1" value="120" style="width:64px"></label>
           <label>threshold（-1=服务端默认） <input id="mem-threshold" type="number" step="0.01" value="-1" style="width:64px"></label>
           <label><input type="checkbox" id="mem-enabled"> 每轮自动检索</label>
         </div>

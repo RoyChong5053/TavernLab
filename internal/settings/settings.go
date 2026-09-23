@@ -19,6 +19,7 @@ type Settings struct {
 	MCPCollection     string  `json:"mcp_collection,omitempty"`
 	MCPEnabled        bool    `json:"mcp_enabled"`
 	MCPTopK           int     `json:"mcp_topk,omitempty"`
+	MCPTimeout        int     `json:"mcp_timeout,omitempty"`
 	MCPThreshold      float64 `json:"mcp_threshold,omitempty"` // <0 = omit (server default)
 	CurrentChar       string  `json:"current_char,omitempty"`  // source of truth for web + app
 	UserName          string  `json:"user_name,omitempty"`     // export attribution / {{user}}
@@ -41,6 +42,7 @@ func Defaults() Settings {
 		MCPCollection:     "",
 		MCPEnabled:        false,
 		MCPTopK:           10,
+		MCPTimeout:        120,
 		MCPThreshold:      -1,
 		CurrentChar:       "Leer乐儿",
 		UserName:          "RoyChong",
@@ -79,6 +81,9 @@ func Load(root string) Settings {
 	s.MCPEnabled = f.MCPEnabled
 	if f.MCPTopK > 0 {
 		s.MCPTopK = f.MCPTopK
+	}
+	if f.MCPTimeout > 0 {
+		s.MCPTimeout = f.MCPTimeout
 	}
 	if f.MCPThreshold >= 0 {
 		s.MCPThreshold = f.MCPThreshold
