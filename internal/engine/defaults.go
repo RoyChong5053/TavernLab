@@ -32,7 +32,7 @@ func DefaultBlocks() []Block {
 		},
 		{
 			ID: "distilled", Role: "system", Order: 40, Enabled: true,
-			Budget:   Budget{Max: 2000},
+			Budget:   Budget{Max: 4000},
 			Source:   Source{Type: "distilled", Collection: "default"},
 			Template: "<User State(Distilled Memory)>\n{{distilled}}\n</User State>",
 		},

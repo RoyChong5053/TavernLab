@@ -134,7 +134,8 @@
         <div class="row">
           <label class="meta"><input type="checkbox" id="dmem-enabled"> 自动蒸馏</label>
           <label>每 <input id="dmem-interval" type="number" min="1" value="8" style="width:56px"> 个用户轮</label>
-          <label>上限 <input id="dmem-maxchars" type="number" min="200" value="2000" style="width:80px"> 字</label>
+          <label>上限 <input id="dmem-maxchars" type="number" min="200" value="4000" style="width:80px"> 字</label>
+          <label>至少保留 <input id="dmem-retain" type="number" min="1" value="3" style="width:56px"> 天</label>
           <label>模型 <input id="dmem-model" size="14" placeholder="空=主模型"></label>
           <button id="btn-dmem-run" class="primary">立即蒸馏</button>
           <button id="btn-dmem-save">保存</button>

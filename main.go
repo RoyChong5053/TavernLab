@@ -15,6 +15,10 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"image"
+	_ "image/gif"  // register decoders for image.DecodeConfig
+	_ "image/jpeg" // (media may be png/jpg/gif; header-only, cheap)
+	_ "image/png"
 	"io"
 	"io/fs"
 	"log"
@@ -22,6 +26,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -129,6 +134,9 @@ func (r *runtimeSettings) update(root string, patch map[string]any) settings.Set
 	if v, ok := patch["distill_max_chars"].(float64); ok && v > 0 {
 		r.cur.DistillMaxChars = int(v)
 	}
+	if v, ok := patch["distill_retain_days"].(float64); ok && v > 0 {
+		r.cur.DistillRetainDays = int(v)
+	}
 	if v, ok := patch["distill_model"]; ok {
 		if s, ok := v.(string); ok {
 			r.cur.DistillModel = s
@@ -172,6 +180,7 @@ func main() {
 	st.MigrateLegacyChats()
 	client := &http.Client{Timeout: 10 * time.Minute}
 	events = newHub()
+	loadCalibration(cfg.DataRoot)
 
 	mux := http.NewServeMux()
 
@@ -248,7 +257,8 @@ func main() {
 				"current_char": s.CurrentChar, "user_name": s.UserName,
 				"ntfy_url": s.NtfyURL, "ntfy_topic": s.NtfyTopic,
 				"distill_enabled": s.DistillEnabled, "distill_interval": s.DistillInterval,
-				"distill_max_chars": s.DistillMaxChars, "distill_model": s.DistillModel,
+				"distill_max_chars": s.DistillMaxChars, "distill_retain_days": s.DistillRetainDays,
+				"distill_model":  s.DistillModel,
 				"distill_prompt": s.DistillPrompt, "distill_prompt_default": distill.DefaultPrompt,
 			})
 		case "PUT":
@@ -300,7 +310,8 @@ func main() {
 		writeJSON(w, map[string]any{
 			"session": session, "sheet": sheet, "meta": distill.LoadMeta(cfg.DataRoot, session),
 			"enabled": s.DistillEnabled, "interval": s.DistillInterval,
-			"max_chars": s.DistillMaxChars, "model": s.DistillModel,
+			"max_chars": s.DistillMaxChars, "retain_days": s.DistillRetainDays,
+			"model":  s.DistillModel,
 			"prompt": prompt, "default_prompt": distill.DefaultPrompt,
 		})
 	})
@@ -414,7 +425,7 @@ func main() {
 		turns := engineTurns(in.Chat)
 		if in.Session != "" {
 			if all, err := st.LoadAll(in.Session); err == nil {
-				turns = chatToTurns(all)
+				turns = chatToTurns(cfg.DataRoot, session, all)
 			}
 		}
 		blocks = renderBlocks(cfg.DataRoot, session, rt.get().UserName, blocks)
@@ -469,7 +480,7 @@ func main() {
 			msg, _ := st.AppendChat(session, "user", userText, paths...)
 			events.publish(session, msg)
 			all, _ := st.LoadAll(session)
-			turns = chatToTurns(all)
+			turns = chatToTurns(cfg.DataRoot, session, all)
 			persisted = true
 		} else if len(in.Messages) > 0 {
 			// classic OpenAI path: convert caller messages to turns
@@ -485,9 +496,7 @@ func main() {
 		if model == nil || model == "" {
 			model = "default"
 		}
-		upBody, _ := json.Marshal(map[string]any{
-			"model": model, "messages": upMsgs, "stream": in.Stream,
-		})
+		upBody := streamUpBody(model, upMsgs, in.Stream)
 		auditID := time.Now().Format("20060102-150405.000")
 
 		// Legacy path (no Text, no Images): user turn arrived inside in.Chat.
@@ -504,10 +513,11 @@ func main() {
 				http.Error(w, "streaming unsupported", 500)
 				return
 			}
-			status, rebuilt, _ := proxy.Forward(client, s.Upstream, s.APIKey, upBody, true, w, flusher)
-			_ = st.SaveAudit(toAudit(auditID, model, res, upBody, rebuilt, nil, memInfo))
+			status, rebuilt, usage := proxy.Forward(client, s.Upstream, s.APIKey, upBody, true, w, flusher)
+			_ = st.SaveAudit(toAudit(auditID, model, res, upBody, rebuilt, usage, memInfo))
 			reply := strings.TrimSpace(rebuiltText(rebuilt))
-			logTurn("chat.stream", status, model, session, res, reply, memInfo)
+			logTurn("chat.stream", status, model, session, res, reply, memInfo, usagePromptTokens(usage))
+			updateCalibration(cfg.DataRoot, res.TotalTok, usagePromptTokens(usage))
 			if reply != "" {
 				msg, _ := st.AppendChat(session, "assistant", reply)
 				events.publish(session, msg)
@@ -522,7 +532,8 @@ func main() {
 		_, _ = w.Write(respBody)
 		_ = st.SaveAudit(toAudit(auditID, model, res, upBody, respBody, usage, memInfo))
 		reply := strings.TrimSpace(replyText(respBody))
-		logTurn("chat", status, model, session, res, reply, memInfo)
+		logTurn("chat", status, model, session, res, reply, memInfo, usagePromptTokens(usage))
+		updateCalibration(cfg.DataRoot, res.TotalTok, usagePromptTokens(usage))
 		if status >= 400 {
 			obs.Warn("upstream error", map[string]any{"path": "/v1/chat/completions", "status": status, "body": excerpt(string(respBody), 300)})
 		}
@@ -935,19 +946,20 @@ func main() {
 			events.publish(session, msg)
 		}
 		all, _ := st.LoadAll(session)
-		turns := chatToTurns(all)
+		turns := chatToTurns(cfg.DataRoot, session, all)
 		blocks := renderBlocks(cfg.DataRoot, session, s.UserName, loadBlocks())
 		memInfo := resolveMCP(r.Context(), s, blocks, turns)
 		res := engine.Assemble(engine.Input{Blocks: blocks, Cfg: cfg.Ctx, Turns: turns})
 		upMsgs := buildUpMessages(res.Messages, upImages)
-		upBody, _ := json.Marshal(map[string]any{"model": model, "messages": upMsgs, "stream": in.Stream})
+		upBody := streamUpBody(model, upMsgs, in.Stream)
 		auditID := time.Now().Format("20060102-150405.000")
 
 		if !in.Stream {
 			status, respBody, usage := proxy.Forward(client, s.Upstream, s.APIKey, upBody, false, nil, nil)
 			reply := replyText(respBody)
 			_ = st.SaveAudit(toAudit(auditID, model, res, upBody, respBody, usage, memInfo))
-			logTurn("app.request", status, model, session, res, reply, memInfo)
+			logTurn("app.request", status, model, session, res, reply, memInfo, usagePromptTokens(usage))
+			updateCalibration(cfg.DataRoot, res.TotalTok, usagePromptTokens(usage))
 			if status >= 400 {
 				obs.Warn("upstream error", map[string]any{"path": "/api/chat", "status": status, "body": excerpt(string(respBody), 300)})
 			}
@@ -969,13 +981,14 @@ func main() {
 			http.Error(w, "streaming unsupported", 500)
 			return
 		}
-		status, full := forwardOllamaStream(client, s.Upstream, s.APIKey, upBody, model, w, flusher)
+		status, full, usage := forwardOllamaStream(client, s.Upstream, s.APIKey, upBody, model, w, flusher)
 		rebuilt, _ := json.Marshal(map[string]any{
 			"choices":        []map[string]any{{"message": map[string]any{"role": "assistant", "content": full}}},
 			"stream_rebuilt": true, "via": "ollama-shim",
 		})
-		_ = st.SaveAudit(toAudit(auditID, model, res, upBody, rebuilt, nil, memInfo))
-		logTurn("app.stream", status, model, session, res, strings.TrimSpace(full), memInfo)
+		_ = st.SaveAudit(toAudit(auditID, model, res, upBody, rebuilt, usage, memInfo))
+		logTurn("app.stream", status, model, session, res, strings.TrimSpace(full), memInfo, usagePromptTokens(usage))
+		updateCalibration(cfg.DataRoot, res.TotalTok, usagePromptTokens(usage))
 		if strings.TrimSpace(full) != "" {
 			msg, _ := st.AppendChat(session, "assistant", full)
 			events.publish(session, msg)
@@ -1120,16 +1133,70 @@ func loadCharMeta(base string) map[string]any {
 // through verbatim (no name prefix) — prefixing used to teach the model to
 // emit "角色名: " in its own replies; attribution for export comes from
 // timelineMD instead, which reads the JSONL directly.
-func chatToTurns(msgs []store.ChatMessage) []engine.Message {
+func chatToTurns(root, session string, msgs []store.ChatMessage) []engine.Message {
 	turns := make([]engine.Message, 0, len(msgs))
 	for _, m := range msgs {
 		role := m.Role
 		if role != "user" && role != "assistant" && role != "system" {
 			continue // e.g. distilled_memory: recorded in JSONL, injected as a block
 		}
-		turns = append(turns, engine.Message{Role: role, Content: m.Text})
+		turns = append(turns, engine.Message{
+			Role:        role,
+			Content:     m.Text,
+			ImageTokens: imageTokensForMedia(root, session, m.Images),
+		})
 	}
 	return turns
+}
+
+// defaultImageTokens is the conservative per-image fallback when a stored file
+// is missing or its dimensions cannot be decoded.
+const defaultImageTokens = 1024
+
+// geminiImageTokens approximates Gemini's image tokenisation: <=384px costs a
+// flat 258; larger images are cropped into 768x768 tiles, 258 tokens each.
+func geminiImageTokens(w, h int) int {
+	if w <= 0 || h <= 0 {
+		return defaultImageTokens
+	}
+	if w <= 384 && h <= 384 {
+		return 258
+	}
+	tiles := ((w + 767) / 768) * ((h + 767) / 768)
+	if tiles < 1 {
+		tiles = 1
+	}
+	return 258 * tiles
+}
+
+// imageTokensForMedia sums the estimated token cost of a message's stored
+// images. Only the image header is read (image.DecodeConfig), so this stays
+// cheap even when called for every historical turn on each request.
+func imageTokensForMedia(root, session string, rel []string) int {
+	if len(rel) == 0 {
+		return 0
+	}
+	base := filepath.Join(root, "characters", store.CleanSession(session))
+	total := 0
+	for _, r := range rel {
+		cfg, err := decodeImageConfig(filepath.Join(base, r))
+		if err != nil {
+			total += defaultImageTokens
+			continue
+		}
+		total += geminiImageTokens(cfg.Width, cfg.Height)
+	}
+	return total
+}
+
+func decodeImageConfig(path string) (image.Config, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return image.Config{}, err
+	}
+	defer f.Close()
+	cfg, _, err := image.DecodeConfig(f)
+	return cfg, err
 }
 
 // engineTurns converts legacy {"role","content"} maps to engine turns.
@@ -1329,13 +1396,26 @@ func upstreamModelIDs(client *http.Client, upstream, apiKey string) []string {
 	return ids
 }
 
+// streamUpBody builds the upstream body, adding stream_options.include_usage
+// for streams so OpenAI-compatible providers return token usage in the final
+// chunk (needed for estimate self-calibration and overflow detection).
+func streamUpBody(model any, msgs []map[string]any, stream bool) []byte {
+	body := map[string]any{"model": model, "messages": msgs, "stream": stream}
+	if stream {
+		body["stream_options"] = map[string]any{"include_usage": true}
+	}
+	b, _ := json.Marshal(body)
+	return b
+}
+
 // forwardOllamaStream POSTs an SSE chat body upstream and relays it as Ollama
 // NDJSON chunks ({"message":{"content":...},"done":false} … {"done":true}).
-// Returns upstream status + full assistant text (for audit/JSONL).
-func forwardOllamaStream(client *http.Client, upstream, apiKey string, upBody []byte, model string, w http.ResponseWriter, flusher http.Flusher) (int, string) {
+// Returns upstream status, full assistant text (for audit/JSONL), and usage
+// when the provider reports it.
+func forwardOllamaStream(client *http.Client, upstream, apiKey string, upBody []byte, model string, w http.ResponseWriter, flusher http.Flusher) (int, string, map[string]any) {
 	req, err := http.NewRequest("POST", strings.TrimRight(upstream, "/")+"/v1/chat/completions", bytes.NewReader(upBody))
 	if err != nil {
-		return 500, ""
+		return 500, "", nil
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if apiKey != "" {
@@ -1343,7 +1423,7 @@ func forwardOllamaStream(client *http.Client, upstream, apiKey string, upBody []
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return 502, ""
+		return 502, "", nil
 	}
 	defer resp.Body.Close()
 	w.Header().Set("Content-Type", "application/x-ndjson")
@@ -1373,6 +1453,7 @@ func forwardOllamaStream(client *http.Client, upstream, apiKey string, upBody []
 		flusher.Flush()
 	}
 	var full strings.Builder
+	var usage map[string]any
 	sc := bufio.NewScanner(resp.Body)
 	sc.Buffer(make([]byte, 1024*1024), 1024*1024)
 	for sc.Scan() {
@@ -1390,6 +1471,7 @@ func forwardOllamaStream(client *http.Client, upstream, apiKey string, upBody []
 					Content string `json:"content"`
 				} `json:"delta"`
 			} `json:"choices"`
+			Usage map[string]any `json:"usage"`
 		}
 		if json.Unmarshal([]byte(payload), &chunk) != nil {
 			continue
@@ -1400,9 +1482,12 @@ func forwardOllamaStream(client *http.Client, upstream, apiKey string, upBody []
 				emit(c.Delta.Content, false)
 			}
 		}
+		if chunk.Usage != nil {
+			usage = chunk.Usage
+		}
 	}
 	emit("", true)
-	return resp.StatusCode, full.String()
+	return resp.StatusCode, full.String(), usage
 }
 
 // stubTitle falls back to the prompt head when the title LLM call fails.
@@ -1494,11 +1579,14 @@ func resolveMCP(ctx context.Context, s settings.Settings, blocks []engine.Block,
 
 // logTurn emits one structured line per generation so the Logs page shows
 // exactly what happened even when the client gets nothing.
-func logTurn(kind string, status int, model any, session string, res engine.AssembleResult, reply string, mem map[string]any) {
+func logTurn(kind string, status int, model any, session string, res engine.AssembleResult, reply string, mem map[string]any, actual int) {
 	fields := map[string]any{
 		"kind": kind, "status": status, "model": fmt.Sprint(model), "session": session,
 		"tier": res.Tier, "tokens": res.TotalTok, "overflow": res.Overflow,
 		"reply_len": len(reply),
+	}
+	if actual > 0 {
+		fields["actual"] = actual
 	}
 	if mem != nil {
 		fields["mcp_hits"] = mem["hits"]
@@ -1509,6 +1597,12 @@ func logTurn(kind string, status int, model any, session string, res engine.Asse
 	lvl := obs.LevelInfo
 	if status >= 400 || reply == "" {
 		lvl = obs.LevelWarn
+	}
+	// Real prompt exceeded the reserved input budget (now that images are
+	// counted and the estimate self-calibrates, this is a genuine overflow).
+	if res.Overflow || (actual > 0 && actual > res.BudgetTok) {
+		lvl = obs.LevelWarn
+		fields["over_budget"] = true
 	}
 	obs.Log(lvl, "turn", fields)
 }
@@ -1575,7 +1669,11 @@ func runDistill(ctx context.Context, st *store.Store, client *http.Client, root 
 	}
 	maxChars := s.DistillMaxChars
 	if maxChars <= 0 {
-		maxChars = 2000
+		maxChars = 4000
+	}
+	retainDays := s.DistillRetainDays
+	if retainDays <= 0 {
+		retainDays = 3
 	}
 	all, err := st.LoadAll(session)
 	if err != nil {
@@ -1604,6 +1702,7 @@ func runDistill(ctx context.Context, st *store.Store, client *http.Client, root 
 	}
 	prompt := applyMacros(promptTpl, time.Now(), firstNonEmpty(s.UserName, "user"))
 	prompt = strings.ReplaceAll(prompt, "{{maxchars}}", fmt.Sprint(maxChars))
+	prompt = strings.ReplaceAll(prompt, "{{retain_days}}", strconv.Itoa(retainDays))
 	prompt = strings.ReplaceAll(prompt, "{{words}}", fmt.Sprint(maxChars))
 	model := firstNonEmpty(s.DistillModel, "auto-gemini")
 	upBody, _ := json.Marshal(map[string]any{
@@ -1622,7 +1721,13 @@ func runDistill(ctx context.Context, st *store.Store, client *http.Client, root 
 	if sheet == "" {
 		return "", fmt.Errorf("上游返回空事实表")
 	}
-	if err := distill.Save(root, session, sheet); err != nil {
+	if !distill.IsValid(sheet) {
+		return "", fmt.Errorf("蒸馏输出无法解析（保留旧事实表）")
+	}
+	// Code-side retention guard: restore anything the model dropped, then trim
+	// by whole oldest days but never below retainDays. The LLM never deletes.
+	final := distill.EnforceWindow(distill.Merge(prev, sheet), maxChars, retainDays)
+	if err := distill.Save(root, session, final); err != nil {
 		return "", err
 	}
 	meta.LastRun = time.Now().Format(time.RFC3339)
@@ -1633,11 +1738,14 @@ func runDistill(ctx context.Context, st *store.Store, client *http.Client, root 
 	_ = distill.SaveMeta(root, session, meta)
 	// Record the sheet itself in the chat JSONL as its own role so the
 	// injected memory is auditable alongside the conversation.
-	if msg, err := st.AppendChat(session, "distilled_memory", sheet); err == nil {
+	if msg, err := st.AppendChat(session, "distilled_memory", final); err == nil {
 		events.publish(session, msg)
 	}
-	obs.Info("distill ok", map[string]any{"session": session, "chars": len(sheet), "runs": meta.Runs, "model": model})
-	return sheet, nil
+	obs.Info("distill ok", map[string]any{
+		"session": session, "chars": len(final), "days": distill.DayCount(final),
+		"retain_days": retainDays, "runs": meta.Runs, "model": model,
+	})
+	return final, nil
 }
 
 func excerpt(s string, n int) string {

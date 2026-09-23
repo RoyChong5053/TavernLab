@@ -63,10 +63,13 @@ func DefaultConfig() ContextConfig {
 	}
 }
 
-// Message is an OpenAI-style chat message.
+// Message is an OpenAI-style chat message. ImageTokens carries the estimated
+// cost of any images attached to this turn (0 for text-only) so the budget
+// engine reserves room for multimodal payloads it cannot see in Content.
 type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role        string `json:"role"`
+	Content     string `json:"content"`
+	ImageTokens int    `json:"image_tokens,omitempty"`
 }
 
 // BlockUsage is per-block audit info.
@@ -113,11 +116,7 @@ func EstimateTokens(s string) int {
 			other++
 		}
 	}
-	n := cjk + (other+3)/4
-	if n < 1 {
-		n = 1
-	}
-	return n
+	return ScaleTokens(cjk + (other+3)/4)
 }
 
 func isWide(r rune) bool {
@@ -143,7 +142,7 @@ const msgOverhead = 4
 func turnsTokens(turns []Message) []int {
 	out := make([]int, len(turns))
 	for i, t := range turns {
-		out[i] = EstimateTokens(t.Content) + msgOverhead
+		out[i] = EstimateTokens(t.Content) + msgOverhead + t.ImageTokens
 	}
 	return out
 }

@@ -12,39 +12,41 @@ import (
 
 // Settings is the runtime-tunable config. Empty APIKey on PUT means "keep".
 type Settings struct {
-	Upstream        string  `json:"upstream,omitempty"`
-	APIKey          string  `json:"api_key,omitempty"`
-	RerankURL       string  `json:"rerank_url,omitempty"`
-	MCPURL          string  `json:"mcp_url,omitempty"`
-	MCPCollection   string  `json:"mcp_collection,omitempty"`
-	MCPEnabled      bool    `json:"mcp_enabled"`
-	MCPTopK         int     `json:"mcp_topk,omitempty"`
-	MCPThreshold    float64 `json:"mcp_threshold,omitempty"` // <0 = omit (server default)
-	CurrentChar     string  `json:"current_char,omitempty"`  // source of truth for web + app
-	UserName        string  `json:"user_name,omitempty"`     // export attribution / {{user}}
-	NtfyURL         string  `json:"ntfy_url,omitempty"`      // self-hosted ntfy base, empty = disabled
-	NtfyTopic       string  `json:"ntfy_topic,omitempty"`
-	DistillEnabled  bool    `json:"distill_enabled"`             // auto-distill every N user turns
-	DistillInterval int     `json:"distill_interval,omitempty"`  // user turns between runs (default 8)
-	DistillMaxChars int     `json:"distill_max_chars,omitempty"` // fact-sheet character budget (default 2000)
-	DistillModel    string  `json:"distill_model,omitempty"`     // empty = main model
-	DistillPrompt   string  `json:"distill_prompt,omitempty"`    // empty = built-in default
+	Upstream          string  `json:"upstream,omitempty"`
+	APIKey            string  `json:"api_key,omitempty"`
+	RerankURL         string  `json:"rerank_url,omitempty"`
+	MCPURL            string  `json:"mcp_url,omitempty"`
+	MCPCollection     string  `json:"mcp_collection,omitempty"`
+	MCPEnabled        bool    `json:"mcp_enabled"`
+	MCPTopK           int     `json:"mcp_topk,omitempty"`
+	MCPThreshold      float64 `json:"mcp_threshold,omitempty"` // <0 = omit (server default)
+	CurrentChar       string  `json:"current_char,omitempty"`  // source of truth for web + app
+	UserName          string  `json:"user_name,omitempty"`     // export attribution / {{user}}
+	NtfyURL           string  `json:"ntfy_url,omitempty"`      // self-hosted ntfy base, empty = disabled
+	NtfyTopic         string  `json:"ntfy_topic,omitempty"`
+	DistillEnabled    bool    `json:"distill_enabled"`               // auto-distill every N user turns
+	DistillInterval   int     `json:"distill_interval,omitempty"`    // user turns between runs (default 8)
+	DistillMaxChars   int     `json:"distill_max_chars,omitempty"`   // fact-sheet character budget (default 4000)
+	DistillRetainDays int     `json:"distill_retain_days,omitempty"` // always keep at least N days (default 3)
+	DistillModel      string  `json:"distill_model,omitempty"`       // empty = main model
+	DistillPrompt     string  `json:"distill_prompt,omitempty"`      // empty = built-in default
 }
 
 // Defaults for a fresh checkout talking to the home LAN.
 func Defaults() Settings {
 	return Settings{
-		Upstream:        "http://192.168.10.2:3000",
-		RerankURL:       "http://127.0.0.1:11437",
-		MCPURL:          "http://192.168.10.2:8199",
-		MCPCollection:   "",
-		MCPEnabled:      false,
-		MCPTopK:         10,
-		MCPThreshold:    -1,
-		CurrentChar:     "Leer乐儿",
-		UserName:        "RoyChong",
-		DistillInterval: 8,
-		DistillMaxChars: 2000,
+		Upstream:          "http://192.168.10.2:3000",
+		RerankURL:         "http://127.0.0.1:11437",
+		MCPURL:            "http://192.168.10.2:8199",
+		MCPCollection:     "",
+		MCPEnabled:        false,
+		MCPTopK:           10,
+		MCPThreshold:      -1,
+		CurrentChar:       "Leer乐儿",
+		UserName:          "RoyChong",
+		DistillInterval:   8,
+		DistillMaxChars:   4000,
+		DistillRetainDays: 3,
 	}
 }
 
@@ -99,6 +101,9 @@ func Load(root string) Settings {
 	}
 	if f.DistillMaxChars > 0 {
 		s.DistillMaxChars = f.DistillMaxChars
+	}
+	if f.DistillRetainDays > 0 {
+		s.DistillRetainDays = f.DistillRetainDays
 	}
 	if f.DistillModel != "" {
 		s.DistillModel = f.DistillModel

@@ -69,6 +69,29 @@ func TestOverflow(t *testing.T) {
 	}
 }
 
+func TestImageTokensRaiseTier(t *testing.T) {
+	turns := []Message{{Role: "user", Content: "look at this"}}
+	plain := Assemble(Input{Blocks: fixedBlocks("sys"), Cfg: DefaultConfig(), Turns: turns})
+	withImg := Assemble(Input{Blocks: fixedBlocks("sys"), Cfg: DefaultConfig(), Turns: []Message{
+		{Role: "user", Content: "look at this", ImageTokens: 9000},
+	}})
+	if plain.Tier != 8192 {
+		t.Fatalf("text-only should fit 8k, got %d", plain.Tier)
+	}
+	if withImg.Tier != 16384 {
+		t.Fatalf("image turn should force 16k, got %d", withImg.Tier)
+	}
+}
+
+func TestTextScaleCalibration(t *testing.T) {
+	defer SetTextScale(1.0)
+	raw := EstimateTokens("字字字字字字字字字字") // 10 CJK runes -> raw 10
+	SetTextScale(0.5)
+	if got := EstimateTokens("字字字字字字字字字字"); got >= raw || got != 5 {
+		t.Fatalf("scale 0.5 on raw %d: want 5, got %d", raw, got)
+	}
+}
+
 func TestUnresolvedDropped(t *testing.T) {
 	blocks := []Block{{
 		ID: "distilled", Role: "system", Order: 40, Enabled: true,

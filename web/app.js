@@ -695,10 +695,12 @@ async function loadDistill() {
     distillDefaultPrompt = j.default_prompt || '';
     $('#dmem-enabled').checked = !!j.enabled;
     $('#dmem-interval').value = j.interval || 8;
-    $('#dmem-maxchars').value = j.max_chars || 2000;
+    $('#dmem-maxchars').value = j.max_chars || 4000;
+    $('#dmem-retain').value = j.retain_days || 3;
     $('#dmem-model').value = j.model || '';
-    $('#dmem-prompt').value = (j.prompt && j.prompt !== distillDefaultPrompt) ? j.prompt : '';
-    $('#dmem-prompt').placeholder = '留空 = 内置默认（点“恢复默认提示词”可查看）';
+    // Open editable prompt: always show the effective template, not a blank box.
+    $('#dmem-prompt').value = j.prompt || distillDefaultPrompt;
+    $('#dmem-prompt').placeholder = '蒸馏提示词（可直接编辑；点“恢复默认提示词”重置）';
     const m = j.meta || {};
     $('#dmem-meta').textContent = m.runs ? `已运行 ${m.runs} 次 · 上次 ${(m.last_run || '').replace('T', ' ').replace(/\+.*$/, '')}` : '尚未蒸馏';
     $('#dmem-out').textContent = (j.sheet && j.sheet.trim()) ? j.sheet : '（还没有事实表，攒够轮数或点“立即蒸馏”）';
@@ -710,7 +712,8 @@ async function saveDistill(silent) {
     body: JSON.stringify({
       distill_enabled: $('#dmem-enabled').checked,
       distill_interval: +$('#dmem-interval').value || 8,
-      distill_max_chars: +$('#dmem-maxchars').value || 2000,
+      distill_max_chars: +$('#dmem-maxchars').value || 4000,
+      distill_retain_days: +$('#dmem-retain').value || 3,
       distill_model: $('#dmem-model').value.trim(),
       distill_prompt: $('#dmem-prompt').value,
     }),
@@ -718,7 +721,7 @@ async function saveDistill(silent) {
   if (!silent) toast('蒸馏设置已保存');
 }
 $('#btn-dmem-save').onclick = () => asyncAction($('#btn-dmem-save'), () => saveDistill(false));
-['dmem-enabled', 'dmem-interval', 'dmem-maxchars', 'dmem-model', 'dmem-prompt'].forEach((id) => {
+['dmem-enabled', 'dmem-interval', 'dmem-maxchars', 'dmem-retain', 'dmem-model', 'dmem-prompt'].forEach((id) => {
   const el = document.getElementById(id); if (el) el.addEventListener('change', () => saveDistill(true).catch((e) => toast('保存失败：' + e.message, 'err')));
 });
 $('#btn-dmem-run').onclick = () => asyncAction($('#btn-dmem-run'), async () => {
@@ -730,9 +733,9 @@ $('#btn-dmem-run').onclick = () => asyncAction($('#btn-dmem-run'), async () => {
   await loadDistill();
 });
 $('#btn-dmem-prompt-reset').onclick = () => {
-  $('#dmem-prompt').value = '';
+  $('#dmem-prompt').value = distillDefaultPrompt;
   $('#dmem-out').textContent = distillDefaultPrompt;
-  toast('已切到内置默认提示词（点保存生效）');
+  toast('已恢复内置默认提示词（点保存生效）');
 };
 $('#btn-dmem-prompt-view').onclick = () => loadDistill();
 

@@ -74,6 +74,7 @@ func Forward(client *http.Client, upstream, apiKey string, body []byte, stream b
 		return resp.StatusCode, payload, nil
 	}
 	var full strings.Builder
+	var usage map[string]any
 	sc := bufio.NewScanner(resp.Body)
 	sc.Buffer(make([]byte, 1024*1024), 1024*1024)
 	for sc.Scan() {
@@ -96,10 +97,14 @@ func Forward(client *http.Client, upstream, apiKey string, body []byte, stream b
 						Content string `json:"content"`
 					} `json:"delta"`
 				} `json:"choices"`
+				Usage map[string]any `json:"usage"`
 			}
 			if json.Unmarshal([]byte(payload), &chunk) == nil {
 				for _, c := range chunk.Choices {
 					full.WriteString(c.Delta.Content)
+				}
+				if chunk.Usage != nil {
+					usage = chunk.Usage
 				}
 			}
 		}
@@ -108,7 +113,7 @@ func Forward(client *http.Client, upstream, apiKey string, body []byte, stream b
 		"choices":        []map[string]any{{"message": map[string]any{"role": "assistant", "content": full.String()}}},
 		"stream_rebuilt": true, "time": time.Now().Format(time.RFC3339),
 	})
-	return resp.StatusCode, rebuilt, nil
+	return resp.StatusCode, rebuilt, usage
 }
 
 func extractUsage(b []byte) map[string]any {
