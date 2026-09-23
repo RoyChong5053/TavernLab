@@ -260,6 +260,7 @@ func main() {
 				"distill_max_chars": s.DistillMaxChars, "distill_retain_days": s.DistillRetainDays,
 				"distill_model":  s.DistillModel,
 				"distill_prompt": s.DistillPrompt, "distill_prompt_default": distill.DefaultPrompt,
+				"estimate_scale": engine.TextScale(),
 			})
 		case "PUT":
 			b, _ := io.ReadAll(r.Body)
