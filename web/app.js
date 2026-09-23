@@ -325,10 +325,10 @@ function renderImgPreview() {
 $('#btn-attach').onclick = () => $('#img-file').click();
 $('#img-file').onchange = async (e) => {
   const files = [...(e.target.files || [])];
-  for (const f of files) {
-    if (!f.type.startsWith('image/')) continue;
-    const d = await new Promise((res) => { const r = new FileReader(); r.onload = () => res(r.result); r.readAsDataURL(f); });
-    pendingImages.push(d);
+  // Single image only: most vision APIs can't handle multiple. New pick replaces.
+  const f = files.find((x) => x.type.startsWith('image/'));
+  if (f) {
+    pendingImages = [await new Promise((res) => { const r = new FileReader(); r.onload = () => res(r.result); r.readAsDataURL(f); })];
   }
   renderImgPreview();
   e.target.value = '';
@@ -404,11 +404,9 @@ $('#input').addEventListener('paste', async (e) => {
   const items = [...(e.clipboardData?.items || [])].filter((i) => i.type.startsWith('image/'));
   if (!items.length) return;
   e.preventDefault();
-  for (const it of items) {
-    const f = it.getAsFile();
-    if (!f) continue;
-    const d = await new Promise((res) => { const r = new FileReader(); r.onload = () => res(r.result); r.readAsDataURL(f); });
-    pendingImages.push(d);
+  const f = items[0].getAsFile();
+  if (f) {
+    pendingImages = [await new Promise((res) => { const r = new FileReader(); r.onload = () => res(r.result); r.readAsDataURL(f); })];
   }
   renderImgPreview();
 });

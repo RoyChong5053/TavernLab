@@ -459,13 +459,18 @@ func main() {
 		// window size never affects what the model sees.
 		turns := engineTurns(in.Chat)
 		var upImages []string
-		if userText := strings.TrimSpace(in.Text); userText != "" {
+		userText := strings.TrimSpace(in.Text)
+		persisted := false
+		if userText != "" || len(in.Images) > 0 {
+			// New path: the frontend sends only the fresh message. Images may
+			// arrive with or without a caption (image-only is allowed).
 			paths, dataURLs, _ := saveImages(cfg.DataRoot, session, in.Images)
 			upImages = dataURLs
 			msg, _ := st.AppendChat(session, "user", userText, paths...)
 			events.publish(session, msg)
 			all, _ := st.LoadAll(session)
 			turns = chatToTurns(all)
+			persisted = true
 		} else if len(in.Messages) > 0 {
 			// classic OpenAI path: convert caller messages to turns
 			turns = rawToTurns(in.Messages)
@@ -485,8 +490,8 @@ func main() {
 		})
 		auditID := time.Now().Format("20060102-150405.000")
 
-		// Legacy path (no Text): user turn arrived inside in.Chat, persist it.
-		if strings.TrimSpace(in.Text) == "" {
+		// Legacy path (no Text, no Images): user turn arrived inside in.Chat.
+		if !persisted && userText == "" {
 			if q := lastUserText(turns); q != "" {
 				msg, _ := st.AppendChat(session, "user", q)
 				events.publish(session, msg)
@@ -913,17 +918,20 @@ func main() {
 		var freshText string
 		var freshImages []string
 		for i := len(in.Messages) - 1; i >= 0; i-- {
-			if in.Messages[i].Role == "user" && strings.TrimSpace(in.Messages[i].Content) != "" {
+			// A fresh turn may carry text, images, or both (image-only sends
+			// are valid: the user may just want the model to look at a picture).
+			if in.Messages[i].Role == "user" &&
+				(strings.TrimSpace(in.Messages[i].Content) != "" || len(in.Messages[i].Images) > 0) {
 				freshText = in.Messages[i].Content
 				freshImages = in.Messages[i].Images
 				break
 			}
 		}
 		var upImages []string
-		if freshText != "" {
+		if strings.TrimSpace(freshText) != "" || len(freshImages) > 0 {
 			paths, dataURLs, _ := saveImages(cfg.DataRoot, session, freshImages)
 			upImages = dataURLs
-			msg, _ := st.AppendChat(session, "user", freshText, paths...)
+			msg, _ := st.AppendChat(session, "user", strings.TrimSpace(freshText), paths...)
 			events.publish(session, msg)
 		}
 		all, _ := st.LoadAll(session)
@@ -1186,7 +1194,7 @@ func saveImages(root, session string, imgs []string) (paths, dataURLs []string, 
 		if strings.TrimSpace(raw) == "" {
 			continue
 		}
-		mime := "image/png"
+		mime := ""
 		b64 := raw
 		if strings.HasPrefix(raw, "data:") {
 			if i := strings.Index(raw, ";base64,"); i >= 0 {
@@ -1200,6 +1208,11 @@ func saveImages(root, session string, imgs []string) (paths, dataURLs []string, 
 		data, decErr := base64.StdEncoding.DecodeString(strings.TrimSpace(b64))
 		if decErr != nil {
 			continue
+		}
+		// No declared mime (raw base64): sniff magic bytes so JPEG/WebP/GIF
+		// aren't silently mislabeled as PNG.
+		if mime == "" {
+			mime = sniffImageMime(data)
 		}
 		ext := "png"
 		if j := strings.Index(mime, "/"); j >= 0 {
@@ -1216,6 +1229,14 @@ func saveImages(root, session string, imgs []string) (paths, dataURLs []string, 
 		dataURLs = append(dataURLs, "data:"+mime+";base64,"+base64.StdEncoding.EncodeToString(data))
 	}
 	return paths, dataURLs, nil
+}
+
+// sniffImageMime returns an image mime from magic bytes, defaulting to PNG.
+func sniffImageMime(data []byte) string {
+	if ct := http.DetectContentType(data); strings.HasPrefix(ct, "image/") {
+		return ct
+	}
+	return "image/png"
 }
 
 // timelineMD renders stored rows in raw_chat_timeline_process.py timeline

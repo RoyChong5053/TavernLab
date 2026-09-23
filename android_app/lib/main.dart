@@ -23,7 +23,6 @@ import 'package:image_picker/image_picker.dart';
 import 'package:visibility_detector/visibility_detector.dart';
 // import 'package:http/http.dart' as http;
 import 'package:ollama_dart/ollama_dart.dart' as llama;
-import 'package:dartx/dartx.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
 // ignore: depend_on_referenced_packages
 import 'package:markdown/markdown.dart' as md;
@@ -75,7 +74,6 @@ bool settingsOpen = false;
 // chat database. currentChar is remembered server-side (settings.json) so the
 // web UI and the phone always continue the same conversation.
 String currentChar = "Leer乐儿";
-final Set<String> sentImageIds = {};
 
 // ---- server REST helpers (plain HTTP, alongside the Ollama shim) ----
 
@@ -128,6 +126,54 @@ Future<List<types.Message>> fetchServerMessages() async {
     }
   }
   return out.reversed.toList(); // newest-first for flutter_chat_ui
+}
+
+// ---- image helpers (attachments) ----
+
+String mimeFromName(String name) {
+  final n = name.toLowerCase();
+  if (n.endsWith(".jpg") || n.endsWith(".jpeg")) return "image/jpeg";
+  if (n.endsWith(".gif")) return "image/gif";
+  if (n.endsWith(".webp")) return "image/webp";
+  if (n.endsWith(".bmp")) return "image/bmp";
+  if (n.endsWith(".heic")) return "image/heic";
+  return "image/png";
+}
+
+/// Encode a picked file as a self-contained data URL so the preview and the
+/// outgoing request never depend on a cache path that may vanish.
+Future<String> encodeXFileToDataURL(XFile f) async {
+  final bytes = await f.readAsBytes();
+  final mime = (f.mimeType != null && f.mimeType!.startsWith("image/"))
+      ? f.mimeType!
+      : mimeFromName(f.name);
+  return "data:$mime;base64,${base64.encode(bytes)}";
+}
+
+/// Render an image from a data URL, an http(s) URL, or a local file path.
+Widget buildImageWidget(String uri,
+    {double? width, double? height, BoxFit fit = BoxFit.cover}) {
+  if (uri.startsWith("data:")) {
+    try {
+      final comma = uri.indexOf(",");
+      final bytes = base64.decode(uri.substring(comma + 1));
+      return Image.memory(bytes, width: width, height: height, fit: fit);
+    } catch (_) {
+      return const Icon(Icons.broken_image);
+    }
+  }
+  if (uri.startsWith("http")) {
+    return Image.network(uri,
+        width: width,
+        height: height,
+        fit: fit,
+        errorBuilder: (c, e, s) => const Icon(Icons.broken_image));
+  }
+  return Image.file(File(uri),
+      width: width,
+      height: height,
+      fit: fit,
+      errorBuilder: (c, e, s) => const Icon(Icons.broken_image));
 }
 
 Future<void> syncFromServer(Function? setState) async {
@@ -345,6 +391,10 @@ class _MainAppState extends State<MainApp> {
   bool menuVisible = false;
 
   bool sendable = false;
+
+  // Telegram-style pending attachment: picking an image does NOT send it; it
+  // waits in the composer until the user sends it (optionally with a caption).
+  final List<String> pendingImages = [];
 
   List<Widget> sidebar(BuildContext context, Function setState) {
     Widget tile(IconData icon, String label, VoidCallback onTap) {
@@ -784,16 +834,55 @@ class _MainAppState extends State<MainApp> {
                                             horizontalRuleDecoration: BoxDecoration(border: Border(top: BorderSide(color: Colors.grey[200]!, width: 1))))));
                       },
                       imageMessageBuilder: (p0, {required messageWidth}) {
+                        final double w = ((Platform.isWindows ||
+                                    Platform.isLinux ||
+                                    Platform.isMacOS) &&
+                                MediaQuery.of(context).size.width >= 1000)
+                            ? 360.0
+                            : 160.0;
                         return SizedBox(
-                            width: ((Platform.isWindows ||
-                                        Platform.isLinux ||
-                                        Platform.isMacOS) &&
-                                    MediaQuery.of(context).size.width >= 1000)
-                                ? 360.0
-                                : 160.0,
-                            child:
-                                MarkdownBody(data: "![${p0.name}](${p0.uri})"));
+                            width: w,
+                            child: ClipRRect(
+                                borderRadius: BorderRadius.circular(8),
+                                child: buildImageWidget(p0.uri,
+                                    width: w, fit: BoxFit.cover)));
                       },
+                      listBottomWidget: pendingImages.isEmpty
+                          ? null
+                          : Container(
+                              margin: const EdgeInsets.only(
+                                  left: 12, right: 12, top: 6, bottom: 2),
+                              alignment: Alignment.centerLeft,
+                              child: Stack(children: [
+                                ClipRRect(
+                                  borderRadius: BorderRadius.circular(12),
+                                  child: buildImageWidget(pendingImages.first,
+                                      width: 96,
+                                      height: 96,
+                                      fit: BoxFit.cover),
+                                ),
+                                Positioned(
+                                  right: 0,
+                                  top: 0,
+                                  child: GestureDetector(
+                                    onTap: () {
+                                      HapticFeedback.selectionClick();
+                                      setState(() {
+                                        pendingImages.clear();
+                                      });
+                                    },
+                                    child: Container(
+                                      decoration: const BoxDecoration(
+                                          color: Colors.black54,
+                                          shape: BoxShape.circle),
+                                      padding: const EdgeInsets.all(2),
+                                      child: const Icon(Icons.close,
+                                          size: 16, color: Colors.white),
+                                    ),
+                                  ),
+                                ),
+                              ]),
+                            ),
                       disableImageGallery: true,
                       // keyboardDismissBehavior:
                       //     ScrollViewKeyboardDismissBehavior.onDrag,
@@ -819,6 +908,10 @@ class _MainAppState extends State<MainApp> {
                                           fit: BoxFit.cover))))),
                       onSendPressed: (p0) async {
                         HapticFeedback.selectionClick();
+                        final String text = p0.text.trim();
+                        final List<String> imgs =
+                            List<String>.from(pendingImages);
+                        if (text.isEmpty && imgs.isEmpty) return;
                         setState(() {
                           sendable = false;
                         });
@@ -841,40 +934,43 @@ class _MainAppState extends State<MainApp> {
                           return;
                         }
 
-                        // Thin client: send only the fresh user message (+ its
-                        // not-yet-sent images). The server owns the full
-                        // context and persists both sides.
-                        List<String> images = [];
-                        for (var i = 0; i < messages.length; i++) {
-                          if (messages[i] is types.ImageMessage &&
-                              !sentImageIds.contains(messages[i].id)) {
-                            final uri = (messages[i] as types.ImageMessage).uri;
-                            if (uri.startsWith("data:image/png;base64,")) {
-                              images.add(
-                                  uri.removePrefix("data:image/png;base64,"));
-                            } else {
-                              try {
-                                images.add(
-                                    base64.encode(await File(uri).readAsBytes()));
-                              } catch (_) {}
-                            }
-                            sentImageIds.add(messages[i].id);
-                          }
-                        }
-                        List<llama.Message> history = [
+                        // Thin client: send only the fresh user turn (caption
+                        // and/or image). The server owns the full context and
+                        // persists both sides.
+                        final List<llama.Message> history = [
                           llama.Message(
                               role: llama.MessageRole.user,
-                              content: p0.text.trim(),
-                              images: images.isNotEmpty ? images : null),
+                              content: text,
+                              images: imgs.isNotEmpty ? imgs : null),
                         ];
-                        messages.insert(
-                            0,
-                            types.TextMessage(
-                                author: user,
-                                id: const Uuid().v4(),
-                                text: p0.text.trim()));
 
-                        setState(() {});
+                        // Optimistically render the fresh turn, then clear the
+                        // pending tray. The tray lives outside `messages`, so a
+                        // Sync can no longer wipe an unsent image.
+                        int shown = 0;
+                        if (text.isNotEmpty) {
+                          messages.insert(
+                              0,
+                              types.TextMessage(
+                                  author: user,
+                                  id: const Uuid().v4(),
+                                  text: text));
+                          shown++;
+                        }
+                        for (final u in imgs) {
+                          messages.insert(
+                              0,
+                              types.ImageMessage(
+                                  author: user,
+                                  id: const Uuid().v4(),
+                                  name: "image",
+                                  size: 0,
+                                  uri: u));
+                          shown++;
+                        }
+                        setState(() {
+                          pendingImages.clear();
+                        });
                         chatAllowed = false;
 
                         String newId = const Uuid().v4();
@@ -952,21 +1048,17 @@ class _MainAppState extends State<MainApp> {
                             }
                           }
                           setState(() {
-                            chatAllowed = true;
-                            messages.removeAt(0);
-                            if (messages.isEmpty) {
-                              var tmp = (prefs!.getStringList("chats") ?? []);
-                              chatUuid = null;
-                              for (var i = 0; i < tmp.length; i++) {
-                                if (jsonDecode((prefs!.getStringList("chats") ??
-                                        [])[i])["uuid"] ==
-                                    chatUuid) {
-                                  tmp.removeAt(i);
-                                  prefs!.setStringList("chats", tmp);
-                                  break;
-                                }
-                              }
+                            // Drop the optimistic turn and put the caption /
+                            // image back in the tray so nothing is lost.
+                            for (var i = 0;
+                                i < shown && messages.isNotEmpty;
+                                i++) {
+                              messages.removeAt(0);
                             }
+                            pendingImages
+                              ..clear()
+                              ..addAll(imgs);
+                            chatAllowed = true;
                           });
                           // ignore: use_build_context_synchronously
                           ScaffoldMessenger.of(context).showSnackBar(SnackBar(
@@ -1063,19 +1155,15 @@ class _MainAppState extends State<MainApp> {
                                   if (files.isEmpty) return;
 
                                   final picked = files.first;
-                                  var encoded = base64.encode(
-                                      await picked.readAsBytes());
-                                  messages.insert(
-                                      0,
-                                      types.ImageMessage(
-                                          author: user,
-                                          id: const Uuid().v4(),
-                                          name: picked.name,
-                                          size: await picked.length() ?? 0,
-                                          uri:
-                                              "data:image/png;base64,$encoded"));
-
-                                  setState(() {});
+                                  final bytes = await picked.readAsBytes();
+                                  final mime = mimeFromName(picked.name);
+                                  if (!mounted) return;
+                                  setState(() {
+                                    pendingImages
+                                      ..clear()
+                                      ..add("data:$mime;base64,"
+                                          "${base64.encode(bytes)}");
+                                  });
                                   HapticFeedback.selectionClick();
                                 });
 
@@ -1109,33 +1197,15 @@ class _MainAppState extends State<MainApp> {
                                                         if (result == null) {
                                                           return;
                                                         }
-
-                                                        final bytes =
-                                                            await result
-                                                                .readAsBytes();
-                                                        final image =
-                                                            await decodeImageFromList(
-                                                                bytes);
-
-                                                        final message =
-                                                            types.ImageMessage(
-                                                          author: user,
-                                                          createdAt: DateTime
-                                                                  .now()
-                                                              .millisecondsSinceEpoch,
-                                                          height: image.height
-                                                              .toDouble(),
-                                                          id: const Uuid().v4(),
-                                                          name: result.name,
-                                                          size: bytes.length,
-                                                          uri: result.path,
-                                                          width: image.width
-                                                              .toDouble(),
-                                                        );
-
-                                                        messages.insert(
-                                                            0, message);
-                                                        setState(() {});
+                                                        final dataUrl =
+                                                            await encodeXFileToDataURL(
+                                                                result);
+                                                        if (!mounted) return;
+                                                        setState(() {
+                                                          pendingImages
+                                                            ..clear()
+                                                            ..add(dataUrl);
+                                                        });
                                                         HapticFeedback
                                                             .selectionClick();
                                                       },
@@ -1164,33 +1234,15 @@ class _MainAppState extends State<MainApp> {
                                                         if (result == null) {
                                                           return;
                                                         }
-
-                                                        final bytes =
-                                                            await result
-                                                                .readAsBytes();
-                                                        final image =
-                                                            await decodeImageFromList(
-                                                                bytes);
-
-                                                        final message =
-                                                            types.ImageMessage(
-                                                          author: user,
-                                                          createdAt: DateTime
-                                                                  .now()
-                                                              .millisecondsSinceEpoch,
-                                                          height: image.height
-                                                              .toDouble(),
-                                                          id: const Uuid().v4(),
-                                                          name: result.name,
-                                                          size: bytes.length,
-                                                          uri: result.path,
-                                                          width: image.width
-                                                              .toDouble(),
-                                                        );
-
-                                                        messages.insert(
-                                                            0, message);
-                                                        setState(() {});
+                                                        final dataUrl =
+                                                            await encodeXFileToDataURL(
+                                                                result);
+                                                        if (!mounted) return;
+                                                        setState(() {
+                                                          pendingImages
+                                                            ..clear()
+                                                            ..add(dataUrl);
+                                                        });
                                                         HapticFeedback
                                                             .selectionClick();
                                                       },
@@ -1217,7 +1269,7 @@ class _MainAppState extends State<MainApp> {
                                   Platform.isLinux ||
                                   Platform.isMacOS)
                               ? SendButtonVisibilityMode.always
-                              : (sendable)
+                              : (sendable || pendingImages.isNotEmpty)
                                   ? SendButtonVisibilityMode.always
                                   : SendButtonVisibilityMode.hidden),
                       user: user,
