@@ -3,9 +3,8 @@ import 'package:flutter/services.dart';
 
 import 'main.dart';
 
-import 'package:smooth_page_indicator/smooth_page_indicator.dart';
-import 'package:transparent_image/transparent_image.dart';
-
+// TavernLab welcome: one clean branded page (replaces the upstream Ollama
+// screenshot carousel).
 class ScreenWelcome extends StatefulWidget {
   const ScreenWelcome({super.key});
 
@@ -14,152 +13,85 @@ class ScreenWelcome extends StatefulWidget {
 }
 
 class _ScreenWelcomeState extends State<ScreenWelcome> {
-  final _pageController = PageController();
-  int page = 0;
-
   @override
   void initState() {
     super.initState();
-
     WidgetsBinding.instance.addPostFrameCallback((timeStamp) {
-      WidgetsBinding.instance.platformDispatcher.onPlatformBrightnessChanged =
-          () {
-        // invert colors used, because brightness not updated yet
-        SystemChrome.setSystemUIOverlayStyle(SystemUiOverlayStyle(
-            systemNavigationBarColor:
-                (prefs!.getString("brightness") ?? "system") == "system"
-                    ? ((MediaQuery.of(context).platformBrightness ==
-                            Brightness.light)
-                        ? Colors.grey[900]
-                        : Colors.grey[100])
-                    : (prefs!.getString("brightness") == "dark"
-                        ? Colors.grey[900]
-                        : Colors.grey[100]),
-            systemNavigationBarIconBrightness:
-                (((prefs!.getString("brightness") ?? "system") == "system" &&
-                            MediaQuery.of(context).platformBrightness ==
-                                Brightness.dark) ||
-                        prefs!.getString("brightness") == "light")
-                    ? Brightness.dark
-                    : Brightness.light));
-      };
-
-      // brightness changed function not run at first startup
       SystemChrome.setSystemUIOverlayStyle(SystemUiOverlayStyle(
           systemNavigationBarColor:
-              (prefs!.getString("brightness") ?? "system") == "system"
-                  ? ((MediaQuery.of(context).platformBrightness ==
-                          Brightness.light)
-                      ? Colors.grey[100]
-                      : Colors.grey[900])
-                  : (prefs!.getString("brightness") == "dark"
-                      ? Colors.grey[900]
-                      : Colors.grey[100]),
+              (Theme.of(context).brightness == Brightness.light)
+                  ? (theme ?? ThemeData()).colorScheme.surface
+                  : (themeDark ?? ThemeData.dark()).colorScheme.surface,
           systemNavigationBarIconBrightness:
-              (((prefs!.getString("brightness") ?? "system") == "system" &&
-                          MediaQuery.of(context).platformBrightness ==
-                              Brightness.light) ||
-                      prefs!.getString("brightness") == "light")
+              (Theme.of(context).brightness == Brightness.light)
                   ? Brightness.dark
                   : Brightness.light));
     });
   }
 
+  void finish() {
+    prefs!.setBool("welcomeFinished", true);
+    SystemChrome.setSystemUIOverlayStyle(SystemUiOverlayStyle(
+        systemNavigationBarColor:
+            (Theme.of(context).brightness == Brightness.light)
+                ? (theme ?? ThemeData()).colorScheme.surface
+                : (themeDark ?? ThemeData.dark()).colorScheme.surface,
+        systemNavigationBarIconBrightness:
+            (Theme.of(context).brightness == Brightness.light)
+                ? Brightness.dark
+                : Brightness.light));
+    Navigator.pushReplacement(
+        context, MaterialPageRoute(builder: (context) => const MainApp()));
+  }
+
   @override
   Widget build(BuildContext context) {
-    precacheImage(const AssetImage("assets/welcome/1.png"), context);
-    precacheImage(const AssetImage("assets/welcome/2.png"), context);
-    precacheImage(const AssetImage("assets/welcome/3.png"), context);
-    precacheImage(const AssetImage("assets/welcome/1dark.png"), context);
-    precacheImage(const AssetImage("assets/welcome/2dark.png"), context);
-    precacheImage(const AssetImage("assets/welcome/3dark.png"), context);
     return Scaffold(
-        bottomNavigationBar: BottomSheet(
-            enableDrag: false,
-            backgroundColor: (Theme.of(context).brightness == Brightness.light)
-                ? Colors.grey[100]
-                : Colors.grey[900],
-            onClosing: () {},
-            builder: (context) {
-              return Container(
-                  width: double.infinity,
-                  padding: const EdgeInsets.all(16),
-                  child: Column(mainAxisSize: MainAxisSize.min, children: [
-                    SmoothPageIndicator(
-                        controller: _pageController,
-                        count: 3,
-                        effect: ExpandingDotsEffect(
-                            activeDotColor: (Theme.of(context).brightness ==
-                                    Brightness.light)
-                                ? (theme ?? ThemeData()).colorScheme.primary
-                                : (themeDark ?? ThemeData.dark())
-                                    .colorScheme
-                                    .primary)),
-                  ]));
-            }),
-        floatingActionButtonLocation: FloatingActionButtonLocation.endDocked,
-        floatingActionButton: FloatingActionButton(
-          onPressed: () {
-            if (page < 2) {
-              _pageController.nextPage(
-                  duration: const Duration(milliseconds: 250),
-                  curve: Curves.easeInOut);
-            } else {
-              prefs!.setBool("welcomeFinished", true);
-              SystemChrome.setSystemUIOverlayStyle(SystemUiOverlayStyle(
-                  systemNavigationBarColor:
-                      (Theme.of(context).brightness == Brightness.light)
-                          ? (theme ?? ThemeData()).colorScheme.surface
-                          : (themeDark ?? ThemeData.dark()).colorScheme.surface,
-                  systemNavigationBarIconBrightness:
-                      (Theme.of(context).brightness == Brightness.light)
-                          ? Brightness.dark
-                          : Brightness.light));
-              Navigator.pushReplacement(context,
-                  MaterialPageRoute(builder: (context) => const MainApp()));
-            }
-          },
-          child: Icon((page < 2) ? Icons.arrow_forward : Icons.check_rounded),
+      body: SafeArea(
+        child: Center(
+          child: Padding(
+            padding: const EdgeInsets.all(32),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                ClipRRect(
+                  borderRadius: const BorderRadius.all(Radius.circular(28)),
+                  child: Image.asset("assets/logo512.png",
+                      width: 132, height: 132, fit: BoxFit.cover),
+                ),
+                const SizedBox(height: 28),
+                const Text("TavernLab",
+                    style:
+                        TextStyle(fontSize: 30, fontWeight: FontWeight.w700)),
+                const SizedBox(height: 8),
+                Text("Prompt · Context · Memory",
+                    style: TextStyle(
+                        fontSize: 15,
+                        color: Theme.of(context).brightness == Brightness.light
+                            ? Colors.black54
+                            : Colors.white60)),
+                const SizedBox(height: 8),
+                Text("能聊天的 Prompt IDE · 对话永远可以继续",
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                        fontSize: 13,
+                        color: Theme.of(context).brightness == Brightness.light
+                            ? Colors.black45
+                            : Colors.white38)),
+                const SizedBox(height: 40),
+                FilledButton(
+                  onPressed: finish,
+                  child: const Padding(
+                    padding:
+                        EdgeInsets.symmetric(horizontal: 24, vertical: 6),
+                    child: Text("开始"),
+                  ),
+                ),
+              ],
+            ),
+          ),
         ),
-        body: SafeArea(
-            child: Column(children: [
-          Expanded(
-              child: PageView(
-                  controller: _pageController,
-                  onPageChanged: (value) {
-                    setState(() {
-                      page = value;
-                    });
-                  },
-                  children: [
-                Center(
-                    child: (Theme.of(context).brightness == Brightness.light)
-                        ? FadeInImage(
-                            placeholder: MemoryImage(kTransparentImage),
-                            image: const AssetImage("assets/welcome/1.png"))
-                        : FadeInImage(
-                            placeholder: MemoryImage(kTransparentImage),
-                            image:
-                                const AssetImage("assets/welcome/1dark.png"))),
-                Center(
-                    child: (Theme.of(context).brightness == Brightness.light)
-                        ? FadeInImage(
-                            placeholder: MemoryImage(kTransparentImage),
-                            image: const AssetImage("assets/welcome/2.png"))
-                        : FadeInImage(
-                            placeholder: MemoryImage(kTransparentImage),
-                            image:
-                                const AssetImage("assets/welcome/2dark.png"))),
-                Center(
-                    child: (Theme.of(context).brightness == Brightness.light)
-                        ? FadeInImage(
-                            placeholder: MemoryImage(kTransparentImage),
-                            image: const AssetImage("assets/welcome/3.png"))
-                        : FadeInImage(
-                            placeholder: MemoryImage(kTransparentImage),
-                            image:
-                                const AssetImage("assets/welcome/3dark.png")))
-              ])),
-        ])));
+      ),
+    );
   }
 }

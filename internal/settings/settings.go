@@ -20,6 +20,10 @@ type Settings struct {
 	MCPEnabled    bool    `json:"mcp_enabled"`
 	MCPTopK       int     `json:"mcp_topk,omitempty"`
 	MCPThreshold  float64 `json:"mcp_threshold,omitempty"` // <0 = omit (server default)
+	CurrentChar   string  `json:"current_char,omitempty"`  // source of truth for web + app
+	UserName      string  `json:"user_name,omitempty"`     // export attribution / {{user}}
+	NtfyURL       string  `json:"ntfy_url,omitempty"`      // self-hosted ntfy base, empty = disabled
+	NtfyTopic     string  `json:"ntfy_topic,omitempty"`
 }
 
 // Defaults for a fresh checkout talking to the home LAN.
@@ -32,6 +36,8 @@ func Defaults() Settings {
 		MCPEnabled:    false,
 		MCPTopK:       10,
 		MCPThreshold:  -1,
+		CurrentChar:   "Leer乐儿",
+		UserName:      "RoyChong",
 	}
 }
 
@@ -67,6 +73,18 @@ func Load(root string) Settings {
 	}
 	if f.MCPThreshold >= 0 {
 		s.MCPThreshold = f.MCPThreshold
+	}
+	if f.CurrentChar != "" {
+		s.CurrentChar = f.CurrentChar
+	}
+	if f.UserName != "" {
+		s.UserName = f.UserName
+	}
+	if f.NtfyURL != "" {
+		s.NtfyURL = f.NtfyURL
+	}
+	if f.NtfyTopic != "" {
+		s.NtfyTopic = f.NtfyTopic
 	}
 	return s
 }

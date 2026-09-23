@@ -1,6 +1,5 @@
 import 'dart:convert';
 import 'dart:io';
-import 'dart:math';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
@@ -8,6 +7,7 @@ import 'package:flutter/services.dart';
 
 import 'package:ollama_app/l10n/app_localizations.dart';
 import 'package:url_launcher/url_launcher.dart';
+import 'package:http/http.dart' as http;
 
 import 'screen_settings.dart';
 import 'screen_welcome.dart';
@@ -64,6 +64,138 @@ final user = types.User(id: const Uuid().v4());
 final assistant = types.User(id: const Uuid().v4());
 
 bool settingsOpen = false;
+
+// The app is a thin mirror of the server: one character = one server-side
+// chat database. currentChar is remembered server-side (settings.json) so the
+// web UI and the phone always continue the same conversation.
+String currentChar = "Leer乐儿";
+final Set<String> sentImageIds = {};
+
+// ---- server REST helpers (plain HTTP, alongside the Ollama shim) ----
+
+Future<Map<String, dynamic>> apiGet(String path) async {
+  final r = await http
+      .get(Uri.parse("$host$path"))
+      .timeout(const Duration(seconds: 15));
+  return jsonDecode(r.body) as Map<String, dynamic>;
+}
+
+/// Persist the chosen character server-side (single source of truth).
+Future<void> setCurrentChar(String name) async {
+  currentChar = name;
+  await prefs?.setString("currentChar", name);
+  try {
+    await http.put(
+      Uri.parse("$host/api/settings"),
+      headers: {"Content-Type": "application/json"},
+      body: jsonEncode({"current_char": name}),
+    );
+  } catch (_) {}
+}
+
+/// Pull the full history for the current character (oldest-first from server,
+/// returned newest-first for the chat UI). Images become network URLs.
+Future<List<types.Message>> fetchServerMessages() async {
+  final j = await apiGet(
+      "/api/history?session=${Uri.encodeComponent(currentChar)}&limit=0");
+  final list = (j["messages"] as List?) ?? [];
+  final out = <types.Message>[]; // oldest first
+  for (final raw in list) {
+    final m = raw as Map<String, dynamic>;
+    final role = (m["role"] ?? "user").toString();
+    if (role != "user" && role != "assistant") continue;
+    final author = role == "user" ? user : assistant;
+    final text = (m["text"] ?? "").toString();
+    final id = (m["id"] ?? const Uuid().v4()).toString();
+    if (text.isNotEmpty) {
+      out.add(types.TextMessage(author: author, id: id, text: text));
+    }
+    final imgs = (m["images"] as List?) ?? [];
+    for (final p in imgs) {
+      out.add(types.ImageMessage(
+        author: author,
+        id: const Uuid().v4(),
+        name: "image",
+        size: 0,
+        uri: "$host/chars/${Uri.encodeComponent(currentChar)}/$p",
+      ));
+    }
+  }
+  return out.reversed.toList(); // newest-first for flutter_chat_ui
+}
+
+Future<void> syncFromServer(Function? setState) async {
+  try {
+    // Adopt the server's current character so web and app share the floor.
+    try {
+      final s = await apiGet("/api/settings");
+      final c = (s["current_char"] ?? "").toString();
+      if (c.isNotEmpty) {
+        currentChar = c;
+        await prefs?.setString("currentChar", c);
+      }
+    } catch (_) {}
+    final msgs = await fetchServerMessages();
+    messages = msgs;
+    chatUuid = null;
+    if (setState != null) setState(() {});
+    HapticFeedback.lightImpact();
+  } catch (_) {}
+}
+
+/// Character picker backed by GET /api/characters.
+Future<void> chooseCharacter(BuildContext context, Function setState) async {
+  List<dynamic> chars = [];
+  try {
+    final j = await apiGet("/api/characters");
+    chars = (j["characters"] as List?) ?? [];
+  } catch (_) {}
+  if (!context.mounted) return;
+  showModalBottomSheet(
+      context: context,
+      builder: (ctx) {
+        return SafeArea(
+          child: ListView(
+            shrinkWrap: true,
+            children: [
+              const Padding(
+                padding: EdgeInsets.all(16),
+                child: Text("选择角色",
+                    style:
+                        TextStyle(fontSize: 18, fontWeight: FontWeight.w600)),
+              ),
+              if (chars.isEmpty)
+                const Padding(
+                  padding: EdgeInsets.all(16),
+                  child: Text("还没有角色，去网页端新建。"),
+                ),
+              ...chars.map((c) {
+                final name = (c["name"] ?? "").toString();
+                final avatar = (c["avatar_url"] ?? "").toString();
+                final selected = name == currentChar;
+                return ListTile(
+                  leading: CircleAvatar(
+                    backgroundImage:
+                        avatar.isEmpty ? null : NetworkImage("$host$avatar"),
+                    child: avatar.isEmpty ? const Icon(Icons.person) : null,
+                  ),
+                  title: Text(name),
+                  trailing: selected
+                      ? const Icon(Icons.check_rounded)
+                      : null,
+                  onTap: () async {
+                    Navigator.of(ctx).pop();
+                    if (name == currentChar) return;
+                    await setCurrentChar(name);
+                    await syncFromServer(setState);
+                  },
+                );
+              }),
+            ],
+          ),
+        );
+      });
+}
 
 void main() {
   runApp(const App());
@@ -166,336 +298,75 @@ class _MainAppState extends State<MainApp> {
   bool logoVisible = true;
   bool menuVisible = false;
 
-  int tipId = Random().nextInt(5);
   bool sendable = false;
 
   List<Widget> sidebar(BuildContext context, Function setState) {
-    return List.from([
-      ((Platform.isWindows || Platform.isLinux || Platform.isMacOS) &&
-              MediaQuery.of(context).size.width >= 1000)
-          ? const SizedBox.shrink()
-          : (Padding(
-              padding: const EdgeInsets.only(left: 12, right: 12),
-              child: InkWell(
-                  customBorder: const RoundedRectangleBorder(
-                      borderRadius: BorderRadius.all(Radius.circular(50))),
-                  onTap: () {},
-                  child: Padding(
-                      padding: const EdgeInsets.only(top: 16, bottom: 16),
-                      child: Row(children: [
-                        const Padding(
-                            padding: EdgeInsets.only(left: 16, right: 12),
-                            child: ImageIcon(AssetImage("assets/logo512.png"))),
-                        Expanded(
-                          child: Text(AppLocalizations.of(context)!.appTitle,
-                              softWrap: false,
-                              overflow: TextOverflow.fade,
-                              style:
-                                  const TextStyle(fontWeight: FontWeight.w500)),
-                        ),
-                        const SizedBox(width: 16),
-                      ]))))),
-      ((Platform.isWindows || Platform.isLinux || Platform.isMacOS) &&
-              MediaQuery.of(context).size.width >= 1000)
-          ? const SizedBox.shrink()
-          : (!allowMultipleChats && !allowSettings)
-              ? const SizedBox.shrink()
-              : const Divider(),
-      (allowMultipleChats)
-          ? (Padding(
-              padding: const EdgeInsets.only(left: 12, right: 12),
-              child: InkWell(
-                  customBorder: const RoundedRectangleBorder(
-                      borderRadius: BorderRadius.all(Radius.circular(50))),
-                  onTap: () {
-                    HapticFeedback.selectionClick();
-                    if (!(Platform.isWindows ||
-                            Platform.isLinux ||
-                            Platform.isMacOS) &&
-                        MediaQuery.of(context).size.width <= 1000) {
-                      Navigator.of(context).pop();
-                    }
-                    if (!chatAllowed) return;
-                    chatUuid = null;
-                    messages = [];
-                    setState(() {});
-                  },
-                  child: Padding(
-                      padding: const EdgeInsets.only(top: 16, bottom: 16),
-                      child: Row(children: [
-                        const Padding(
-                            padding: EdgeInsets.only(left: 16, right: 12),
-                            child: Icon(Icons.add_rounded)),
-                        Expanded(
-                          child: Text(
-                              AppLocalizations.of(context)!.optionNewChat,
-                              softWrap: false,
-                              overflow: TextOverflow.fade,
-                              style:
-                                  const TextStyle(fontWeight: FontWeight.w500)),
-                        ),
-                        const SizedBox(width: 16),
-                      ])))))
-          : const SizedBox.shrink(),
-      (allowSettings)
-          ? (Padding(
-              padding: const EdgeInsets.only(left: 12, right: 12),
-              child: InkWell(
-                  customBorder: const RoundedRectangleBorder(
-                      borderRadius: BorderRadius.all(Radius.circular(50))),
-                  onTap: () {
-                    HapticFeedback.selectionClick();
-                    if (!(Platform.isWindows ||
-                            Platform.isLinux ||
-                            Platform.isMacOS) &&
-                        MediaQuery.of(context).size.width <= 1000) {
-                      Navigator.of(context).pop();
-                    }
-                    setState(() {
-                      settingsOpen = true;
-                    });
-                    Navigator.push(
-                        context,
-                        MaterialPageRoute(
-                            builder: (context) => const ScreenSettings()));
-                  },
-                  child: Padding(
-                      padding: const EdgeInsets.only(top: 16, bottom: 16),
-                      child: Row(children: [
-                        const Padding(
-                            padding: EdgeInsets.only(left: 16, right: 12),
-                            child: Icon(Icons.dns_rounded)),
-                        Expanded(
-                          child: Text(
-                              AppLocalizations.of(context)!.optionSettings,
-                              softWrap: false,
-                              overflow: TextOverflow.fade,
-                              style:
-                                  const TextStyle(fontWeight: FontWeight.w500)),
-                        ),
-                        const SizedBox(width: 16),
-                      ])))))
-          : const SizedBox.shrink(),
-      Divider(
-          color:
-              ((Platform.isWindows || Platform.isLinux || Platform.isMacOS) &&
-                      MediaQuery.of(context).size.width >= 1000)
-                  ? (Theme.of(context).brightness == Brightness.light)
-                      ? Colors.grey[400]
-                      : Colors.grey[900]
-                  : null),
-      ((prefs?.getStringList("chats") ?? []).isNotEmpty)
-          ? const SizedBox.shrink()
-          : (Padding(
-              padding: const EdgeInsets.only(left: 12, right: 12),
-              child: InkWell(
-                  customBorder: const RoundedRectangleBorder(
-                      borderRadius: BorderRadius.all(Radius.circular(50))),
-                  onTap: () {
-                    HapticFeedback.selectionClick();
-                  },
-                  child: Padding(
-                      padding: const EdgeInsets.only(top: 16, bottom: 16),
-                      child: Row(children: [
-                        const Padding(
-                            padding: EdgeInsets.only(left: 16, right: 12),
-                            child: Icon(Icons.question_mark_rounded,
-                                color: Colors.grey)),
-                        Expanded(
-                          child: Text(
-                              AppLocalizations.of(context)!.optionNoChatFound,
-                              softWrap: false,
-                              overflow: TextOverflow.fade,
-                              style: const TextStyle(
-                                  fontWeight: FontWeight.w500,
-                                  color: Colors.grey)),
-                        ),
-                        const SizedBox(width: 16),
-                      ]))))),
-      Builder(builder: (context) {
-        String tip = (tipId == 0)
-            ? AppLocalizations.of(context)!.tip0
-            : (tipId == 1)
-                ? AppLocalizations.of(context)!.tip1
-                : (tipId == 2)
-                    ? AppLocalizations.of(context)!.tip2
-                    : (tipId == 3)
-                        ? AppLocalizations.of(context)!.tip3
-                        : AppLocalizations.of(context)!.tip4;
-        return (!(prefs?.getBool("tips") ?? true) ||
-                (prefs?.getStringList("chats") ?? []).isNotEmpty ||
-                !allowSettings)
-            ? const SizedBox.shrink()
-            : (Padding(
-                padding: const EdgeInsets.only(left: 12, right: 12),
-                child: InkWell(
-                  splashFactory: NoSplash.splashFactory,
-                  highlightColor: Colors.transparent,
-                  enableFeedback: false,
-                  hoverColor: Colors.transparent,
-                  onTap: () {
-                    HapticFeedback.selectionClick();
-                    setState(() {
-                      tipId = Random().nextInt(5);
-                    });
-                  },
-                  child: Padding(
-                      padding: const EdgeInsets.only(top: 16, bottom: 16),
-                      child: Row(children: [
-                        const Padding(
-                            padding: EdgeInsets.only(left: 16, right: 12),
-                            child: Icon(Icons.tips_and_updates_rounded,
-                                color: Colors.grey)),
-                        Expanded(
-                          child: Text(
-                              AppLocalizations.of(context)!.tipPrefix + tip,
-                              softWrap: true,
-                              maxLines: 3,
-                              overflow: TextOverflow.fade,
-                              style: const TextStyle(
-                                  fontWeight: FontWeight.w500,
-                                  color: Colors.grey)),
-                        ),
-                        const SizedBox(width: 16),
-                      ])),
-                )));
-      }),
-    ])
-      ..addAll((prefs?.getStringList("chats") ?? []).map((item) {
-        return Dismissible(
-            key: Key(jsonDecode(item)["uuid"]),
-            direction: (chatAllowed)
-                ? DismissDirection.startToEnd
-                : DismissDirection.none,
-            confirmDismiss: (direction) async {
-              bool returnValue = false;
-              if (!chatAllowed) return false;
+    Widget tile(IconData icon, String label, VoidCallback onTap) {
+      return Padding(
+        padding: const EdgeInsets.only(left: 12, right: 12),
+        child: InkWell(
+          customBorder: const RoundedRectangleBorder(
+              borderRadius: BorderRadius.all(Radius.circular(50))),
+          onTap: () {
+            HapticFeedback.selectionClick();
+            if (!(Platform.isWindows ||
+                    Platform.isLinux ||
+                    Platform.isMacOS) &&
+                MediaQuery.of(context).size.width <= 1000) {
+              Navigator.of(context).pop();
+            }
+            onTap();
+          },
+          child: Padding(
+            padding: const EdgeInsets.only(top: 16, bottom: 16),
+            child: Row(children: [
+              Padding(
+                  padding: const EdgeInsets.only(left: 16, right: 12),
+                  child: Icon(icon)),
+              Expanded(
+                child: Text(label,
+                    softWrap: false,
+                    overflow: TextOverflow.fade,
+                    style: const TextStyle(fontWeight: FontWeight.w500)),
+              ),
+              const SizedBox(width: 16),
+            ]),
+          ),
+        ),
+      );
+    }
 
-              if (prefs!.getBool("askBeforeDeletion") ?? false) {
-                await showDialog(
-                    context: context,
-                    builder: (context) {
-                      return StatefulBuilder(builder: (context, setLocalState) {
-                        return AlertDialog(
-                            title: Text(AppLocalizations.of(context)!
-                                .deleteDialogTitle),
-                            content: Column(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  Text(AppLocalizations.of(context)!
-                                      .deleteDialogDescription),
-                                ]),
-                            actions: [
-                              TextButton(
-                                  onPressed: () {
-                                    HapticFeedback.selectionClick();
-                                    Navigator.of(context).pop();
-                                    returnValue = false;
-                                  },
-                                  child: Text(AppLocalizations.of(context)!
-                                      .deleteDialogCancel)),
-                              TextButton(
-                                  onPressed: () {
-                                    HapticFeedback.selectionClick();
-                                    Navigator.of(context).pop();
-                                    returnValue = true;
-                                  },
-                                  child: Text(AppLocalizations.of(context)!
-                                      .deleteDialogDelete))
-                            ]);
-                      });
-                    });
-              } else {
-                returnValue = true;
-              }
-              return returnValue;
-            },
-            onDismissed: (direction) {
-              HapticFeedback.selectionClick();
-              for (var i = 0;
-                  i < (prefs!.getStringList("chats") ?? []).length;
-                  i++) {
-                if (jsonDecode(
-                        (prefs!.getStringList("chats") ?? [])[i])["uuid"] ==
-                    jsonDecode(item)["uuid"]) {
-                  List<String> tmp = prefs!.getStringList("chats")!;
-                  tmp.removeAt(i);
-                  prefs!.setStringList("chats", tmp);
-                  break;
-                }
-              }
-              if (chatUuid == jsonDecode(item)["uuid"]) {
-                messages = [];
-                chatUuid = null;
-                if (!(Platform.isWindows ||
-                        Platform.isLinux ||
-                        Platform.isMacOS) &&
-                    MediaQuery.of(context).size.width <= 1000) {
-                  Navigator.of(context).pop();
-                }
-              }
-              setState(() {});
-            },
-            child: Padding(
-                padding: const EdgeInsets.only(left: 12, right: 12),
-                child: InkWell(
-                    customBorder: const RoundedRectangleBorder(
-                        borderRadius: BorderRadius.all(Radius.circular(50))),
-                    onTap: () {
-                      HapticFeedback.selectionClick();
-                      if (!(Platform.isWindows ||
-                              Platform.isLinux ||
-                              Platform.isMacOS) &&
-                          MediaQuery.of(context).size.width <= 1000) {
-                        Navigator.of(context).pop();
-                      }
-                      if (!chatAllowed) return;
-                      loadChat(jsonDecode(item)["uuid"], setState);
-                      chatUuid = jsonDecode(item)["uuid"];
-                    },
-                    onLongPress: () async {
-                      HapticFeedback.selectionClick();
-                      if (!chatAllowed) return;
-                      if (!allowSettings) return;
-                      String oldTitle = jsonDecode(item)["title"];
-                      var newTitle = await prompt(context,
-                          title:
-                              AppLocalizations.of(context)!.dialogEnterNewTitle,
-                          value: oldTitle,
-                          uuid: jsonDecode(item)["uuid"]);
-                      var tmp = (prefs!.getStringList("chats") ?? []);
-                      for (var i = 0; i < tmp.length; i++) {
-                        if (jsonDecode((prefs!.getStringList("chats") ??
-                                [])[i])["uuid"] ==
-                            jsonDecode(item)["uuid"]) {
-                          var tmp2 = jsonDecode(tmp[i]);
-                          tmp2["title"] = newTitle;
-                          tmp[i] = jsonEncode(tmp2);
-                          break;
-                        }
-                      }
-                      prefs!.setStringList("chats", tmp);
-                      setState(() {});
-                    },
-                    child: Padding(
-                        padding: const EdgeInsets.only(top: 16, bottom: 16),
-                        child: Row(children: [
-                          Padding(
-                              padding:
-                                  const EdgeInsets.only(left: 16, right: 16),
-                              child: Icon((chatUuid == jsonDecode(item)["uuid"])
-                                  ? Icons.location_on_rounded
-                                  : Icons.restore_rounded)),
-                          Expanded(
-                            child: Text(jsonDecode(item)["title"],
-                                softWrap: false,
-                                overflow: TextOverflow.fade,
-                                style: const TextStyle(
-                                    fontWeight: FontWeight.w500)),
-                          ),
-                          const SizedBox(width: 16),
-                        ])))));
-      }).toList());
+    return [
+      Padding(
+        padding: const EdgeInsets.only(left: 28, right: 12, top: 20, bottom: 16),
+        child: Row(children: [
+          ClipRRect(
+            borderRadius: BorderRadius.all(Radius.circular(6)),
+            child: Image.asset("assets/logo512.png",
+                width: 24, height: 24, fit: BoxFit.cover),
+          ),
+          SizedBox(width: 12),
+          Expanded(
+            child: Text("TavernLab",
+                softWrap: false,
+                overflow: TextOverflow.fade,
+                style: TextStyle(fontWeight: FontWeight.w700)),
+          ),
+          SizedBox(width: 16),
+        ]),
+      ),
+      const Divider(),
+      tile(Icons.people_alt_rounded, "选角色",
+          () => chooseCharacter(context, setState)),
+      tile(Icons.dns_rounded, AppLocalizations.of(context)!.optionSettings, () {
+        setState(() {
+          settingsOpen = true;
+        });
+        Navigator.push(context,
+            MaterialPageRoute(builder: (context) => const ScreenSettings()));
+      }),
+      tile(Icons.sync_rounded, "Sync 同步", () => syncFromServer(setState)),
+    ];
   }
 
   @override
@@ -584,13 +455,7 @@ class _MainAppState extends State<MainApp> {
               });
         }
 
-        if (!allowMultipleChats &&
-            (prefs!.getStringList("chats") ?? []).isNotEmpty) {
-          chatUuid =
-              jsonDecode((prefs!.getStringList("chats") ?? [])[0])["uuid"];
-          loadChat(chatUuid!, setState);
-        }
-
+        // Thin mirror: load the current character from the server.
         setState(() {
           model = useModel ? fixedModel : prefs!.getString("model");
           chatAllowed = !(model == null);
@@ -604,6 +469,9 @@ class _MainAppState extends State<MainApp> {
               // ignore: use_build_context_synchronously
               content: Text(AppLocalizations.of(context)!.noHostSelected),
               showCloseIcon: true));
+        } else {
+          currentChar = prefs!.getString("currentChar") ?? currentChar;
+          syncFromServer(setState);
         }
       },
     );
@@ -611,141 +479,24 @@ class _MainAppState extends State<MainApp> {
 
   @override
   Widget build(BuildContext context) {
-    Widget selector = InkWell(
-        onTap: () {
-          if (host == null) {
-            ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-                content: Text(AppLocalizations.of(context)!.noHostSelected),
-                showCloseIcon: true));
-            return;
-          }
-          setModel(context, setState);
-        },
-        splashFactory: NoSplash.splashFactory,
-        highlightColor: Colors.transparent,
-        enableFeedback: false,
-        hoverColor: Colors.transparent,
-        child: SizedBox(
-            height: 200,
-            child: Row(
-                mainAxisAlignment: MainAxisAlignment.center,
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Flexible(
-                      child: Text(
-                          (model ??
-                                  AppLocalizations.of(context)!.noSelectedModel)
-                              .split(":")[0],
-                          overflow: TextOverflow.fade,
-                          style: const TextStyle(
-                              fontFamily: "monospace", fontSize: 16))),
-                  useModel
-                      ? const SizedBox.shrink()
-                      : const Icon(Icons.expand_more_rounded)
-                ])));
-
     return Scaffold(
           appBar: AppBar(
-              title: Row(
-                children: [
-                  Expanded(child: selector),
-                ],
-              ),
+              title: Row(children: [
+                Expanded(
+                  child: Text(currentChar,
+                      overflow: TextOverflow.fade,
+                      style: const TextStyle(fontWeight: FontWeight.w600)),
+                ),
+              ]),
               actions: [
                       const SizedBox(width: 4),
                       IconButton(
                           onPressed: () {
                             HapticFeedback.selectionClick();
                             if (!chatAllowed) return;
-
-                            if (prefs!.getBool("askBeforeDeletion") ??
-                                // ignore: dead_code
-                                false && messages.isNotEmpty) {
-                              showDialog(
-                                  context: context,
-                                  builder: (context) {
-                                    return StatefulBuilder(
-                                        builder: (context, setLocalState) {
-                                      return AlertDialog(
-                                          title: Text(
-                                              AppLocalizations.of(context)!
-                                                  .deleteDialogTitle),
-                                          content: Column(
-                                              mainAxisSize: MainAxisSize.min,
-                                              children: [
-                                                Text(AppLocalizations.of(
-                                                        context)!
-                                                    .deleteDialogDescription),
-                                              ]),
-                                          actions: [
-                                            TextButton(
-                                                onPressed: () {
-                                                  HapticFeedback
-                                                      .selectionClick();
-                                                  Navigator.of(context).pop();
-                                                },
-                                                child: Text(AppLocalizations.of(
-                                                        context)!
-                                                    .deleteDialogCancel)),
-                                            TextButton(
-                                                onPressed: () {
-                                                  HapticFeedback
-                                                      .selectionClick();
-                                                  Navigator.of(context).pop();
-
-                                                  for (var i = 0;
-                                                      i <
-                                                          (prefs!.getStringList(
-                                                                      "chats") ??
-                                                                  [])
-                                                              .length;
-                                                      i++) {
-                                                    if (jsonDecode((prefs!
-                                                                .getStringList(
-                                                                    "chats") ??
-                                                            [])[i])["uuid"] ==
-                                                        chatUuid) {
-                                                      List<String> tmp = prefs!
-                                                          .getStringList(
-                                                              "chats")!;
-                                                      tmp.removeAt(i);
-                                                      prefs!.setStringList(
-                                                          "chats", tmp);
-                                                      break;
-                                                    }
-                                                  }
-                                                  messages = [];
-                                                  chatUuid = null;
-                                                  setState(() {});
-                                                },
-                                                child: Text(AppLocalizations.of(
-                                                        context)!
-                                                    .deleteDialogDelete))
-                                          ]);
-                                    });
-                                  });
-                            } else {
-                              for (var i = 0;
-                                  i <
-                                      (prefs!.getStringList("chats") ?? [])
-                                          .length;
-                                  i++) {
-                                if (jsonDecode((prefs!.getStringList("chats") ??
-                                        [])[i])["uuid"] ==
-                                    chatUuid) {
-                                  List<String> tmp =
-                                      prefs!.getStringList("chats")!;
-                                  tmp.removeAt(i);
-                                  prefs!.setStringList("chats", tmp);
-                                  break;
-                                }
-                              }
-                              messages = [];
-                              chatUuid = null;
-                            }
-                            setState(() {});
+                            syncFromServer(setState);
                           },
-                          icon: const Icon(Icons.restart_alt_rounded))
+                          icon: const Icon(Icons.sync_rounded))
                     ],
               bottom: PreferredSize(
                   preferredSize: const Size.fromHeight(1),
@@ -1012,9 +763,13 @@ class _MainAppState extends State<MainApp> {
                               child: AnimatedOpacity(
                                   opacity: logoVisible ? 1.0 : 0.0,
                                   duration: const Duration(milliseconds: 500),
-                                  child: const ImageIcon(
-                                      AssetImage("assets/logo512.png"),
-                                      size: 44)))),
+                                  child: ClipRRect(
+                                      borderRadius: const BorderRadius.all(
+                                          Radius.circular(14)),
+                                      child: Image.asset("assets/logo512.png",
+                                          width: 88,
+                                          height: 88,
+                                          fit: BoxFit.cover))))),
                       onSendPressed: (p0) async {
                         HapticFeedback.selectionClick();
                         setState(() {
@@ -1039,68 +794,38 @@ class _MainAppState extends State<MainApp> {
                           return;
                         }
 
-                        bool newChat = false;
-                        if (chatUuid == null) {
-                          newChat = true;
-                          chatUuid = const Uuid().v4();
-                          prefs!.setStringList(
-                              "chats",
-                              (prefs!.getStringList("chats") ?? []).append([
-                                jsonEncode({
-                                  "title": AppLocalizations.of(context)!
-                                      .newChatTitle,
-                                  "uuid": chatUuid,
-                                  "messages": []
-                                })
-                              ]).toList());
-                        }
-
-                        var system = prefs?.getString("system") ??
-                            "You are a helpful assistant";
-                        if (prefs!.getBool("noMarkdown") ?? false) {
-                          system +=
-                              " You must not use markdown or any other formatting language in any way!";
-                        }
-
-                        List<llama.Message> history = [
-                          llama.Message(
-                              role: llama.MessageRole.system, content: system)
-                        ];
+                        // Thin client: send only the fresh user message (+ its
+                        // not-yet-sent images). The server owns the full
+                        // context and persists both sides.
                         List<String> images = [];
                         for (var i = 0; i < messages.length; i++) {
-                          if (jsonDecode(jsonEncode(messages[i]))["text"] !=
-                              null) {
-                            history.add(llama.Message(
-                                role: (messages[i].author.id == user.id)
-                                    ? llama.MessageRole.user
-                                    : llama.MessageRole.system,
-                                content:
-                                    jsonDecode(jsonEncode(messages[i]))["text"],
-                                images: (images.isNotEmpty) ? images : null));
-                          } else {
-                            var uri = jsonDecode(jsonEncode(messages[i]))["uri"]
-                                as String;
-                            String content = (uri
-                                    .startsWith("data:image/png;base64,"))
-                                ? uri.removePrefix("data:image/png;base64,")
-                                : base64.encode(await File(uri).readAsBytes());
-                            uri = uri.removePrefix("data:image/png;base64,");
-                            images.add(content);
+                          if (messages[i] is types.ImageMessage &&
+                              !sentImageIds.contains(messages[i].id)) {
+                            final uri = (messages[i] as types.ImageMessage).uri;
+                            if (uri.startsWith("data:image/png;base64,")) {
+                              images.add(
+                                  uri.removePrefix("data:image/png;base64,"));
+                            } else {
+                              try {
+                                images.add(
+                                    base64.encode(await File(uri).readAsBytes()));
+                              } catch (_) {}
+                            }
+                            sentImageIds.add(messages[i].id);
                           }
                         }
-
-                        history.add(llama.Message(
-                            role: llama.MessageRole.user,
-                            content: p0.text.trim(),
-                            images: (images.isNotEmpty) ? images : null));
+                        List<llama.Message> history = [
+                          llama.Message(
+                              role: llama.MessageRole.user,
+                              content: p0.text.trim(),
+                              images: images.isNotEmpty ? images : null),
+                        ];
                         messages.insert(
                             0,
                             types.TextMessage(
                                 author: user,
                                 id: const Uuid().v4(),
                                 text: p0.text.trim()));
-
-                        saveChat(chatUuid!, setState);
 
                         setState(() {});
                         chatAllowed = false;
@@ -1205,59 +930,6 @@ class _MainAppState extends State<MainApp> {
                           return;
                         }
 
-                        saveChat(chatUuid!, setState);
-
-                        if (newChat &&
-                            (prefs!.getBool("generateTitles") ?? true)) {
-                          void setTitle() async {
-                            List<Map<String, String>> history = [];
-                            for (var i = 0; i < messages.length; i++) {
-                              if (jsonDecode(jsonEncode(messages[i]))["text"] ==
-                                  null) {
-                                continue;
-                              }
-                              history.add({
-                                "role": (messages[i].author == user)
-                                    ? "user"
-                                    : "assistant",
-                                "content":
-                                    jsonDecode(jsonEncode(messages[i]))["text"]
-                              });
-                            }
-                            history = history.reversed.toList();
-
-                            try {
-                              final generated = await client.generateCompletion(
-                                request: llama.GenerateCompletionRequest(
-                                  model: model!,
-                                  prompt:
-                                      "You must not use markdown or any other formatting language! Create a short title for the subject of the conversation described in the following json object. It is not allowed to be too general; no 'Assistance', 'Help' or similar!\n\n```json\n${jsonEncode(history)}\n```",
-                                ),
-                              );
-                              var title = generated.response!
-                                  .replaceAll("*", "")
-                                  .replaceAll("_", "")
-                                  .trim();
-                              var tmp = (prefs!.getStringList("chats") ?? []);
-                              for (var i = 0; i < tmp.length; i++) {
-                                if (jsonDecode((prefs!.getStringList("chats") ??
-                                        [])[i])["uuid"] ==
-                                    chatUuid) {
-                                  var tmp2 = jsonDecode(tmp[i]);
-                                  tmp2["title"] = title;
-                                  tmp[i] = jsonEncode(tmp2);
-                                  break;
-                                }
-                              }
-                              prefs!.setStringList("chats", tmp);
-                            } catch (_) {}
-
-                            setState(() {});
-                          }
-
-                          setTitle();
-                        }
-
                         setState(() {});
                         chatAllowed = true;
                       },
@@ -1291,7 +963,6 @@ class _MainAppState extends State<MainApp> {
                             break;
                           }
                         }
-                        saveChat(chatUuid!, setState);
                         setState(() {});
                       },
                       onMessageLongPress: (context, p1) async {
@@ -1544,14 +1215,8 @@ class _MainAppState extends State<MainApp> {
                                               Platform.isMacOS))
                                       ? 0
                                       : 8),
-                              messageMaxWidth: (MediaQuery.of(context).size.width >=
-                                      1000)
-                                  ? (MediaQuery.of(context).size.width >= 1600)
-                                      ? (MediaQuery.of(context).size.width >= 2200)
-                                          ? 1900
-                                          : 1300
-                                      : 700
-                                  : 440)
+                              messageMaxWidth:
+                                  MediaQuery.of(context).size.width)
                           : DarkChatTheme(
                               backgroundColor: (themeDark ?? ThemeData.dark()).colorScheme.surface,
                               primaryColor: (themeDark ?? ThemeData.dark()).colorScheme.primary.withAlpha(40),
@@ -1563,13 +1228,8 @@ class _MainAppState extends State<MainApp> {
                               inputBorderRadius: const BorderRadius.all(Radius.circular(64)),
                               inputPadding: const EdgeInsets.all(16),
                               inputMargin: EdgeInsets.only(left: 8, right: 8, bottom: (MediaQuery.of(context).viewInsets.bottom == 0.0 && !(Platform.isWindows || Platform.isLinux || Platform.isMacOS)) ? 0 : 8),
-                              messageMaxWidth: (MediaQuery.of(context).size.width >= 1000)
-                                  ? (MediaQuery.of(context).size.width >= 1600)
-                                      ? (MediaQuery.of(context).size.width >= 2200)
-                                          ? 1900
-                                          : 1300
-                                      : 700
-                                  : 440))),
+                              messageMaxWidth:
+                                  MediaQuery.of(context).size.width))),
             ],
           ),
           drawerEdgeDragWidth:

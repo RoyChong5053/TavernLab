@@ -12,7 +12,7 @@
 <button id="hamburger" aria-label="菜单">☰</button>
 <div class="shell">
   <aside class="sidebar glass" id="sidebar">
-    <div class="brand"><img src="/icon.png" alt="" class="brand-logo"> TavernLab <span class="sub">P1 · IDE</span></div>
+    <div class="brand"><img src="/icon.png" alt="" class="brand-logo"> TavernLab <span class="sub">IDE</span></div>
     <nav class="nav">
       <button data-page="chat" class="on">💬 聊天</button>
       <button data-page="chars">👤 角色</button>
@@ -30,17 +30,10 @@
     <!-- CHAT (default) -->
     <section class="page on" id="page-chat">
       <div class="chat-head glass">
-        <img id="chat-avatar" class="avatar" alt="角色头像" src="">
+        <img id="chat-avatar" class="avatar sq" alt="角色头像" src="">
         <div class="chat-head-info">
-          <div class="chat-name-row">
-            <strong id="chat-char-name">Leer乐儿</strong>
-            <span id="expr-badge" class="expr-badge" title="最近一次表情判定">·</span>
-          </div>
-          <div class="chat-sub" id="chat-sub">Prompt IDE · 16k自适应预算</div>
-        </div>
-        <div class="chat-head-actions">
-          <button id="btn-export" title="导出整楼为 timeline md（喂 RAG 用）">📥 导出md</button>
-          <button id="btn-archive" title="封存当前楼到 archive，另起新楼（ST 的 new chat）">🗃 归档新楼</button>
+          <strong id="chat-char-name">Leer乐儿</strong>
+          <div id="expr-badge" class="mood" title="最近一次表情判定">心情 · —</div>
         </div>
       </div>
       <div class="glass chat-box">
@@ -54,30 +47,35 @@
     </section>
     <!-- CHARACTERS -->
     <section class="page" id="page-chars">
-      <h2>角色 <small>头像支持动态 webp（浏览器原生播放），表情包以后接 Expression Router</small></h2>
+      <h2>角色 <small>一个角色一个自包含数据包（角色卡 + 头像 + 聊天 + 归档）</small></h2>
       <div class="row">
-        <select id="char-list"></select>
-        <button id="btn-char-new">新建</button>
-        <button id="btn-char-refresh">刷新</button>
+        <button id="btn-char-new" class="primary">＋ 新建角色</button>
+        <span class="meta">点头像卡片即切换；聊天数据各自独立，切换不会清空。</span>
       </div>
-      <div class="char-detail glass">
-        <img id="char-avatar" class="avatar big" alt="头像预览">
-        <div>
-          <div class="row">
-            <input id="char-name" placeholder="角色名，如 Leer乐儿" size="16">
+      <div id="char-grid" class="char-grid"></div>
+      <div id="char-editor" class="char-editor glass hidden">
+        <div class="row"><b id="char-editor-title">编辑角色</b><span class="meta">描述会直接注入 Blocks 的角色卡区块</span></div>
+        <div class="char-editor-body">
+          <div class="char-avatar-col">
+            <img id="char-avatar" class="avatar sq" alt="头像预览">
             <label class="filebtn">上传头像 <input type="file" id="char-file" accept=".webp,.png,.jpg,.jpeg,.gif" hidden></label>
+            <div id="char-expr" class="meta"></div>
           </div>
-          <div class="row">
-            <label>头像大小 <input id="char-avatar-px" type="range" min="32" max="240" step="4" value="48" style="width:140px"> <span id="char-avatar-px-v" class="meta">48px</span></label>
-            <button id="btn-avatar-size">保存大小</button>
+          <div class="char-fields">
+            <label>角色名 <input id="char-name" placeholder="如 Leer乐儿" size="24"></label>
+            <label>角色描述<textarea id="char-desc" rows="6" placeholder="写下这个角色的设定、性格、说话方式…（不用宏，直接写自然语言）"></textarea></label>
           </div>
-          <div id="char-expr" class="meta"></div>
+        </div>
+        <div class="row">
+          <button id="btn-char-save" class="primary">保存</button>
+          <button id="btn-char-cancel">取消</button>
+          <button id="btn-char-delete" class="danger">删除角色</button>
         </div>
       </div>
     </section>
     <!-- BLOCKS -->
     <section class="page" id="page-blocks">
-      <h2>Blocks <small>order=位置 priority=压缩顺序</small></h2>
+      <h2>Blocks <small>order=位置；去 priority，改用预计算 token + 自动窗口档位</small></h2>
       <div id="budget" class="glass budget"></div>
       <div class="row">
         <button id="btn-assemble">试算 Assemble</button>
@@ -85,7 +83,7 @@
         <button id="btn-save-blocks">保存</button>
         <button id="btn-reload-blocks">重载</button>
       </div>
-      <p class="meta">拖动卡片可排序（order 自动重写）。Preview = 当前编辑器状态的模拟试算；Audit = 真实发出的 raw 数据，两者不同。</p>
+      <p class="meta">拖动卡片排序。窗口自动选 8k/16k/32k 中最小可容纳档；最近轮优先保留，超 32k 会标红 overflow。</p>
       <div id="blocks"></div>
       <div id="preview-modal" class="modal hidden">
         <div class="modal-box glass">
@@ -98,7 +96,7 @@
     </section>
     <!-- AUDIT -->
     <section class="page" id="page-audit">
-      <h2>Audit <small>每次生成存 raw+tokens，可 Replay</small></h2>
+      <h2>Audit <small>每次生成存 raw+tokens+档位，可 Replay</small></h2>
       <div class="row">
         <button id="btn-audit-list">刷新</button>
         <select id="audit-list"></select>
@@ -133,17 +131,37 @@
         <label>上游 One-API <input id="set-upstream" size="30" placeholder="http://192.168.10.2:3000"></label>
         <label>API Key <input id="set-apikey" type="password" size="30" placeholder="空=保持不变" autocomplete="off"></label>
         <span id="set-key-state" class="meta"></span>
-        <label>总预算 max_tokens <input id="set-max" type="number" value="16384" style="width:90px"></label>
-        <label>回复预留 response_reserve <input id="set-reserve" type="number" value="4096" style="width:90px"></label>
-        <label>保底轮数 <input id="set-minrounds" type="number" value="4" style="width:60px"></label>
+        <div class="row">
+          <label>窗口档位 <input id="set-tiers" size="18" value="8192,16384,32768"></label>
+          <label>回复预留 <input id="set-reserve" type="number" value="4096" style="width:80px"></label>
+          <label>保底轮数 <input id="set-minrounds" type="number" value="4" style="width:56px"></label>
+        </div>
         <label>Reranker（表情判定） <input id="set-rerank" size="26" value="http://127.0.0.1:11437"></label>
         <label>模型 <select id="set-model" style="max-width:230px"></select>（存本机，刷新不丢）</label>
         <label><input type="checkbox" id="set-stream"> 流式输出</label>
         <label>聊天显示最近 <input id="set-visible" type="number" value="10" min="5" max="200" style="width:60px"> 轮（滑动窗口，上下文不受影响）</label>
+        <div class="row">
+          <label>聊天头像大小 <input id="set-avatar-size" type="number" min="32" max="240" value="88" style="width:64px"> px</label>
+        </div>
         <label>导出时我的名字 <input id="set-user" size="12" placeholder="RoyChong"></label>
-        <label>本机头像缩放 <input id="set-avatar-zoom" type="number" step="0.1" min="0.5" max="2" value="1" style="width:60px">（只影响本设备）</label>
         <div class="row"><button id="btn-settings-save" class="primary">保存偏好</button><button id="btn-models-refresh">刷新模型列表</button></div>
-        <p class="meta">upstream/key 存后端 data/settings.json（0600，不进 git）；其余存浏览器 localStorage。</p>
+        <p class="meta">upstream/key/current_char 存后端 data/settings.json（0600，不进 git）；其余存浏览器 localStorage。</p>
+      </div>
+      <div class="glass pad form">
+        <b>会话操作</b>
+        <p class="meta">导出 = 把当前角色整楼（可含全部归档）转 timeline md 喂 RAG；归档 = 封存当前楼另起新楼（角色数据不丢）。</p>
+        <div class="row">
+          <button id="btn-export">📥 导出 md</button>
+          <button id="btn-export-all">📥 导出全部归档+当前</button>
+          <button id="btn-archive">🗃 归档新楼</button>
+        </div>
+      </div>
+      <div class="glass pad form">
+        <b>后台推送（ntfy，可选）</b>
+        <label>ntfy 地址 <input id="set-ntfy-url" size="28" placeholder="http://192.168.10.2:8081"></label>
+        <label>ntfy topic <input id="set-ntfy-topic" size="16" placeholder="tavernlab"></label>
+        <div class="row"><button id="btn-ntfy-save">保存推送设置</button></div>
+        <p class="meta">填了地址+主题后，助手回复会推送到手机 App（App 锁屏也能收）。</p>
       </div>
     </section>
   </main>

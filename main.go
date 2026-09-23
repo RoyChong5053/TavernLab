@@ -11,6 +11,7 @@ import (
 	"bytes"
 	"context"
 	"embed"
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -101,6 +102,22 @@ func (r *runtimeSettings) update(root string, patch map[string]any) settings.Set
 	if v, ok := patch["mcp_threshold"].(float64); ok {
 		r.cur.MCPThreshold = v
 	}
+	if v, ok := patch["current_char"].(string); ok && v != "" {
+		r.cur.CurrentChar = v
+	}
+	if v, ok := patch["user_name"].(string); ok && v != "" {
+		r.cur.UserName = v
+	}
+	if v, ok := patch["ntfy_url"]; ok {
+		if s, ok := v.(string); ok {
+			r.cur.NtfyURL = s
+		}
+	}
+	if v, ok := patch["ntfy_topic"]; ok {
+		if s, ok := v.(string); ok {
+			r.cur.NtfyTopic = s
+		}
+	}
 	_ = settings.Save(root, r.cur) // best-effort; key stays usable in memory regardless
 	return r.cur
 }
@@ -131,7 +148,9 @@ func main() {
 		Ctx:           engine.DefaultConfig(),
 	}
 	st := store.New(cfg.DataRoot)
+	st.MigrateLegacyChats()
 	client := &http.Client{Timeout: 10 * time.Minute}
+	events := newHub()
 
 	mux := http.NewServeMux()
 
@@ -151,6 +170,8 @@ func main() {
 				"api_key_hint": settings.Mask(s.APIKey), "rerank_url": s.RerankURL,
 				"mcp_url": s.MCPURL, "mcp_collection": s.MCPCollection,
 				"mcp_enabled": s.MCPEnabled, "mcp_topk": s.MCPTopK, "mcp_threshold": s.MCPThreshold,
+				"current_char": s.CurrentChar, "user_name": s.UserName,
+				"ntfy_url": s.NtfyURL, "ntfy_topic": s.NtfyTopic,
 			})
 		case "PUT":
 			b, _ := io.ReadAll(r.Body)
@@ -216,11 +237,15 @@ func main() {
 		case "GET":
 			b, err := os.ReadFile(p)
 			if err != nil {
-				writeJSON(w, cfg.DefaultBlocks)
+				writeJSON(w, normalizeBlocks(cfg.DefaultBlocks))
 				return
 			}
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write(b)
+			var blocks []engine.Block
+			if json.Unmarshal(b, &blocks) != nil {
+				writeJSON(w, normalizeBlocks(cfg.DefaultBlocks))
+				return
+			}
+			writeJSON(w, normalizeBlocks(blocks))
 		case "PUT":
 			b, _ := io.ReadAll(r.Body)
 			var blocks []engine.Block
@@ -240,13 +265,13 @@ func main() {
 		p := filepath.Join(cfg.DataRoot, "presets", "default.json")
 		b, err := os.ReadFile(p)
 		if err != nil {
-			return cfg.DefaultBlocks
+			return normalizeBlocks(cfg.DefaultBlocks)
 		}
 		var blocks []engine.Block
 		if err := json.Unmarshal(b, &blocks); err != nil {
-			return cfg.DefaultBlocks
+			return normalizeBlocks(cfg.DefaultBlocks)
 		}
-		return blocks
+		return normalizeBlocks(blocks)
 	}
 
 	// Dry-run assemble: blocks -> raw + per-block tokens + dropped. No LLM call.
@@ -267,21 +292,23 @@ func main() {
 			blocks = loadBlocks()
 		}
 		ctx := in.Context
-		if ctx.MaxTokens == 0 {
+		if len(ctx.Tiers) == 0 && ctx.MaxTokens == 0 {
 			ctx = cfg.Ctx
 		}
-		turns := in.Chat
+		session := firstNonEmpty(in.Session, rt.get().CurrentChar, "main")
+		turns := engineTurns(in.Chat)
 		if in.Session != "" {
 			if all, err := st.LoadAll(in.Session); err == nil {
 				turns = chatToTurns(all)
 			}
 		}
-		blocks = injectChat(blocks, turns)
+		blocks = renderBlocks(cfg.DataRoot, session, rt.get().UserName, blocks)
 		memInfo := resolveMCP(r.Context(), rt.get(), blocks, turns)
-		res := engine.Assemble(blocks, ctx)
+		res := engine.Assemble(engine.Input{Blocks: blocks, Cfg: ctx, Turns: turns})
 		out := map[string]any{
 			"messages": res.Messages, "blocks": res.Blocks, "total_tokens": res.TotalTok,
-			"budget_tokens": res.BudgetTok, "dropped": res.Dropped, "prompt_text": res.PromptText,
+			"budget_tokens": res.BudgetTok, "tier": res.Tier, "overflow": res.Overflow,
+			"dropped": res.Dropped, "prompt_text": res.PromptText,
 			"memory": memInfo,
 		}
 		writeJSON(w, out)
@@ -296,7 +323,8 @@ func main() {
 			Messages []map[string]any     `json:"messages"`
 			Stream   bool                 `json:"stream"`
 			Session  string               `json:"session"`
-			Text     string               `json:"text"` // new path: single fresh user message
+			Text     string               `json:"text"`   // new path: single fresh user message
+			Images   []string             `json:"images"` // data URLs / raw base64 for the fresh message
 			Blocks   []engine.Block       `json:"blocks"`
 			Context  engine.ContextConfig `json:"context"`
 			Chat     []map[string]string  `json:"chat"` // legacy: explicit turns (assemble/preview compat)
@@ -307,44 +335,46 @@ func main() {
 			blocks = loadBlocks()
 		}
 		ctx := in.Context
-		if ctx.MaxTokens == 0 {
+		if len(ctx.Tiers) == 0 && ctx.MaxTokens == 0 {
 			ctx = cfg.Ctx
 		}
-		session := store.CleanSession(firstNonEmpty(in.Session, "main"))
+		session := store.CleanSession(firstNonEmpty(in.Session, s.CurrentChar, "main"))
 		// New path: frontend sends only the fresh message; full context slides
 		// server-side out of the (possibly thousands of turns) JSONL so the DOM
 		// window size never affects what the model sees.
-		turns := in.Chat
+		turns := engineTurns(in.Chat)
+		var upImages []string
 		if userText := strings.TrimSpace(in.Text); userText != "" {
-			_ = st.AppendChat(session, "user", userText)
+			paths, dataURLs, _ := saveImages(cfg.DataRoot, session, in.Images)
+			upImages = dataURLs
+			msg, _ := st.AppendChat(session, "user", userText, paths...)
+			events.publish(session, msg)
 			all, _ := st.LoadAll(session)
 			turns = chatToTurns(all)
+		} else if len(in.Messages) > 0 {
+			// classic OpenAI path: convert caller messages to turns
+			turns = rawToTurns(in.Messages)
 		}
-		blocks = injectChat(blocks, turns)
-		// If caller passed raw messages (classic path), wrap as chat block content.
-		if len(in.Messages) > 0 {
-			blocks = injectRawMessages(blocks, in.Messages)
-		}
+		blocks = renderBlocks(cfg.DataRoot, session, s.UserName, blocks)
 		memInfo := resolveMCP(r.Context(), s, blocks, turns)
-		res := engine.Assemble(blocks, ctx)
+		res := engine.Assemble(engine.Input{Blocks: blocks, Cfg: ctx, Turns: turns})
 
-		// Build upstream body from assembled messages.
+		// Build upstream body from assembled messages (attach fresh images).
+		upMsgs := buildUpMessages(res.Messages, upImages)
 		model := in.Model
 		if model == nil || model == "" {
 			model = "default"
 		}
 		upBody, _ := json.Marshal(map[string]any{
-			"model": model, "messages": res.Messages, "stream": in.Stream,
+			"model": model, "messages": upMsgs, "stream": in.Stream,
 		})
 		auditID := time.Now().Format("20060102-150405.000")
-		if s, ok := model.(string); ok {
-			_ = s
-		}
 
 		// Legacy path (no Text): user turn arrived inside in.Chat, persist it.
 		if strings.TrimSpace(in.Text) == "" {
-			if q := lastUserText(in.Chat); q != "" {
-				_ = st.AppendChat(session, "user", q)
+			if q := lastUserText(turns); q != "" {
+				msg, _ := st.AppendChat(session, "user", q)
+				events.publish(session, msg)
 			}
 		}
 
@@ -357,7 +387,11 @@ func main() {
 			status, rebuilt, _ := proxy.Forward(client, s.Upstream, s.APIKey, upBody, true, w, flusher)
 			_ = status
 			_ = st.SaveAudit(toAudit(auditID, model, res, upBody, rebuilt, nil, memInfo))
-			_ = st.AppendChat(session, "assistant", rebuiltText(rebuilt))
+			if reply := strings.TrimSpace(rebuiltText(rebuilt)); reply != "" {
+				msg, _ := st.AppendChat(session, "assistant", reply)
+				events.publish(session, msg)
+				publishNtfy(s, msg)
+			}
 			return
 		}
 		status, respBody, usage := proxy.Forward(client, s.Upstream, s.APIKey, upBody, false, nil, nil)
@@ -365,7 +399,11 @@ func main() {
 		w.WriteHeader(status)
 		_, _ = w.Write(respBody)
 		_ = st.SaveAudit(toAudit(auditID, model, res, upBody, respBody, usage, memInfo))
-		_ = st.AppendChat(session, "assistant", replyText(respBody))
+		if reply := strings.TrimSpace(replyText(respBody)); reply != "" {
+			msg, _ := st.AppendChat(session, "assistant", reply)
+			events.publish(session, msg)
+			publishNtfy(s, msg)
+		}
 	})
 
 	// Expression classify: reply -> avatar label (rule + local reranker).
@@ -383,33 +421,116 @@ func main() {
 		writeJSON(w, expression.Classify(client, in.RerankURL, in.Text))
 	})
 
-	// Characters: list/detail/avatar(expressions come later with webp).
-	// Data layout: data/characters/<name>/avatar.* + expressions/<label>.webp
+	// Characters: list/create/detail/delete + card + avatar.
+	// Self-contained layout: data/characters/<name>/{card.json,avatar.*,chat.jsonl,media/,archive/}
 	mux.HandleFunc("/api/characters", func(w http.ResponseWriter, r *http.Request) {
 		root := filepath.Join(cfg.DataRoot, "characters")
-		es, _ := os.ReadDir(root)
-		var names []string
-		for _, e := range es {
-			if e.IsDir() {
-				names = append(names, e.Name())
+		switch r.Method {
+		case "GET":
+			es, _ := os.ReadDir(root)
+			out := []map[string]any{}
+			for _, e := range es {
+				if !e.IsDir() {
+					continue
+				}
+				base := filepath.Join(root, e.Name())
+				out = append(out, map[string]any{
+					"name":        e.Name(),
+					"description": loadCharCard(base).Description,
+					"avatar_url":  charAvatarURL(cfg.DataRoot, e.Name()),
+					"avatar_px":   charAvatarPx(base),
+				})
 			}
+			writeJSON(w, map[string]any{"characters": out})
+		case "POST":
+			var in struct {
+				Name        string `json:"name"`
+				Description string `json:"description"`
+			}
+			b, _ := io.ReadAll(r.Body)
+			if err := json.Unmarshal(b, &in); err != nil {
+				http.Error(w, "bad json", 400)
+				return
+			}
+			name, ok := store.SafeCharName(in.Name)
+			if !ok {
+				http.Error(w, "invalid character name", 400)
+				return
+			}
+			base := filepath.Join(root, name)
+			if _, err := os.Stat(base); err == nil {
+				http.Error(w, "character already exists", 409)
+				return
+			}
+			if err := os.MkdirAll(base, 0o755); err != nil {
+				http.Error(w, "create failed", 500)
+				return
+			}
+			if err := saveCharCard(base, CharCard{Name: name, Description: in.Description, Created: time.Now().Format(time.RFC3339)}); err != nil {
+				http.Error(w, "create failed", 500)
+				return
+			}
+			writeJSON(w, map[string]any{"ok": true, "name": name})
+		default:
+			http.Error(w, "method not allowed", 405)
 		}
-		if names == nil {
-			names = []string{}
-		}
-		writeJSON(w, map[string]any{"characters": names})
 	})
 	mux.HandleFunc("/api/characters/", func(w http.ResponseWriter, r *http.Request) {
 		rest := strings.TrimPrefix(r.URL.Path, "/api/characters/")
 		parts := strings.SplitN(rest, "/", 2)
 		name := parts[0]
-		if name == "" || strings.Contains(name, "..") {
+		if name == "" || strings.Contains(name, "..") || strings.ContainsAny(name, "/\\") {
 			http.Error(w, "bad name", 400)
 			return
 		}
 		base := filepath.Join(cfg.DataRoot, "characters", name)
-		if len(parts) == 2 && parts[1] == "avatar" && r.Method == "PUT" {			// multipart file=...  or raw body; save as avatar.webp (browser
-			// <img> plays animated webp natively, mp4 loop comes later).
+		sub := ""
+		if len(parts) == 2 {
+			sub = parts[1]
+		}
+
+		switch {
+		case sub == "" && r.Method == "GET":
+			card := loadCharCard(base)
+			writeJSON(w, map[string]any{
+				"name": name, "description": card.Description, "created": card.Created,
+				"avatar_url": charAvatarURL(cfg.DataRoot, name), "avatar_px": charAvatarPx(base),
+				"expressions": listExpressions(base),
+			})
+		case sub == "" && r.Method == "DELETE":
+			// Default: keep chat data. ?chats=1 explicitly removes chat too.
+			if r.URL.Query().Get("chats") == "1" {
+				_ = os.RemoveAll(base)
+			} else {
+				_ = os.Remove(filepath.Join(base, "card.json"))
+				for _, a := range []string{"avatar.webp", "avatar.png", "avatar.jpg", "avatar.gif", "avatar.jpeg"} {
+					_ = os.Remove(filepath.Join(base, a))
+				}
+			}
+			writeJSON(w, map[string]any{"ok": true, "chats_kept": r.URL.Query().Get("chats") != "1"})
+		case sub == "card" && r.Method == "PUT":
+			var in struct {
+				Description string `json:"description"`
+			}
+			b, _ := io.ReadAll(r.Body)
+			if err := json.Unmarshal(b, &in); err != nil {
+				http.Error(w, "bad json", 400)
+				return
+			}
+			_ = os.MkdirAll(base, 0o755)
+			card := loadCharCard(base)
+			card.Name = name
+			card.Description = in.Description
+			if card.Created == "" {
+				card.Created = time.Now().Format(time.RFC3339)
+			}
+			if err := saveCharCard(base, card); err != nil {
+				http.Error(w, "save failed", 500)
+				return
+			}
+			writeJSON(w, map[string]any{"ok": true, "card": card})
+		case sub == "avatar" && r.Method == "PUT":
+			// multipart file=... or raw body; saved as avatar.<ext>.
 			_ = os.MkdirAll(base, 0o755)
 			var src io.Reader = r.Body
 			fname := "avatar.webp"
@@ -421,11 +542,13 @@ func main() {
 				}
 				defer f.Close()
 				src = f
-				if n := strings.ToLower(h.Filename); strings.HasSuffix(n, ".png") {
+				n := strings.ToLower(h.Filename)
+				switch {
+				case strings.HasSuffix(n, ".png"):
 					fname = "avatar.png"
-				} else if strings.HasSuffix(n, ".jpg") || strings.HasSuffix(n, ".jpeg") {
+				case strings.HasSuffix(n, ".jpg") || strings.HasSuffix(n, ".jpeg"):
 					fname = "avatar.jpg"
-				} else if strings.HasSuffix(n, ".gif") {
+				case strings.HasSuffix(n, ".gif"):
 					fname = "avatar.gif"
 				}
 			}
@@ -439,18 +562,13 @@ func main() {
 				http.Error(w, "save failed", 500)
 				return
 			}
-			// remove sibling avatar.* so detail has one canonical file
-			for _, alt := range []string{"avatar.webp", "avatar.png", "avatar.jpg", "avatar.gif"} {
+			for _, alt := range []string{"avatar.webp", "avatar.png", "avatar.jpg", "avatar.jpeg", "avatar.gif"} {
 				if alt != fname {
 					_ = os.Remove(filepath.Join(base, alt))
 				}
 			}
 			writeJSON(w, map[string]any{"ok": true, "avatar_url": "/chars/" + name + "/" + fname})
-			return
-		}
-		if len(parts) == 2 && parts[1] == "meta" && r.Method == "PUT" {
-			// Per-character prefs: {"avatar_px": 64}. Stored in
-			// data/characters/<name>/meta.json (rclone-friendly).
+		case sub == "meta" && r.Method == "PUT":
 			b, _ := io.ReadAll(r.Body)
 			var meta map[string]any
 			if err := json.Unmarshal(b, &meta); err != nil {
@@ -465,37 +583,25 @@ func main() {
 			mb, _ := json.MarshalIndent(cur, "", "  ")
 			_ = os.WriteFile(filepath.Join(base, "meta.json"), mb, 0o644)
 			writeJSON(w, map[string]any{"ok": true, "meta": cur})
+		default:
+			http.Error(w, "not found", 404)
+		}
+	})
+	// Static avatar/media only: chat.jsonl / card.json / archive stay private.
+	mux.HandleFunc("/chars/", func(w http.ResponseWriter, r *http.Request) {
+		rel := strings.TrimPrefix(r.URL.Path, "/chars/")
+		if rel == "" || strings.Contains(rel, "..") {
+			http.Error(w, "bad path", 400)
 			return
 		}
-		// detail
-		avatarURL := ""
-		for _, cand := range []string{"avatar.webp", "avatar.png", "avatar.jpg", "avatar.gif"} {
-			if _, err := os.Stat(filepath.Join(base, cand)); err == nil {
-				avatarURL = "/chars/" + name + "/" + cand
-				break
-			}
+		switch strings.ToLower(filepath.Ext(rel)) {
+		case ".webp", ".png", ".jpg", ".jpeg", ".gif":
+		default:
+			http.Error(w, "not found", 404)
+			return
 		}
-		var exprs []string
-		if es, err := os.ReadDir(filepath.Join(base, "expressions")); err == nil {
-			for _, e := range es {
-				if !e.IsDir() {
-					exprs = append(exprs, "expressions/"+e.Name())
-				}
-			}
-		}
-		if exprs == nil {
-			exprs = []string{}
-		}
-		meta := loadCharMeta(base)
-		avatarPx := 48
-		if v, ok := meta["avatar_px"].(float64); ok && v >= 24 {
-			avatarPx = int(v)
-		} else if v, ok := meta["avatar_px"].(int); ok && v >= 24 {
-			avatarPx = v
-		}
-		writeJSON(w, map[string]any{"name": name, "avatar_url": avatarURL, "expressions": exprs, "avatar_px": avatarPx})
+		http.ServeFile(w, r, filepath.Join(cfg.DataRoot, "characters", filepath.FromSlash(rel)))
 	})
-	mux.Handle("/chars/", http.StripPrefix("/chars/", http.FileServer(http.Dir(filepath.Join(cfg.DataRoot, "characters")))))
 
 	// Audit list + detail + replay.
 	mux.HandleFunc("/api/audit", func(w http.ResponseWriter, r *http.Request) {
@@ -533,10 +639,10 @@ func main() {
 	})
 
 	// Chat history: GET /api/history?session=<char>&limit=10&before=0
-	// Sliding window over data/chats/<session>.jsonl (newest last).
+	// Sliding window over data/characters/<char>/chat.jsonl (newest last).
 	// `before` = messages already shown (for "load earlier").
 	mux.HandleFunc("/api/history", func(w http.ResponseWriter, r *http.Request) {
-		session := store.CleanSession(r.URL.Query().Get("session"))
+		session := store.CleanSession(firstNonEmpty(r.URL.Query().Get("session"), rt.get().CurrentChar))
 		limit := atoiDefault(r.URL.Query().Get("limit"), 10)
 		before := atoiDefault(r.URL.Query().Get("before"), 0)
 		msgs, total, err := st.Tail(session, limit, before)
@@ -547,28 +653,75 @@ func main() {
 		writeJSON(w, map[string]any{"session": session, "total": total, "messages": msgs, "has_more": total-before-limit > 0})
 	})
 
+	// Live events: GET /api/events?session=<char> (SSE). Foreground clients
+	// subscribe and receive every appended message in real time; the app's
+	// sync button remains the fallback when the connection drops.
+	mux.HandleFunc("/api/events", func(w http.ResponseWriter, r *http.Request) {
+		session := store.CleanSession(firstNonEmpty(r.URL.Query().Get("session"), rt.get().CurrentChar, "main"))
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "streaming unsupported", 500)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("X-Accel-Buffering", "no")
+		_, _ = io.WriteString(w, ": connected\n\n")
+		flusher.Flush()
+
+		ch := events.subscribe(session)
+		defer events.unsubscribe(session, ch)
+		ctx := r.Context()
+		keep := time.NewTicker(25 * time.Second)
+		defer keep.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case m := <-ch:
+				b, _ := json.Marshal(m)
+				_, _ = fmt.Fprintf(w, "event: message\ndata: %s\n\n", b)
+				flusher.Flush()
+			case <-keep.C:
+				_, _ = io.WriteString(w, ": ping\n\n")
+				flusher.Flush()
+			}
+		}
+	})
+
 	// Export timeline md (same shape as raw_chat_timeline_process.py output so it
 	// feeds the RAG pipeline directly): GET /api/export?session=<char>&user=RoyChong
-	// Header: "# A & B Chat: YYYY-MM-DD ~ YYYY-MM-DD", rows: "**Name** [ts]: text".
+	// &archives=1 also prepends every archived floor (full lifetime, for RAG).
 	mux.HandleFunc("/api/export", func(w http.ResponseWriter, r *http.Request) {
-		session := store.CleanSession(r.URL.Query().Get("session"))
+		session := store.CleanSession(firstNonEmpty(r.URL.Query().Get("session"), rt.get().CurrentChar))
 		userName := strings.TrimSpace(r.URL.Query().Get("user"))
 		if userName == "" {
-			userName = "user"
+			userName = firstNonEmpty(rt.get().UserName, "user")
 		}
-		msgs, err := st.LoadAll(session)
+		var all []store.ChatMessage
+		if r.URL.Query().Get("archives") == "1" {
+			names, _ := st.ListArchives(session)
+			for i := len(names) - 1; i >= 0; i-- { // oldest floor first
+				if msgs, err := st.LoadArchive(session, names[i]); err == nil {
+					all = append(all, msgs...)
+				}
+			}
+		}
+		cur, err := st.LoadAll(session)
 		if err != nil {
 			http.Error(w, "export read failed", 500)
 			return
 		}
-		md := timelineMD(session, userName, msgs)
+		all = append(all, cur...)
+		md := timelineMD(session, userName, all)
 		w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
 		w.Header().Set("Content-Disposition", "attachment; filename=\""+session+" (timeline).md\"")
 		_, _ = w.Write([]byte(md))
 	})
 
 	// Archive ("new chat" in ST terms): POST /api/archive {"session":"..."}
-	// Seals current jsonl into chats/archive/ and starts a fresh one.
+	// Seals <char>/chat.jsonl into <char>/archive/<ts>.jsonl and starts fresh.
 	mux.HandleFunc("/api/archive", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "POST" {
 			http.Error(w, "method not allowed", 405)
@@ -579,7 +732,7 @@ func main() {
 		}
 		b, _ := io.ReadAll(r.Body)
 		_ = json.Unmarshal(b, &in)
-		name, err := st.Archive(in.Session)
+		name, err := st.Archive(firstNonEmpty(in.Session, rt.get().CurrentChar))
 		if err != nil {
 			http.Error(w, "archive failed: "+err.Error(), 500)
 			return
@@ -602,7 +755,7 @@ func main() {
 				"size": 0, "digest": "-",
 				"details": map[string]any{
 					"parent_model": "", "format": "", "family": "tavernlab",
-					"families": []string{"tavernlab"},
+					"families":       []string{"tavernlab"},
 					"parameter_size": "", "quantization_level": "",
 				},
 			})
@@ -623,42 +776,54 @@ func main() {
 			Model    string `json:"model"`
 			Stream   bool   `json:"stream"`
 			Messages []struct {
-				Role    string `json:"role"`
-				Content string `json:"content"`
+				Role    string   `json:"role"`
+				Content string   `json:"content"`
+				Images  []string `json:"images"`
 			} `json:"messages"`
 		}
 		b, _ := io.ReadAll(r.Body)
 		_ = json.Unmarshal(b, &in)
 		model := firstNonEmpty(in.Model, "auto-gemini")
-		turns := make([]map[string]string, 0, len(in.Messages))
-		for _, m := range in.Messages {
-			role := m.Role
-			if role != "user" && role != "assistant" && role != "system" {
-				role = "user"
-			}
-			turns = append(turns, map[string]string{"role": role, "content": m.Content})
-		}
-		if q := lastUserText(turns); q != "" {
-			_ = st.AppendChat(singleFloor, "user", q)
-			if all, err := st.LoadAll(singleFloor); err == nil {
-				turns = chatToTurns(all)
+		session := store.CleanSession(firstNonEmpty(s.CurrentChar, "tavernlab"))
+		// The app mirrors the server: only the newest user message matters;
+		// full context is slid server-side out of the character's JSONL.
+		var freshText string
+		var freshImages []string
+		for i := len(in.Messages) - 1; i >= 0; i-- {
+			if in.Messages[i].Role == "user" && strings.TrimSpace(in.Messages[i].Content) != "" {
+				freshText = in.Messages[i].Content
+				freshImages = in.Messages[i].Images
+				break
 			}
 		}
-		blocks := injectChat(loadBlocks(), turns)
+		var upImages []string
+		if freshText != "" {
+			paths, dataURLs, _ := saveImages(cfg.DataRoot, session, freshImages)
+			upImages = dataURLs
+			msg, _ := st.AppendChat(session, "user", freshText, paths...)
+			events.publish(session, msg)
+		}
+		all, _ := st.LoadAll(session)
+		turns := chatToTurns(all)
+		blocks := renderBlocks(cfg.DataRoot, session, s.UserName, loadBlocks())
 		memInfo := resolveMCP(r.Context(), s, blocks, turns)
-		res := engine.Assemble(blocks, cfg.Ctx)
-		upBody, _ := json.Marshal(map[string]any{"model": model, "messages": res.Messages, "stream": in.Stream})
+		res := engine.Assemble(engine.Input{Blocks: blocks, Cfg: cfg.Ctx, Turns: turns})
+		upMsgs := buildUpMessages(res.Messages, upImages)
+		upBody, _ := json.Marshal(map[string]any{"model": model, "messages": upMsgs, "stream": in.Stream})
 		auditID := time.Now().Format("20060102-150405.000")
 
 		if !in.Stream {
 			status, respBody, usage := proxy.Forward(client, s.Upstream, s.APIKey, upBody, false, nil, nil)
 			reply := replyText(respBody)
 			_ = st.SaveAudit(toAudit(auditID, model, res, upBody, respBody, usage, memInfo))
-			_ = st.AppendChat(singleFloor, "assistant", reply)
+			if strings.TrimSpace(reply) != "" {
+				msg, _ := st.AppendChat(session, "assistant", reply)
+				events.publish(session, msg)
+			}
 			w.WriteHeader(status)
 			writeJSON(w, map[string]any{
 				"model": model, "created_at": time.Now().Format(time.RFC3339),
-				"message": map[string]any{"role": "assistant", "content": reply},
+				"message":     map[string]any{"role": "assistant", "content": reply},
 				"done_reason": "stop", "done": true,
 			})
 			return
@@ -671,11 +836,14 @@ func main() {
 		status, full := forwardOllamaStream(client, s.Upstream, s.APIKey, upBody, model, w, flusher)
 		_ = status
 		rebuilt, _ := json.Marshal(map[string]any{
-			"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": full}}},
+			"choices":        []map[string]any{{"message": map[string]any{"role": "assistant", "content": full}}},
 			"stream_rebuilt": true, "via": "ollama-shim",
 		})
 		_ = st.SaveAudit(toAudit(auditID, model, res, upBody, rebuilt, nil, memInfo))
-		_ = st.AppendChat(singleFloor, "assistant", full)
+		if strings.TrimSpace(full) != "" {
+			msg, _ := st.AppendChat(session, "assistant", full)
+			events.publish(session, msg)
+		}
 	})
 
 	// POST /api/generate {"model":"...","prompt":"..."} -> {"response":title,"done":true}
@@ -724,6 +892,8 @@ func writeJSON(w http.ResponseWriter, v any) {
 }
 
 // injectChat renders {{chat_history}} into the chat block from simple turns.
+// Deprecated: chat history is now passed as structured turns to the engine,
+// but kept for the classic /v1 messages path.
 func injectChat(blocks []engine.Block, chat []map[string]string) []engine.Block {
 	if len(chat) == 0 {
 		return blocks
@@ -743,17 +913,6 @@ func injectChat(blocks []engine.Block, chat []map[string]string) []engine.Block 
 		}
 	}
 	return out
-}
-
-// injectRawMessages wraps caller-supplied messages as the chat block.
-func injectRawMessages(blocks []engine.Block, msgs []map[string]any) []engine.Block {
-	var sb strings.Builder
-	for _, m := range msgs {
-		role, _ := m["role"].(string)
-		content, _ := m["content"].(string)
-		sb.WriteString(role + ": " + content + "\n")
-	}
-	return injectChat(blocks, []map[string]string{{"role": "chat", "content": sb.String()}})
 }
 
 func toAudit(id string, model any, res engine.AssembleResult, upBody, respBody []byte, usage map[string]any, mem map[string]any) store.Audit {
@@ -779,9 +938,17 @@ func toAudit(id string, model any, res engine.AssembleResult, upBody, respBody [
 	for _, b := range res.Blocks {
 		rows = append(rows, store.BlockRow{ID: b.ID, Role: b.Role, Order: b.Order, Tokens: b.Tokens, Cut: b.Truncated, Note: b.DroppedNote})
 	}
+	actual := 0
+	if usage != nil {
+		if v, ok := usage["prompt_tokens"].(float64); ok {
+			actual = int(v)
+		}
+	}
 	return store.Audit{
 		ID: id, Time: time.Now().Format(time.RFC3339), Model: mName,
-		Budget: res.BudgetTok, TotalTok: res.TotalTok, Blocks: rows,
+		Tier: res.Tier, Overflow: res.Overflow,
+		Budget: res.BudgetTok, TotalTok: res.TotalTok, Estimate: res.TotalTok, Actual: actual,
+		Blocks:  rows,
 		Dropped: res.Dropped, Raw: raw, ReplyText: reply, Upstream: usage,
 		Memory: mem,
 	}
@@ -815,16 +982,110 @@ func loadCharMeta(base string) map[string]any {
 // through verbatim (no name prefix) — prefixing used to teach the model to
 // emit "角色名: " in its own replies; attribution for export comes from
 // timelineMD instead, which reads the JSONL directly.
-func chatToTurns(msgs []store.ChatMessage) []map[string]string {
-	turns := make([]map[string]string, 0, len(msgs))
+func chatToTurns(msgs []store.ChatMessage) []engine.Message {
+	turns := make([]engine.Message, 0, len(msgs))
 	for _, m := range msgs {
 		role := m.Role
 		if role != "user" && role != "assistant" && role != "system" {
 			role = "user"
 		}
-		turns = append(turns, map[string]string{"role": role, "content": m.Text})
+		turns = append(turns, engine.Message{Role: role, Content: m.Text})
 	}
 	return turns
+}
+
+// engineTurns converts legacy {"role","content"} maps to engine turns.
+func engineTurns(chat []map[string]string) []engine.Message {
+	turns := make([]engine.Message, 0, len(chat))
+	for _, m := range chat {
+		role := m["role"]
+		if role != "user" && role != "assistant" && role != "system" {
+			role = "user"
+		}
+		turns = append(turns, engine.Message{Role: role, Content: m["content"]})
+	}
+	return turns
+}
+
+// rawToTurns converts classic OpenAI messages to engine turns.
+func rawToTurns(msgs []map[string]any) []engine.Message {
+	turns := make([]engine.Message, 0, len(msgs))
+	for _, m := range msgs {
+		role, _ := m["role"].(string)
+		if role != "user" && role != "assistant" && role != "system" {
+			role = "user"
+		}
+		content, _ := m["content"].(string)
+		turns = append(turns, engine.Message{Role: role, Content: content})
+	}
+	return turns
+}
+
+// buildUpMessages converts assembled messages to OpenAI maps and attaches
+// image data URLs to the final user message (multimodal content parts).
+func buildUpMessages(msgs []engine.Message, imageDataURLs []string) []map[string]any {
+	out := make([]map[string]any, 0, len(msgs))
+	for _, m := range msgs {
+		out = append(out, map[string]any{"role": m.Role, "content": m.Content})
+	}
+	if len(imageDataURLs) == 0 {
+		return out
+	}
+	for i := len(out) - 1; i >= 0; i-- {
+		if out[i]["role"] != "user" {
+			continue
+		}
+		parts := []map[string]any{{"type": "text", "text": out[i]["content"]}}
+		for _, u := range imageDataURLs {
+			parts = append(parts, map[string]any{"type": "image_url", "image_url": map[string]any{"url": u}})
+		}
+		out[i]["content"] = parts
+		break
+	}
+	return out
+}
+
+// saveImages persists base64/data-URL images under the character package and
+// returns package-relative paths plus normalised data URLs for the upstream.
+func saveImages(root, session string, imgs []string) (paths, dataURLs []string, err error) {
+	if len(imgs) == 0 {
+		return nil, nil, nil
+	}
+	st := store.New(root)
+	for _, raw := range imgs {
+		if strings.TrimSpace(raw) == "" {
+			continue
+		}
+		mime := "image/png"
+		b64 := raw
+		if strings.HasPrefix(raw, "data:") {
+			if i := strings.Index(raw, ";base64,"); i >= 0 {
+				mime = raw[5:i]
+				b64 = raw[i+8:]
+			} else if i := strings.Index(raw, ","); i >= 0 {
+				mime = raw[5:i]
+				b64 = raw[i+1:]
+			}
+		}
+		data, decErr := base64.StdEncoding.DecodeString(strings.TrimSpace(b64))
+		if decErr != nil {
+			continue
+		}
+		ext := "png"
+		if j := strings.Index(mime, "/"); j >= 0 {
+			ext = mime[j+1:]
+		}
+		if ext == "jpeg" {
+			ext = "jpg"
+		}
+		p, werr := st.SaveMedia(session, ext, data)
+		if werr != nil {
+			continue
+		}
+		paths = append(paths, p)
+		dataURLs = append(dataURLs, "data:"+mime+";base64,"+base64.StdEncoding.EncodeToString(data))
+	}
+	return paths, dataURLs, nil
 }
 
 // timelineMD renders stored rows in raw_chat_timeline_process.py timeline
@@ -875,10 +1136,6 @@ func atoiDefault(s string, d int) int {
 	}
 	return n
 }
-
-// singleFloor is the one conversation the Flutter app ever sees.
-// Web UI shares it when settings.char matches (default Leer乐儿).
-const singleFloor = "Leer乐儿"
 
 // upstreamModelIDs lists upstream /v1/models ids ("" upstream -> empty).
 func upstreamModelIDs(client *http.Client, upstream, apiKey string) []string {
@@ -951,7 +1208,7 @@ func forwardOllamaStream(client *http.Client, upstream, apiKey string, upBody []
 		} else {
 			line, _ = json.Marshal(map[string]any{
 				"model": model, "created_at": time.Now().Format(time.RFC3339),
-				"message": map[string]any{"role": "assistant", "content": ""},
+				"message":     map[string]any{"role": "assistant", "content": ""},
 				"done_reason": "stop", "done": true,
 			})
 		}
@@ -1010,10 +1267,10 @@ func firstLine(s string, n int) string {
 }
 
 // lastUserText returns the latest user utterance from chat turns.
-func lastUserText(chat []map[string]string) string {
+func lastUserText(chat []engine.Message) string {
 	for i := len(chat) - 1; i >= 0; i-- {
-		if chat[i]["role"] == "user" && strings.TrimSpace(chat[i]["content"]) != "" {
-			return chat[i]["content"]
+		if chat[i].Role == "user" && strings.TrimSpace(chat[i].Content) != "" {
+			return chat[i].Content
 		}
 	}
 	return ""
@@ -1022,7 +1279,7 @@ func lastUserText(chat []map[string]string) string {
 // resolveMCP fills enabled mcp-source blocks by searching rag-mcp-server with
 // the latest user utterance. Fail-open: errors are recorded, chat continues.
 // Returns an audit-friendly summary (also served by /api/assemble preview).
-func resolveMCP(ctx context.Context, s settings.Settings, blocks []engine.Block, chat []map[string]string) map[string]any {
+func resolveMCP(ctx context.Context, s settings.Settings, blocks []engine.Block, chat []engine.Message) map[string]any {
 	info := map[string]any{"enabled": false}
 	if !s.MCPEnabled {
 		return info

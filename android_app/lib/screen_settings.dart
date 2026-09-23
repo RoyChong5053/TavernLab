@@ -86,9 +86,6 @@ class _ScreenSettingsState extends State<ScreenSettings> {
     HapticFeedback.selectionClick();
   }
 
-  final systemInputController = TextEditingController(
-      text: prefs?.getString("system") ?? "You are a helpful assistant");
-
   @override
   void initState() {
     super.initState();
@@ -287,45 +284,6 @@ class _ScreenSettingsState extends State<ScreenSettings> {
                                                 fontFamily: "monospace"))
                                       ],
                                     )))),
-                  title(AppLocalizations.of(context)!.settingsTitleBehavior,
-                      bottom: 24),
-                  TextField(
-                      controller: systemInputController,
-                      keyboardType: TextInputType.multiline,
-                      maxLines: 2,
-                      decoration: InputDecoration(
-                          labelText: AppLocalizations.of(context)!
-                              .settingsSystemMessage,
-                          hintText: "You are a helpful assistant",
-                          suffixIcon: IconButton(
-                            onPressed: () {
-                              HapticFeedback.selectionClick();
-                              prefs?.setString(
-                                  "system",
-                                  (systemInputController.text.isNotEmpty)
-                                      ? systemInputController.text
-                                      : "You are a helpful assistant");
-                            },
-                            icon: const Icon(Icons.save_rounded),
-                          ),
-                          border: const OutlineInputBorder())),
-                  const SizedBox(height: 16),
-                  toggle(AppLocalizations.of(context)!.settingsDisableMarkdown,
-                      (prefs!.getBool("noMarkdown") ?? false), (value) {
-                    HapticFeedback.selectionClick();
-                    prefs!.setBool("noMarkdown", value);
-                    setState(() {});
-                  }),
-                  const SizedBox(height: 8),
-                  Row(children: [
-                    const Icon(Icons.warning_rounded, color: Colors.grey),
-                    const SizedBox(width: 16),
-                    Expanded(
-                        child: Text(
-                            AppLocalizations.of(context)!
-                                .settingsBehaviorNotUpdatedForOlderChats,
-                            style: const TextStyle(color: Colors.grey)))
-                  ]),
                   title(AppLocalizations.of(context)!.settingsTitleInterface),
                   SegmentedButton(
                       segments: const [
