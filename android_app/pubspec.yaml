@@ -1,7 +1,7 @@
 name: ollama_app
 description: "A modern and easy-to-use client for Ollama"
 publish_to: 'none'
-version: 1.0.3+6
+version: 1.0.4+7
 
 environment:
   sdk: '>=3.3.4 <4.0.0'
@@ -35,6 +35,8 @@ dependencies:
   package_info_plus: ^10.2.1
   version: ^3.0.2
   flutter_displaymode: ^0.7.0
+  audioplayers: ^6.4.0
+  flutter_local_notifications: ^22.3.1
 
 dev_dependencies:
   flutter_test:

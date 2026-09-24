@@ -1,6 +1,9 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
+import 'dart:typed_data';
+import 'dart:ui' show ImageFilter;
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
@@ -27,6 +30,10 @@ import 'package:flutter_markdown/flutter_markdown.dart';
 // ignore: depend_on_referenced_packages
 import 'package:markdown/markdown.dart' as md;
 import 'package:flutter_displaymode/flutter_displaymode.dart';
+// ignore: implementation_imports
+import 'package:flutter_chat_ui/src/widgets/state/inherited_chat_theme.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:audioplayers/audioplayers.dart';
 
 // client configuration (TavernLab single-floor build: locked to home server)
 
@@ -75,12 +82,88 @@ bool settingsOpen = false;
 // web UI and the phone always continue the same conversation.
 String currentChar = "Leer乐儿";
 
+// ---- Telegram-style live state: chat head, mood panel, polling, chime ----
+
+// UI refresh hook registered by _MainAppState (background helpers cannot hold
+// a BuildContext). All polling/SSE/classify paths funnel through pokeUI().
+void Function(void Function())? uiRefresh;
+void pokeUI() {
+  try {
+    uiRefresh?.call(() {});
+  } catch (_) {}
+}
+
+// Chat head (mirrors WebUI syncChatHead: GET /api/characters/<name>).
+String charAvatarUrl = ""; // full URL ("$host/chars/...") or "" when unknown
+
+// Mood panel: idle shows classified mood, sending/awaiting shows animated
+// "努力回复中" frames (same 420ms cadence as WebUI setPending).
+String moodText = "心情 · —";
+String? moodForMsgId;
+int pendingFrame = 0;
+Timer? pendingAnimTimer;
+const List<String> pendingFrames = ["努力回复中", "努力回复中·", "努力回复中··", "努力回复中···"];
+
+// Send/await state. awaitingReply survives stream errors and screen locks;
+// the 5s poller clears it when the server-side reply lands. No timeout UI.
+bool awaitingReply = false;
+bool offlineMode = false;
+bool appActive = true; // WidgetsBindingObserver resumed?
+String serverRerankUrl = "";
+
+// sendEpoch invalidates zombie streams: every successful sync bumps it, and
+// stream loops break as soon as their epoch goes stale (prevents a dead
+// stream from re-inserting a partial bubble after history was replaced).
+int sendEpoch = 0;
+// One-shot: the server echo of our own just-streamed reply must not chime.
+bool suppressChimeOnce = false;
+
+// Poller state.
+Timer? pollTimer;
+bool pollInFlight = false;
+String? lastProbeFp; // "total:id,id" of the limit=1 probe
+String? lastSeenAssistantId;
+
+// Local notifications (Android only, no Google/FCM involved).
+final FlutterLocalNotificationsPlugin notifPlugin =
+    FlutterLocalNotificationsPlugin();
+bool notifReady = false;
+const String notifChannelId = "tavernlab_reply";
+
+String headerStatus() {
+  if (offlineMode) return "离线 · 重试中";
+  if (!chatAllowed || awaitingReply) {
+    return pendingFrames[pendingFrame % pendingFrames.length];
+  }
+  return moodText;
+}
+
+void setAwaitingReply(bool v) {
+  if (awaitingReply == v) {
+    pokeUI();
+    return;
+  }
+  awaitingReply = v;
+  if (v) {
+    pendingAnimTimer?.cancel();
+    pendingAnimTimer =
+        Timer.periodic(const Duration(milliseconds: 420), (_) {
+      pendingFrame = (pendingFrame + 1) % pendingFrames.length;
+      pokeUI();
+    });
+  } else {
+    pendingAnimTimer?.cancel();
+    pendingAnimTimer = null;
+  }
+  pokeUI();
+}
+
 // ---- server REST helpers (plain HTTP, alongside the Ollama shim) ----
 
-Future<Map<String, dynamic>> apiGet(String path) async {
+Future<Map<String, dynamic>> apiGet(String path, {int seconds = 15}) async {
   final r = await http
       .get(Uri.parse("$host$path"))
-      .timeout(const Duration(seconds: 15));
+      .timeout(Duration(seconds: seconds));
   return jsonDecode(r.body) as Map<String, dynamic>;
 }
 
@@ -176,35 +259,407 @@ Widget buildImageWidget(String uri,
       errorBuilder: (c, e, s) => const Icon(Icons.broken_image));
 }
 
-Future<void> syncFromServer(Function? setState) async {
+Future<Map<String, dynamic>> apiPost(
+    String path, Map<String, dynamic> body,
+    {int seconds = 15}) async {
+  final r = await http
+      .post(Uri.parse("$host$path"),
+          headers: {"Content-Type": "application/json"},
+          body: jsonEncode(body))
+      .timeout(Duration(seconds: seconds));
+  return jsonDecode(r.body) as Map<String, dynamic>;
+}
+
+/// Local notifications, Android only. Purely on-device: no FCM, no Google.
+Future<void> initNotif() async {
+  if (!Platform.isAndroid) return;
   try {
-    // Adopt the server's current character so web and app share the floor.
+    await notifPlugin.initialize(
+        settings: const InitializationSettings(
+            android: AndroidInitializationSettings('@mipmap/ic_launcher')));
+    await notifPlugin
+        .resolvePlatformSpecificImplementation<
+            AndroidFlutterLocalNotificationsPlugin>()
+        ?.requestNotificationsPermission();
+    notifReady = true;
+  } catch (_) {
+    notifReady = false;
+  }
+}
+
+/// Self-contained reply chime: a two-tone sine WAV synthesized at runtime
+/// (no asset files, no Google services). ~0.6s, 22050Hz 16-bit mono.
+Uint8List? _chimeWav;
+Uint8List chimeWav() => _chimeWav ??= _synthChime();
+
+Uint8List _synthChime() {
+  const rate = 22050;
+  const notes = [880.0, 1174.66]; // A5 -> D6
+  const lens = [0.20, 0.38];
+  double total = 0;
+  for (final l in lens) {
+    total += l;
+  }
+  final n = (total * rate).ceil();
+  final data = BytesBuilder();
+  // WAV header (PCM16 mono).
+  void u32(int v) {
+    data.add([v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF, (v >> 24) & 0xFF]);
+  }
+
+  void u16(int v) {
+    data.add([v & 0xFF, (v >> 8) & 0xFF]);
+  }
+
+  data.add(ascii.encode('RIFF'));
+  u32(36 + n * 2);
+  data.add(ascii.encode('WAVEfmt '));
+  u32(16);
+  u16(1);
+  u16(1);
+  u32(rate);
+  u32(rate * 2);
+  u16(2);
+  u16(16);
+  data.add(ascii.encode('data'));
+  u32(n * 2);
+  double t = 0;
+  int ni = 0;
+  double noteStart = 0;
+  for (var i = 0; i < n; i++) {
+    t = i / rate;
+    while (ni < notes.length - 1 && t >= noteStart + lens[ni]) {
+      noteStart += lens[ni];
+      ni++;
+    }
+    final f = notes[ni];
+    final age = t - noteStart;
+    final env = math.exp(-age * 5.5);
+    final s = math.sin(2 * math.pi * f * age) * env;
+    final v = (s * 28000).clamp(-32768, 32767).toInt();
+    u16(v & 0xFFFF);
+  }
+  return data.toBytes();
+}
+
+Future<void> playChime() async {
+  if (!Platform.isAndroid) {
     try {
-      final s = await apiGet("/api/settings");
-      final c = (s["current_char"] ?? "").toString();
-      if (c.isNotEmpty) {
-        currentChar = c;
-        await prefs?.setString("currentChar", c);
-      }
+      HapticFeedback.mediumImpact();
     } catch (_) {}
+    return;
+  }
+  try {
+    final p = AudioPlayer();
+    await p.play(BytesSource(chimeWav()));
+    unawaited(() async {
+      try {
+        await p.onPlayerComplete.first
+            .timeout(const Duration(seconds: 5));
+      } catch (_) {}
+      try {
+        await p.dispose();
+      } catch (_) {}
+    }());
+  } catch (_) {
+    try {
+      SystemSound.play(SystemSoundType.alert);
+    } catch (_) {}
+  }
+  try {
+    HapticFeedback.mediumImpact();
+  } catch (_) {}
+}
+
+Future<void> showReplyNotification(String preview) async {
+  if (!Platform.isAndroid || !notifReady) return;
+  try {
+    await notifPlugin.show(
+      id: 7,
+      title: currentChar,
+      body: preview,
+      notificationDetails: const NotificationDetails(
+        android: AndroidNotificationDetails(
+          notifChannelId,
+          '回复提醒',
+          channelDescription: '角色回复到达提醒（纯本地，无需 Google）',
+          importance: Importance.high,
+          priority: Priority.high,
+        ),
+      ),
+    );
+  } catch (_) {}
+}
+
+/// Foreground: chime. Backgrounded (process still alive): local notification
+/// plus a best-effort chime.
+Future<void> announceReply(String text) async {
+  final preview =
+      text.trim().replaceAll(RegExp(r'\s+'), ' ').trim();
+  final short =
+      preview.length > 120 ? "${preview.substring(0, 120)}…" : preview;
+  if (appActive) {
+    await playChime();
+  } else {
+    await showReplyNotification(short.isEmpty ? "（收到新回复）" : short);
+    await playChime();
+  }
+}
+
+/// Mood panel backend: mirrors WebUI classifyAndBadge
+/// (POST /api/expression/classify with the last 500 chars).
+Future<void> classifyMood(String msgId, String text) async {
+  if (host == null || text.trim().isEmpty) return;
+  if (moodForMsgId == msgId) return;
+  try {
+    final t = text.length > 500 ? text.substring(text.length - 500) : text;
+    final j = await apiPost("/api/expression/classify",
+        {"text": t, "rerank_url": serverRerankUrl});
+    final label = (j["label"] ?? "").toString();
+    moodForMsgId = msgId;
+    moodText = (j["fallback"] == true)
+        ? "心情 · 😐 平静"
+        : (label.isEmpty ? "心情 · —" : "心情 · 😊 $label");
+  } catch (_) {
+    // Silent by design: mood never interrupts chat.
+  }
+  pokeUI();
+}
+
+/// Chat head avatar, mirrors WebUI syncChatHead.
+Future<void> refreshCharHead() async {
+  if (host == null) return;
+  try {
+    final j =
+        await apiGet("/api/characters/${Uri.encodeComponent(currentChar)}");
+    final a = (j["avatar_url"] ?? "").toString();
+    charAvatarUrl = a.isEmpty ? "" : "$host$a";
+  } catch (_) {}
+  pokeUI();
+}
+
+/// 5s poller tick (only while the app is resumed). Cheap limit=1 probe;
+/// a full silent sync happens only when the tail actually changed.
+Future<void> pollTick() async {
+  if (pollInFlight) return;
+  if (host == null) return;
+  if (!chatAllowed) return; // a local stream owns the UI right now
+  pollInFlight = true;
+  try {
+    final j = await apiGet(
+        "/api/history?session=${Uri.encodeComponent(currentChar)}&limit=1",
+        seconds: 4);
+    final total = (j["total"] ?? -1).toString();
+    final list = (j["messages"] as List?) ?? [];
+    var fp = "$total:";
+    for (final raw in list) {
+      fp += "${(raw as Map)["id"] ?? ""},";
+    }
+    if (lastProbeFp != null && fp != lastProbeFp) {
+      lastProbeFp = fp;
+      await syncFromServer(silent: true);
+    } else {
+      lastProbeFp = fp;
+    }
+    if (offlineMode) {
+      offlineMode = false;
+      pokeUI();
+    }
+  } catch (_) {
+    if (!offlineMode) {
+      offlineMode = true;
+      pokeUI();
+    }
+  } finally {
+    pollInFlight = false;
+  }
+}
+
+/// Code-block frame: rounded box + header (language label + copy button) +
+/// horizontal scroll. Registered as builders['pre'] in every MarkdownBody.
+/// The default codeblockDecoration is left empty so this frame is the only
+/// chrome (flutter_markdown still wraps it in a bare Container).
+class PreBlockBuilder extends MarkdownElementBuilder {
+  PreBlockBuilder();
+
+  @override
+  Widget? visitElementAfterWithContext(BuildContext context, md.Element element,
+      TextStyle? preferredStyle, TextStyle? parentStyle) {
+    String lang = '';
+    final kids = element.children;
+    if (kids != null) {
+      for (final k in kids) {
+        if (k is md.Element && k.tag == 'code') {
+          final cls = k.attributes['class'] ?? '';
+          if (cls.startsWith('language-')) lang = cls.substring(9);
+          break;
+        }
+      }
+    }
+    return CodeBlockFrame(language: lang, code: element.textContent);
+  }
+}
+
+class CodeBlockFrame extends StatefulWidget {
+  final String language;
+  final String code;
+  const CodeBlockFrame(
+      {super.key, required this.language, required this.code});
+
+  @override
+  State<CodeBlockFrame> createState() => _CodeBlockFrameState();
+}
+
+class _CodeBlockFrameState extends State<CodeBlockFrame> {
+  bool copied = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final bool light = Theme.of(context).brightness == Brightness.light;
+    final Color bg =
+        light ? const Color(0xFFF1F1F4) : const Color(0xFF1E1E24);
+    final Color fg = light ? Colors.black87 : const Color(0xFFE4E4E7);
+    final Color sub = light ? Colors.black54 : Colors.white54;
+    final display = widget.code.replaceAll(RegExp(r'\s+$'), '');
+    return Container(
+      margin: const EdgeInsets.symmetric(vertical: 6),
+      decoration: BoxDecoration(
+        color: bg,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(
+            color: (light ? Colors.black : Colors.white)
+                .withValues(alpha: 0.08)),
+      ),
+      clipBehavior: Clip.hardEdge,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Padding(
+            padding:
+                const EdgeInsets.only(left: 12, right: 4, top: 4, bottom: 0),
+            child: Row(children: [
+              Expanded(
+                child: Text(
+                    widget.language.isEmpty ? "code" : widget.language,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                        color: sub,
+                        fontSize: 11,
+                        fontWeight: FontWeight.w600)),
+              ),
+              InkWell(
+                borderRadius: BorderRadius.circular(8),
+                onTap: () {
+                  HapticFeedback.selectionClick();
+                  Clipboard.setData(ClipboardData(text: widget.code));
+                  setState(() {
+                    copied = true;
+                  });
+                  Future.delayed(const Duration(milliseconds: 1200), () {
+                    if (mounted) {
+                      setState(() {
+                        copied = false;
+                      });
+                    }
+                  });
+                },
+                child: Padding(
+                  padding: const EdgeInsets.all(8),
+                  child: Icon(
+                      copied ? Icons.check_rounded : Icons.copy_rounded,
+                      size: 15,
+                      color: copied ? Colors.green : sub),
+                ),
+              ),
+            ]),
+          ),
+          Scrollbar(
+            child: SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              padding: const EdgeInsets.fromLTRB(12, 2, 12, 10),
+              child: Text(display,
+                  style: TextStyle(
+                      color: fg,
+                      fontSize: 13.5,
+                      height: 1.5,
+                      fontFamily: 'monospace',
+                      fontFamilyFallback: const ['monospace'])),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+Future<void> syncFromServer({bool silent = false}) async {
+  try {
+    if (!silent) {
+      // Adopt the server's current character so web and app share the floor.
+      try {
+        final s = await apiGet("/api/settings");
+        final c = (s["current_char"] ?? "").toString();
+        if (c.isNotEmpty && c != currentChar) {
+          currentChar = c;
+          await prefs?.setString("currentChar", c);
+          await refreshCharHead();
+        }
+        final ru = (s["rerank_url"] ?? "").toString();
+        if (ru.isNotEmpty) serverRerankUrl = ru;
+        await refreshCharHead();
+      } catch (_) {}
+    }
     final msgs = await fetchServerMessages();
+    // Newest-first list: find the newest assistant message for chime/mood.
+    String? newestAssistantId;
+    String newestAssistantText = "";
+    for (final m in msgs) {
+      if (m is types.TextMessage && m.author.id == assistant.id) {
+        newestAssistantId = m.id;
+        newestAssistantText = m.text;
+        break;
+      }
+    }
     messages = msgs;
     chatUuid = null;
-    if (setState != null) setState(() {});
-    HapticFeedback.lightImpact();
+    sendEpoch++; // invalidate any zombie stream still patching the old list
+    offlineMode = false;
+    if (newestAssistantId != null &&
+        newestAssistantId != lastSeenAssistantId) {
+      final firstLoad = lastSeenAssistantId == null;
+      lastSeenAssistantId = newestAssistantId;
+      if (!firstLoad) {
+        if (suppressChimeOnce) {
+          suppressChimeOnce = false; // server echo of our own live stream
+        } else {
+          unawaited(announceReply(newestAssistantText));
+        }
+      }
+      if (awaitingReply) setAwaitingReply(false);
+      unawaited(classifyMood(newestAssistantId, newestAssistantText));
+    } else {
+      pokeUI();
+    }
+    if (!silent) HapticFeedback.lightImpact();
   } catch (e) {
-    // No longer silent: tell the user why Sync did nothing.
-    messengerKey.currentState?.showSnackBar(SnackBar(
-      content: Text("Sync 失败：$e（host=$host）"),
-      showCloseIcon: true,
-      duration: const Duration(seconds: 6),
-    ));
+    offlineMode = true;
+    pokeUI();
+    if (!silent) {
+      // Manual Sync only: tell the user why it did nothing.
+      messengerKey.currentState?.showSnackBar(SnackBar(
+        content: Text("Sync 失败：$e（host=$host）"),
+        showCloseIcon: true,
+        duration: const Duration(seconds: 6),
+      ));
+    }
   }
 }
 
 /// Subscribe to server-side live events so the app picks up messages written
 /// by the web UI (or background distillation) without manual Sync.
-void startEvents(Function? setState) {
+/// The 5s poller is the primary path now; SSE is a best-effort accelerator.
+void startEvents() {
   eventSub?.cancel();
   if (host == null) return;
   () async {
@@ -222,13 +677,16 @@ void startEvents(Function? setState) {
           try {
             final m = jsonDecode(line.substring(5).trim());
             if (m is Map && m["role"] != null) {
-              syncFromServer(setState);
+              // A local stream owns the UI while it runs; the poller will
+              // reconcile with server truth once it ends.
+              if (!chatAllowed) return;
+              syncFromServer(silent: true);
             }
           } catch (_) {}
         }
       }, onError: (_) {}, cancelOnError: false);
     } catch (_) {
-      // SSE unsupported/unreachable: Sync button remains the fallback.
+      // SSE unsupported/unreachable: the 5s poller remains the fallback.
     }
   }();
 }
@@ -277,8 +735,9 @@ Future<void> chooseCharacter(BuildContext context, Function setState) async {
                     Navigator.of(ctx).pop();
                     if (name == currentChar) return;
                     await setCurrentChar(name);
-                    await syncFromServer(setState);
-                    startEvents(setState);
+                    await syncFromServer();
+                    await refreshCharHead();
+                    startEvents();
                   },
                 );
               }),
@@ -386,7 +845,7 @@ class MainApp extends StatefulWidget {
   State<MainApp> createState() => _MainAppState();
 }
 
-class _MainAppState extends State<MainApp> {
+class _MainAppState extends State<MainApp> with WidgetsBindingObserver {
   bool logoVisible = true;
   bool menuVisible = false;
 
@@ -461,13 +920,19 @@ class _MainAppState extends State<MainApp> {
         Navigator.push(context,
             MaterialPageRoute(builder: (context) => const ScreenSettings()));
       }),
-      tile(Icons.sync_rounded, "Sync 同步", () => syncFromServer(setState)),
+      tile(Icons.sync_rounded, "Sync 同步", () => syncFromServer()),
     ];
   }
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    uiRefresh = (fn) {
+      if (mounted) setState(fn);
+    };
+    unawaited(initNotif());
+    startPolling();
 
     WidgetsBinding.instance.addPostFrameCallback(
       (_) async {
@@ -567,31 +1032,142 @@ class _MainAppState extends State<MainApp> {
               showCloseIcon: true));
         } else {
           currentChar = prefs!.getString("currentChar") ?? currentChar;
-          syncFromServer(setState);
-          startEvents(setState);
+          syncFromServer();
+          startEvents();
         }
       },
     );
   }
 
+  void startPolling() {
+    pollTimer?.cancel();
+    pollTimer = Timer.periodic(const Duration(seconds: 5), (_) => pollTick());
+  }
+
+  void stopPolling() {
+    pollTimer?.cancel();
+    pollTimer = null;
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    final resumed = state == AppLifecycleState.resumed;
+    appActive = resumed;
+    if (resumed) {
+      // Reopening the app instantly reconciles with server truth; the poller
+      // keeps going every 5s until any awaited reply lands. No timeout UI.
+      syncFromServer(silent: true);
+      startEvents();
+      startPolling();
+    } else {
+      stopPolling();
+    }
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    stopPolling();
+    pendingAnimTimer?.cancel();
+    pendingAnimTimer = null;
+    try {
+      eventSub?.cancel();
+    } catch (_) {}
+    uiRefresh = null;
+    super.dispose();
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+          extendBodyBehindAppBar: true,
           appBar: AppBar(
-              title: Row(children: [
-                Expanded(
-                  child: Text(currentChar,
-                      overflow: TextOverflow.fade,
-                      style: const TextStyle(fontWeight: FontWeight.w600)),
+              backgroundColor: Colors.transparent,
+              elevation: 0,
+              scrolledUnderElevation: 0,
+              systemOverlayStyle: (Theme.of(context).brightness ==
+                      Brightness.light)
+                  ? SystemUiOverlayStyle.dark
+                      .copyWith(statusBarColor: Colors.transparent)
+                  : SystemUiOverlayStyle.light
+                      .copyWith(statusBarColor: Colors.transparent),
+              // Telegram-style pinned frosted glass: messages scroll beneath.
+              flexibleSpace: ClipRect(
+                child: BackdropFilter(
+                  filter: ImageFilter.blur(sigmaX: 18, sigmaY: 18),
+                  child: Container(
+                    color: Theme.of(context)
+                        .colorScheme
+                        .surface
+                        .withValues(alpha: 0.62),
+                    child: SafeArea(
+                      bottom: false,
+                      child: Container(
+                        alignment: Alignment.bottomCenter,
+                        child: Container(
+                          height: 0.5,
+                          color: Theme.of(context)
+                              .dividerColor
+                              .withValues(alpha: 0.5),
+                        ),
+                      ),
+                    ),
+                  ),
                 ),
-              ]),
+              ),
+              titleSpacing: 4,
+              title: InkWell(
+                  borderRadius: BorderRadius.circular(12),
+                  onTap: () {
+                    HapticFeedback.selectionClick();
+                    chooseCharacter(context, setState);
+                  },
+                  child: Row(children: [
+                    CircleAvatar(
+                      radius: 20,
+                      backgroundColor: Theme.of(context)
+                          .colorScheme
+                          .onSurface
+                          .withValues(alpha: 0.08),
+                      backgroundImage: charAvatarUrl.isEmpty
+                          ? null
+                          : NetworkImage(charAvatarUrl),
+                      onBackgroundImageError:
+                          charAvatarUrl.isEmpty ? null : (_, __) {},
+                      child: charAvatarUrl.isEmpty
+                          ? const Icon(Icons.person, size: 22)
+                          : null,
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Text(currentChar,
+                                overflow: TextOverflow.fade,
+                                style: const TextStyle(
+                                    fontWeight: FontWeight.w600,
+                                    fontSize: 17)),
+                            Text(headerStatus(),
+                                overflow: TextOverflow.ellipsis,
+                                style: TextStyle(
+                                    fontWeight: FontWeight.w400,
+                                    fontSize: 12,
+                                    color: Theme.of(context)
+                                        .colorScheme
+                                        .onSurface
+                                        .withValues(alpha: 0.62))),
+                          ]),
+                    ),
+                  ])),
               actions: [
                       const SizedBox(width: 4),
                       IconButton(
                           onPressed: () {
                             HapticFeedback.selectionClick();
                             if (!chatAllowed) return;
-                            syncFromServer(setState);
+                            syncFromServer();
                           },
                           icon: const Icon(Icons.sync_rounded))
                     ],
@@ -658,14 +1234,80 @@ class _MainAppState extends State<MainApp> {
               Expanded(
                   child: Chat(
                       messages: messages,
+                      // Full-bleed assistant bubbles (DeepSeek style) while
+                      // user bubbles keep the classic right-aligned look.
+                      messageWidthRatio: 0.94,
+                      bubbleBuilder: (child,
+                          {required message,
+                          required nextMessageInGroup}) {
+                        return Builder(builder: (innerCtx) {
+                          final bool isUser =
+                              message.author.id == user.id;
+                          final th =
+                              InheritedChatTheme.of(innerCtx).theme;
+                          final double sw =
+                              MediaQuery.of(innerCtx).size.width;
+                          final double safeR =
+                              MediaQuery.of(innerCtx).padding.right;
+                          final double r = th.messageBorderRadius;
+                          if (isUser) {
+                            final br = BorderRadius.only(
+                              topLeft: Radius.circular(r),
+                              topRight: Radius.circular(r),
+                              bottomLeft: Radius.circular(r),
+                              bottomRight: Radius.circular(
+                                  nextMessageInGroup ? r : 0),
+                            );
+                            return Padding(
+                              padding:
+                                  EdgeInsets.only(right: 4 + safeR),
+                              child: ConstrainedBox(
+                                constraints: BoxConstraints(
+                                    maxWidth: sw * 0.78),
+                                child: Container(
+                                  decoration: BoxDecoration(
+                                    borderRadius: br,
+                                    color: th.primaryColor,
+                                  ),
+                                  child: ClipRRect(
+                                    borderRadius: br,
+                                    child: child,
+                                  ),
+                                ),
+                              ),
+                            );
+                          }
+                          final bool light =
+                              Theme.of(innerCtx).brightness ==
+                                  Brightness.light;
+                          return Container(
+                            width: double.infinity,
+                            decoration: BoxDecoration(
+                              borderRadius: BorderRadius.circular(10),
+                              color: light
+                                  ? Colors.black
+                                      .withValues(alpha: 0.05)
+                                  : Colors.white
+                                      .withValues(alpha: 0.07),
+                            ),
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: 14, vertical: 6),
+                            child: child,
+                          );
+                        });
+                      },
                       textMessageBuilder: (p0,
                           {required messageWidth, required showName}) {
                         var white = const TextStyle(color: Colors.white);
                         return Padding(
-                            padding: const EdgeInsets.only(
-                                left: 20, right: 23, top: 17, bottom: 17),
+                            padding: (p0.author == user)
+                                ? const EdgeInsets.only(
+                                    left: 20, right: 23, top: 17, bottom: 17)
+                                : const EdgeInsets.symmetric(
+                                    horizontal: 2, vertical: 4),
                             child: MarkdownBody(
                                 data: p0.text,
+                                builders: {'pre': PreBlockBuilder()},
                                 onTapLink: (text, href, title) async {
                                   HapticFeedback.selectionClick();
                                   try {
@@ -770,12 +1412,19 @@ class _MainAppState extends State<MainApp> {
                                               BorderRadius.circular(8),
                                         ),
                                         code: const TextStyle(
-                                            color: Colors.black,
-                                            backgroundColor: Colors.white),
-                                        codeblockDecoration: BoxDecoration(
-                                            color: Colors.white,
-                                            borderRadius:
-                                                BorderRadius.circular(8)),
+                                            color: Colors.black87,
+                                            backgroundColor:
+                                                Color(0xFFE8E8EA),
+                                            fontFamily: 'monospace',
+                                            fontFamilyFallback: [
+                                              'monospace'
+                                            ],
+                                            fontSize: 13.5),
+                                        codeblockPadding:
+                                            const EdgeInsets.all(10),
+                                        // Bare wrapper: CodeBlockFrame draws.
+                                        codeblockDecoration:
+                                            const BoxDecoration(),
                                         h1: white,
                                         h2: white,
                                         h3: white,
@@ -803,13 +1452,20 @@ class _MainAppState extends State<MainApp> {
                                               borderRadius:
                                                   BorderRadius.circular(8),
                                             ),
-                                            code: const TextStyle(
-                                                color: Colors.white,
-                                                backgroundColor: Colors.black),
-                                            codeblockDecoration: BoxDecoration(
-                                                color: Colors.black,
-                                                borderRadius:
-                                                    BorderRadius.circular(8)),
+                                        code: const TextStyle(
+                                            color: Colors.black87,
+                                            backgroundColor:
+                                                Color(0xFFE0E0E5),
+                                            fontFamily: 'monospace',
+                                            fontFamilyFallback: [
+                                              'monospace'
+                                            ],
+                                            fontSize: 13.5),
+                                        codeblockPadding:
+                                            const EdgeInsets.all(10),
+                                        // Bare wrapper: CodeBlockFrame draws.
+                                        codeblockDecoration:
+                                            const BoxDecoration(),
                                             horizontalRuleDecoration: BoxDecoration(
                                                 border: Border(
                                                     top: BorderSide(
@@ -827,10 +1483,19 @@ class _MainAppState extends State<MainApp> {
                                                   BorderRadius.circular(8),
                                             ),
                                             code: const TextStyle(
-                                                color: Colors.black,
-                                                backgroundColor: Colors.white),
+                                                color: Colors.black87,
+                                                backgroundColor:
+                                                    Color(0xFFE8E8EA),
+                                                fontFamily: 'monospace',
+                                                fontFamilyFallback: [
+                                                  'monospace'
+                                                ],
+                                                fontSize: 13.5),
+                                            codeblockPadding:
+                                                const EdgeInsets.all(10),
+                                            // Bare wrapper: CodeBlockFrame draws.
                                             codeblockDecoration:
-                                                BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(8)),
+                                                const BoxDecoration(),
                                             horizontalRuleDecoration: BoxDecoration(border: Border(top: BorderSide(color: Colors.grey[200]!, width: 1))))));
                       },
                       imageMessageBuilder: (p0, {required messageWidth}) {
@@ -934,6 +1599,24 @@ class _MainAppState extends State<MainApp> {
                           return;
                         }
 
+                        // Preflight: fail fast while the composer still holds
+                        // the text (no optimistic insert, no timeout drama).
+                        try {
+                          await http
+                              .get(Uri.parse("$host/api/health"))
+                              .timeout(const Duration(seconds: 4));
+                        } catch (_) {
+                          if (!context.mounted) return;
+                          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                              content:
+                                  Text("无法连接服务器（$host），稍后再试"),
+                              showCloseIcon: true));
+                          setState(() {
+                            sendable = true;
+                          });
+                          return;
+                        }
+
                         // Thin client: send only the fresh user turn (caption
                         // and/or image). The server owns the full context and
                         // persists both sides.
@@ -947,7 +1630,6 @@ class _MainAppState extends State<MainApp> {
                         // Optimistically render the fresh turn, then clear the
                         // pending tray. The tray lives outside `messages`, so a
                         // Sync can no longer wipe an unsent image.
-                        int shown = 0;
                         if (text.isNotEmpty) {
                           messages.insert(
                               0,
@@ -955,7 +1637,6 @@ class _MainAppState extends State<MainApp> {
                                   author: user,
                                   id: const Uuid().v4(),
                                   text: text));
-                          shown++;
                         }
                         for (final u in imgs) {
                           messages.insert(
@@ -966,12 +1647,21 @@ class _MainAppState extends State<MainApp> {
                                   name: "image",
                                   size: 0,
                                   uri: u));
-                          shown++;
                         }
                         setState(() {
                           pendingImages.clear();
                         });
                         chatAllowed = false;
+                        setAwaitingReply(true);
+                        suppressChimeOnce = false;
+                        final int myEpoch = sendEpoch;
+                        // Silent watchdog: never surfaces a timeout; it only
+                        // unblocks the input while polling keeps waiting.
+                        final watchdog =
+                            Timer(const Duration(minutes: 6), () {
+                          chatAllowed = true;
+                          pokeUI();
+                        });
 
                         String newId = const Uuid().v4();
                         llama.OllamaClient client = llama.OllamaClient(
@@ -984,6 +1674,9 @@ class _MainAppState extends State<MainApp> {
                         try {
                           if ((prefs!.getString("requestType") ?? "stream") ==
                               "stream") {
+                            // No client-side timeout: if the connection dies
+                            // (screen lock etc.) the server still finishes the
+                            // turn, and the poller picks the reply up.
                             final stream = client
                                 .generateChatCompletionStream(
                                   request: llama.GenerateChatCompletionRequest(
@@ -991,11 +1684,13 @@ class _MainAppState extends State<MainApp> {
                                     messages: history,
                                     keepAlive: 1,
                                   ),
-                                )
-                                .timeout(const Duration(minutes: 10));
+                                );
 
                             String text = "";
                             await for (final res in stream) {
+                              // A sync replaced history mid-flight: stop
+                              // patching the stale optimistic list.
+                              if (myEpoch != sendEpoch) break;
                               text += (res.message?.content ?? "");
                               for (var i = 0; i < messages.length; i++) {
                                 if (messages[i].id == newId) {
@@ -1025,8 +1720,7 @@ class _MainAppState extends State<MainApp> {
                                     messages: history,
                                     keepAlive: 1,
                                   ),
-                                )
-                                .timeout(const Duration(minutes: 10));
+                                );
                             if (chatAllowed) return;
                             if (request.message!.content.trim() == "") {
                               throw Exception();
@@ -1041,36 +1735,21 @@ class _MainAppState extends State<MainApp> {
                             HapticFeedback.lightImpact();
                           }
                         } catch (e) {
-                          for (var i = 0; i < messages.length; i++) {
-                            if (messages[i].id == newId) {
-                              messages.removeAt(i);
-                              break;
-                            }
-                          }
-                          setState(() {
-                            // Drop the optimistic turn and put the caption /
-                            // image back in the tray so nothing is lost.
-                            for (var i = 0;
-                                i < shown && messages.isNotEmpty;
-                                i++) {
-                              messages.removeAt(0);
-                            }
-                            pendingImages
-                              ..clear()
-                              ..addAll(imgs);
-                            chatAllowed = true;
-                          });
-                          // ignore: use_build_context_synchronously
-                          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-                              // ignore: use_build_context_synchronously
-                              content: Text(AppLocalizations.of(context)!
-                                  .settingsHostInvalid("timeout")),
-                              showCloseIcon: true));
+                          watchdog.cancel();
+                          // Silent by design: keep the optimistic turn and any
+                          // partial reply; the 5s poller reconciles with
+                          // server truth. No rollback, no timeout warning.
+                          chatAllowed = true;
+                          setState(() {});
                           return;
                         }
+                        watchdog.cancel();
 
                         setState(() {});
                         chatAllowed = true;
+                        // The server echo of our own reply must not chime.
+                        suppressChimeOnce = true;
+                        setAwaitingReply(false);
                       },
                       onMessageDoubleTap: (context, p1) {
                         HapticFeedback.selectionClick();
@@ -1278,6 +1957,10 @@ class _MainAppState extends State<MainApp> {
                           ? DefaultChatTheme(
                               backgroundColor:
                                   (theme ?? ThemeData()).colorScheme.surface,
+                              // Horizontal margins are handled per message in
+                              // bubbleBuilder (full-bleed assistant bubbles).
+                              bubbleMargin:
+                                  const EdgeInsets.only(bottom: 4),
                               primaryColor:
                                   (theme ?? ThemeData()).colorScheme.primary,
                               attachmentButtonIcon:
@@ -1315,6 +1998,8 @@ class _MainAppState extends State<MainApp> {
                                   MediaQuery.of(context).size.width)
                           : DarkChatTheme(
                               backgroundColor: (themeDark ?? ThemeData.dark()).colorScheme.surface,
+                              bubbleMargin:
+                                  const EdgeInsets.only(bottom: 4),
                               primaryColor: (themeDark ?? ThemeData.dark()).colorScheme.primary.withAlpha(40),
                               secondaryColor: (themeDark ?? ThemeData.dark()).colorScheme.primary.withAlpha(20),
                               attachmentButtonIcon: const Icon(Icons.add_a_photo_rounded),
