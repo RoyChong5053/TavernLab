@@ -100,8 +100,6 @@ String charAvatarUrl = ""; // full URL ("$host/chars/...") or "" when unknown
 // "努力回复中" frames (same 420ms cadence as WebUI setPending).
 String moodText = "心情 · —";
 String? moodForMsgId;
-int pendingFrame = 0;
-Timer? pendingAnimTimer;
 const List<String> pendingFrames = ["努力回复中", "努力回复中·", "努力回复中··", "努力回复中···"];
 
 // Send/await state. awaitingReply survives stream errors and screen locks;
@@ -130,10 +128,10 @@ final FlutterLocalNotificationsPlugin notifPlugin =
 bool notifReady = false;
 const String notifChannelId = "tavernlab_reply";
 
-String headerStatus() {
+String headerStatus(int frame) {
   if (offlineMode) return "离线 · 重试中";
   if (!chatAllowed || awaitingReply) {
-    return pendingFrames[pendingFrame % pendingFrames.length];
+    return pendingFrames[frame % pendingFrames.length];
   }
   return moodText;
 }
@@ -144,17 +142,6 @@ void setAwaitingReply(bool v) {
     return;
   }
   awaitingReply = v;
-  if (v) {
-    pendingAnimTimer?.cancel();
-    pendingAnimTimer =
-        Timer.periodic(const Duration(milliseconds: 420), (_) {
-      pendingFrame = (pendingFrame + 1) % pendingFrames.length;
-      pokeUI();
-    });
-  } else {
-    pendingAnimTimer?.cancel();
-    pendingAnimTimer = null;
-  }
   pokeUI();
 }
 
@@ -233,14 +220,41 @@ Future<String> encodeXFileToDataURL(XFile f) async {
   return "data:$mime;base64,${base64.encode(bytes)}";
 }
 
+/// Decoded data-URL bytes keyed by message id (or tray slot). Rebuilding the
+/// chat list must NOT re-run base64.decode + image codec on multi-MB photos
+/// every frame — that was the send-image flicker.
+final Map<String, Uint8List> _imgBytesCache = {};
+
+void pruneImgCache() {
+  final keep = <String>{};
+  for (final m in messages) {
+    if (m is types.ImageMessage) keep.add(m.id);
+  }
+  keep.add("pending0");
+  _imgBytesCache.removeWhere((k, _) => !keep.contains(k));
+  // Bound memory: drop oldest entries beyond a sane cap.
+  while (_imgBytesCache.length > 40) {
+    _imgBytesCache.remove(_imgBytesCache.keys.first);
+  }
+}
+
 /// Render an image from a data URL, an http(s) URL, or a local file path.
 Widget buildImageWidget(String uri,
-    {double? width, double? height, BoxFit fit = BoxFit.cover}) {
+    {double? width,
+    double? height,
+    BoxFit fit = BoxFit.cover,
+    String? cacheKey}) {
   if (uri.startsWith("data:")) {
     try {
-      final comma = uri.indexOf(",");
-      final bytes = base64.decode(uri.substring(comma + 1));
-      return Image.memory(bytes, width: width, height: height, fit: fit);
+      Uint8List? bytes;
+      if (cacheKey != null) bytes = _imgBytesCache[cacheKey];
+      bytes ??= base64.decode(uri.substring(uri.indexOf(",") + 1));
+      if (cacheKey != null) _imgBytesCache[cacheKey] = bytes;
+      return Image.memory(bytes,
+          width: width,
+          height: height,
+          fit: fit,
+          gaplessPlayback: true);
     } catch (_) {
       return const Icon(Icons.broken_image);
     }
@@ -250,12 +264,14 @@ Widget buildImageWidget(String uri,
         width: width,
         height: height,
         fit: fit,
+        gaplessPlayback: true,
         errorBuilder: (c, e, s) => const Icon(Icons.broken_image));
   }
   return Image.file(File(uri),
       width: width,
       height: height,
       fit: fit,
+      gaplessPlayback: true,
       errorBuilder: (c, e, s) => const Icon(Icons.broken_image));
 }
 
@@ -593,6 +609,53 @@ class _CodeBlockFrameState extends State<CodeBlockFrame> {
   }
 }
 
+/// AppBar status line with its own 420ms ticker, so the "努力回复中" animation
+/// only rebuilds this tiny Text — never the whole Scaffold/Chat list (a full
+/// rebuild every 420ms on a photo-heavy list was part of the send-image
+/// flicker).
+class HeaderStatusText extends StatefulWidget {
+  const HeaderStatusText({super.key});
+
+  @override
+  State<HeaderStatusText> createState() => _HeaderStatusTextState();
+}
+
+class _HeaderStatusTextState extends State<HeaderStatusText> {
+  Timer? _t;
+  int _frame = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    _t = Timer.periodic(const Duration(milliseconds: 420), (_) {
+      if (mounted) {
+        setState(() {
+          _frame = (_frame + 1) % pendingFrames.length;
+        });
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _t?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Text(headerStatus(_frame),
+        overflow: TextOverflow.ellipsis,
+        style: TextStyle(
+            fontWeight: FontWeight.w400,
+            fontSize: 12,
+            color: Theme.of(context)
+                .colorScheme
+                .onSurface
+                .withValues(alpha: 0.62)));
+  }
+}
+
 Future<void> syncFromServer({bool silent = false}) async {
   try {
     if (!silent) {
@@ -623,6 +686,7 @@ Future<void> syncFromServer({bool silent = false}) async {
     }
     messages = msgs;
     chatUuid = null;
+    pruneImgCache();
     sendEpoch++; // invalidate any zombie stream still patching the old list
     offlineMode = false;
     if (newestAssistantId != null &&
@@ -1068,8 +1132,6 @@ class _MainAppState extends State<MainApp> with WidgetsBindingObserver {
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     stopPolling();
-    pendingAnimTimer?.cancel();
-    pendingAnimTimer = null;
     try {
       eventSub?.cancel();
     } catch (_) {}
@@ -1149,15 +1211,7 @@ class _MainAppState extends State<MainApp> with WidgetsBindingObserver {
                                 style: const TextStyle(
                                     fontWeight: FontWeight.w600,
                                     fontSize: 17)),
-                            Text(headerStatus(),
-                                overflow: TextOverflow.ellipsis,
-                                style: TextStyle(
-                                    fontWeight: FontWeight.w400,
-                                    fontSize: 12,
-                                    color: Theme.of(context)
-                                        .colorScheme
-                                        .onSurface
-                                        .withValues(alpha: 0.62))),
+                            const HeaderStatusText(),
                           ]),
                     ),
                   ])),
@@ -1510,7 +1564,9 @@ class _MainAppState extends State<MainApp> with WidgetsBindingObserver {
                             child: ClipRRect(
                                 borderRadius: BorderRadius.circular(8),
                                 child: buildImageWidget(p0.uri,
-                                    width: w, fit: BoxFit.cover)));
+                                    width: w,
+                                    fit: BoxFit.cover,
+                                    cacheKey: p0.id)));
                       },
                       listBottomWidget: pendingImages.isEmpty
                           ? null
@@ -1519,12 +1575,13 @@ class _MainAppState extends State<MainApp> with WidgetsBindingObserver {
                                   left: 12, right: 12, top: 6, bottom: 2),
                               alignment: Alignment.centerLeft,
                               child: Stack(children: [
-                                ClipRRect(
-                                  borderRadius: BorderRadius.circular(12),
-                                  child: buildImageWidget(pendingImages.first,
-                                      width: 96,
-                                      height: 96,
-                                      fit: BoxFit.cover),
+                                 ClipRRect(
+                                   borderRadius: BorderRadius.circular(12),
+                                   child: buildImageWidget(pendingImages.first,
+                                       width: 96,
+                                       height: 96,
+                                       fit: BoxFit.cover,
+                                       cacheKey: "pending0"),
                                 ),
                                 Positioned(
                                   right: 0,
@@ -1687,6 +1744,9 @@ class _MainAppState extends State<MainApp> with WidgetsBindingObserver {
                                 );
 
                             String text = "";
+                            var lastUiPush =
+                                DateTime.fromMillisecondsSinceEpoch(0);
+                            var announced = false;
                             await for (final res in stream) {
                               // A sync replaced history mid-flight: stop
                               // patching the stale optimistic list.
@@ -1708,9 +1768,23 @@ class _MainAppState extends State<MainApp> with WidgetsBindingObserver {
                                       author: assistant,
                                       id: newId,
                                       text: text));
-                              setState(() {});
-                              HapticFeedback.lightImpact();
+                              // Throttle UI pushes: per-chunk setState on a
+                              // photo-heavy list is what visibly flickered.
+                              // One haptic on first content, then <=8fps.
+                              if (!announced) {
+                                announced = true;
+                                HapticFeedback.lightImpact();
+                              }
+                              final now = DateTime.now();
+                              if (now
+                                      .difference(lastUiPush)
+                                      .inMilliseconds >
+                                  120) {
+                                lastUiPush = now;
+                                setState(() {});
+                              }
                             }
+                            setState(() {}); // flush the throttled tail
                           } else {
                             llama.GenerateChatCompletionResponse request;
                             request = await client
