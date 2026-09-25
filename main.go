@@ -81,9 +81,14 @@ func (r *runtimeSettings) setAPIKey(k string) {
 }
 
 // update merges a PUT body (empty api_key = keep) and persists.
+// admin_user/admin_password_sha256/session_days are server-side only and
+// silently ignored here: the WebUI can never set credentials.
 func (r *runtimeSettings) update(root string, patch map[string]any) settings.Settings {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	delete(patch, "admin_user")
+	delete(patch, "admin_password_sha256")
+	delete(patch, "session_days")
 	if v, ok := patch["upstream"].(string); ok && v != "" {
 		r.cur.Upstream = v
 	}
@@ -169,6 +174,8 @@ func main() {
 	data := flag.String("data", "data", "data root (rclone this dir)")
 	upstream := flag.String("upstream", "", "one-api base URL (overrides settings file)")
 	apiKey := flag.String("apikey", "", "one-api key (overrides env ONEAPI_KEY / settings file)")
+	adminUser := flag.String("admin-user", "", "login gate username (overrides env TAVERNLAB_ADMIN_USER / settings file; empty = auth disabled)")
+	appToken := flag.String("app-token", "", "static Bearer token for the Flutter app (overrides env TAVERNLAB_APP_TOKEN)")
 	flag.Parse()
 
 	// Runtime settings: flags > env > data/settings.json > built-in defaults.
@@ -182,6 +189,15 @@ func main() {
 	} else if k := os.Getenv("ONEAPI_KEY"); k != "" {
 		rt.setAPIKey(k)
 	}
+
+	// Login gate (server-side only: flags > env > settings file; the WebUI
+	// can never set these). Password hash deliberately has no flag (ps-visible).
+	auth := NewAuth(*data,
+		firstNonEmpty(*adminUser, os.Getenv("TAVERNLAB_ADMIN_USER"), rt.get().AdminUser),
+		firstNonEmpty(os.Getenv("TAVERNLAB_ADMIN_SHA256"), rt.get().AdminPasswordSHA256),
+		rt.get().SessionDays,
+		firstNonEmpty(*appToken, os.Getenv("TAVERNLAB_APP_TOKEN")),
+	)
 
 	cfg := Config{
 		Port: *port, DataRoot: *data, Upstream: rt.get().Upstream,
@@ -200,6 +216,50 @@ func main() {
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		s := rt.get()
 		writeJSON(w, map[string]any{"ok": true, "time": time.Now().Format(time.RFC3339), "upstream": s.Upstream, "key_set": s.APIKey != ""})
+	})
+
+	// Login gate bootstrap: /api/me tells the frontend whether auth is on;
+	// /api/login issues a Bearer token, /api/logout revokes it.
+	mux.HandleFunc("/api/me", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, map[string]any{"auth_enabled": auth.Enabled(), "ok": auth.Check(r), "user": auth.User()})
+	})
+	mux.HandleFunc("/api/login", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			http.Error(w, "method not allowed", 405)
+			return
+		}
+		if !auth.Enabled() {
+			writeJSON(w, map[string]any{"ok": true, "auth": "disabled"})
+			return
+		}
+		var in struct {
+			Username string `json:"username"`
+			Password string `json:"password"`
+			Remember bool   `json:"remember"`
+		}
+		b, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(b, &in)
+		if strings.TrimSpace(in.Username) != auth.User() || !auth.VerifyPassword(in.Password) {
+			obs.Warn("login failed", map[string]any{"user": in.Username})
+			w.WriteHeader(401)
+			writeJSON(w, map[string]any{"ok": false, "error": "invalid credentials"})
+			return
+		}
+		ttl := 24 * time.Hour
+		if in.Remember {
+			ttl = time.Duration(auth.sessionDays) * 24 * time.Hour
+		}
+		tok, exp := auth.sess.Issue(ttl)
+		obs.Info("login ok", map[string]any{"user": auth.User()})
+		writeJSON(w, map[string]any{"ok": true, "token": tok, "exp": exp.Format(time.RFC3339)})
+	})
+	mux.HandleFunc("/api/logout", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			http.Error(w, "method not allowed", 405)
+			return
+		}
+		auth.sess.Revoke(TokenFromRequest(r))
+		writeJSON(w, map[string]any{"ok": true})
 	})
 
 	// Runtime logs (ring buffer) + live SSE stream, backed by internal/obs.
@@ -268,7 +328,7 @@ func main() {
 				"mcp_url": s.MCPURL, "mcp_collection": s.MCPCollection,
 				"mcp_enabled": s.MCPEnabled, "mcp_topk": s.MCPTopK, "mcp_timeout": s.MCPTimeout, "mcp_threshold": s.MCPThreshold,
 				"mcp_budget_tokens": s.MCPBudgetTokens, "mcp_per_hit_chars": s.MCPPerHitChars,
-				"max_tokens": s.MaxTokens,
+				"max_tokens":   s.MaxTokens,
 				"current_char": s.CurrentChar, "user_name": s.UserName,
 				"ntfy_url": s.NtfyURL, "ntfy_topic": s.NtfyTopic,
 				"distill_enabled": s.DistillEnabled, "distill_interval": s.DistillInterval,
@@ -276,6 +336,7 @@ func main() {
 				"distill_model":  s.DistillModel,
 				"distill_prompt": s.DistillPrompt, "distill_prompt_default": distill.DefaultPrompt,
 				"estimate_scale": engine.TextScale(),
+				"auth_enabled":   auth.Enabled(), "admin_user": auth.User(),
 			})
 		case "PUT":
 			b, _ := io.ReadAll(r.Body)
@@ -1067,9 +1128,32 @@ func main() {
 	mux.Handle("/", http.FileServer(http.FS(sub)))
 
 	addr := fmt.Sprintf("0.0.0.0:%d", cfg.Port)
-	obs.Info("tavernlab listening", map[string]any{"addr": addr, "upstream": cfg.Upstream, "data": cfg.DataRoot})
+	obs.Info("tavernlab listening", map[string]any{"addr": addr, "upstream": cfg.Upstream, "data": cfg.DataRoot, "auth_enabled": auth.Enabled()})
 	log.Printf("tavernlab listening on %s (upstream=%s data=%s)", addr, cfg.Upstream, cfg.DataRoot)
-	log.Fatal(http.ListenAndServe(addr, obs.Middleware(mux)))
+	if auth.Enabled() {
+		log.Printf("auth gate enabled (user=%s session_days=%d app_token_set=%v)", auth.User(), auth.sessionDays, auth.appToken != "")
+	}
+	log.Fatal(http.ListenAndServe(addr, obs.Middleware(authGate(auth, mux))))
+}
+
+// authGate enforces the optional login gate. The static frontend stays public
+// so the login page can load; everything under /api/, /v1/ and /chars/ needs
+// a credential except the bootstrap endpoints.
+func authGate(a *Auth, next http.Handler) http.Handler {
+	open := map[string]bool{
+		"/api/health": true, "/api/login": true, "/api/logout": true, "/api/me": true,
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := r.URL.Path
+		gated := strings.HasPrefix(p, "/api/") || strings.HasPrefix(p, "/v1/") || strings.HasPrefix(p, "/chars/")
+		if gated && !open[p] && !a.Check(r) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(401)
+			_, _ = w.Write([]byte(`{"ok":false,"error":"unauthorized"}`))
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

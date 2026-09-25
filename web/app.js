@@ -26,6 +26,91 @@ const settings = Object.assign(
 );
 if (!Array.isArray(settings.tiers) || !settings.tiers.length) settings.tiers = DEFAULT_TIERS;
 
+/* ---------- auth (Bearer, one-api style; optional server-side gate) ---------- */
+// Token lives in sessionStorage by default, localStorage when "remember me".
+// api() attaches it to every request and pops the login overlay on 401.
+// EventSource / <img> / window.open can't send headers: withToken() appends
+// ?token= instead (server accepts both).
+let authEnabled = false, authUser = '';
+function getToken() {
+  try { return sessionStorage.getItem('tavernlab.token') || localStorage.getItem('tavernlab.token') || ''; }
+  catch { return ''; }
+}
+function setToken(tok, remember) {
+  try {
+    if (remember) { localStorage.setItem('tavernlab.token', tok); sessionStorage.removeItem('tavernlab.token'); }
+    else { sessionStorage.setItem('tavernlab.token', tok); localStorage.removeItem('tavernlab.token'); }
+  } catch {}
+}
+function clearToken() {
+  try { sessionStorage.removeItem('tavernlab.token'); localStorage.removeItem('tavernlab.token'); } catch {}
+}
+function authHeaders(h) {
+  const o = Object.assign({}, h);
+  const t = getToken();
+  if (t) o['Authorization'] = 'Bearer ' + t;
+  return o;
+}
+async function api(path, opts) {
+  opts = opts || {};
+  const r = await fetch(path, Object.assign({}, opts, { headers: authHeaders(opts.headers) }));
+  if (r.status === 401) { showLogin('登录已过期，请重新登录'); throw new Error('HTTP 401 未登录'); }
+  return r;
+}
+function withToken(url) {
+  const t = getToken();
+  if (!t || url.indexOf('token=') >= 0) return url;
+  return url + (url.indexOf('?') >= 0 ? '&' : '?') + 'token=' + encodeURIComponent(t);
+}
+// imgURL appends ?token= to same-origin asset paths (<img> can't send headers).
+function imgURL(u) {
+  if (!u || u.startsWith('data:')) return u;
+  return withToken(u);
+}
+function showLogin(msg) {
+  const ov = $('#login-overlay');
+  if (!ov) return;
+  ov.classList.remove('hidden');
+  $('#login-err').textContent = msg || '';
+  if (authUser) $('#login-user').value = $('#login-user').value || authUser;
+  setTimeout(() => ($('#login-pass') || $('#login-user')).focus(), 50);
+}
+async function doLogin() {
+  const u = $('#login-user').value.trim(), p = $('#login-pass').value;
+  const remember = $('#login-remember').checked;
+  $('#login-err').textContent = '';
+  try {
+    const r = await fetch('/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: u, password: p, remember }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || !j.ok) throw new Error((j && j.error) || ('HTTP ' + r.status));
+    if (j.auth === 'disabled' || !j.token) { location.reload(); return; }
+    setToken(j.token, remember);
+    $('#login-pass').value = '';
+    location.reload(); // simplest correct boot: token persisted, init reruns authed
+  } catch (e) {
+    $('#login-err').textContent = '登录失败：' + (e.message || e);
+  }
+}
+async function doLogout() {
+  try { await fetch('/api/logout', { method: 'POST', headers: authHeaders({}) }); } catch {}
+  clearToken();
+  location.reload();
+}
+async function bootAuth() {
+  try {
+    const me = await (await fetch('/api/me')).json();
+    authEnabled = !!me.auth_enabled;
+    authUser = me.user || '';
+    const lo = $('#btn-logout');
+    if (lo) lo.classList.toggle('hidden', !authEnabled);
+    if (authEnabled && !me.ok) { showLogin(''); return false; }
+  } catch { return true; }
+  return true;
+}
+
 /* ---------- ui scale (persisted, replaces browser 130% zoom) ---------- */
 function applyUiScale() {
   const s = Math.min(150, Math.max(80, +settings.ui_scale || 100));
@@ -101,7 +186,7 @@ fetch('/api/health').then((r) => r.json()).then((h) => {
 
 /* ---------- blocks ---------- */
 async function loadBlocks() {
-  blocks = await (await fetch('/api/blocks')).json();
+  blocks = await (await api('/api/blocks')).json();
   if (!Array.isArray(blocks)) blocks = [];
   renderBlocks();
 }
@@ -118,7 +203,7 @@ function setUnsaved(on) {
 async function saveBlocks(quiet) {
   clearTimeout(blockSaveTimer);
   try {
-    const r = await fetch('/api/blocks', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(blocks) });
+    const r = await api('/api/blocks', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(blocks) });
     if (!r.ok) throw new Error('HTTP ' + r.status);
     setUnsaved(false);
     if (!quiet) toast('Blocks 已保存');
@@ -219,7 +304,7 @@ function budgetLine(res) {
   return `<b>${res.total_tokens}</b> / ${res.budget_tokens} tokens · tier ${tier} · dropped: ${drop}${overflow}<br>${blocksTxt}`;
 }
 async function assemble() {
-  const r = await fetch('/api/assemble', {
+  const r = await api('/api/assemble', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ blocks, context: ctxCfg(), session: settings.char }),
   });
@@ -276,7 +361,7 @@ function renderMsg(role, text, who, prepend, images, id) {
     images.forEach((p) => {
       const img = document.createElement('img');
       img.className = 'msg-img';
-      img.src = p.startsWith('data:') ? p : '/chars/' + encodeURIComponent(settings.char) + '/' + p;
+      img.src = p.startsWith('data:') ? p : withToken('/chars/' + encodeURIComponent(settings.char) + '/' + p);
       im.appendChild(img);
     });
     d.appendChild(im);
@@ -298,7 +383,7 @@ async function loadHistory() {
 }
 async function loadEarlier() {
   const q = new URLSearchParams({ session: settings.char, limit: settings.visible_turns, before: historyShown });
-  const j = await (await fetch('/api/history?' + q)).json();
+  const j = await (await api('/api/history?' + q)).json();
   const msgs = j.messages || [];
   if (!msgs.length) { $('#btn-earlier').textContent = '没有更早了'; return; }
   const chat = $('#chat');
@@ -321,7 +406,7 @@ $('#btn-earlier').onclick = loadEarlier;
 let chatES = null;
 function subscribeChat() {
   if (chatES) chatES.close();
-  chatES = new EventSource('/api/events?session=' + encodeURIComponent(settings.char));
+  chatES = new EventSource(withToken('/api/events?session=' + encodeURIComponent(settings.char)));
   chatES.addEventListener('message', (ev) => {
     let m; try { m = JSON.parse(ev.data); } catch { return; }
     if (!m || !m.role) return;
@@ -339,7 +424,7 @@ function subscribeChat() {
 }
 async function classifyAndBadge(text) {
   try {
-    const r = await fetch('/api/expression/classify', {
+    const r = await api('/api/expression/classify', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ text: text.slice(-500), rerank_url: settings.rerank_url }),
     });
@@ -415,7 +500,7 @@ async function send() {
   const body = { model: settings.model || undefined, session: settings.char, text, images: imgs, stream, blocks, context: ctxCfg(), max_tokens: maxTokens };
   try {
     if (stream) {
-      const r = await fetch('/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      const r = await api('/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
       if (!r.ok || !r.body) throw new Error('HTTP ' + r.status + ' ' + (await r.text()).slice(0, 200));
       const reader = r.body.getReader();
       const dec = new TextDecoder();
@@ -443,7 +528,7 @@ async function send() {
       if (full.trim()) classifyAndBadge(full);
       return;
     }
-    const r = await fetch('/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    const r = await api('/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     const j = await r.json().catch(() => ({}));
     if (!r.ok) {
       const detail = (typeof j === 'string' ? j : JSON.stringify(j)).slice(0, 300);
@@ -507,15 +592,15 @@ $('#btn-reload-blocks').onclick = () => asyncAction($('#btn-reload-blocks'), asy
 /* ---------- export / archive (moved to settings) ---------- */
 $('#btn-export').onclick = () => {
   const q = new URLSearchParams({ session: settings.char, user: settings.user_name || 'user' });
-  window.open('/api/export?' + q, '_blank');
+  window.open(withToken('/api/export?' + q), '_blank');
 };
 $('#btn-export-all').onclick = () => {
   const q = new URLSearchParams({ session: settings.char, user: settings.user_name || 'user', archives: '1' });
-  window.open('/api/export?' + q, '_blank');
+  window.open(withToken('/api/export?' + q), '_blank');
 };
 $('#btn-archive').onclick = async () => {
   if (!confirm(`归档「${settings.char}」当前楼并另起新楼？归档进该角色数据包，聊天数据不会丢。`)) return;
-  const j = await (await fetch('/api/archive', {
+  const j = await (await api('/api/archive', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ session: settings.char }),
   })).json();
@@ -524,7 +609,7 @@ $('#btn-archive').onclick = async () => {
 
 /* ---------- audit ---------- */
 async function refreshAudit() {
-  const { ids } = await (await fetch('/api/audit')).json();
+  const { ids } = await (await api('/api/audit')).json();
   $('#audit-list').innerHTML = ids.map((id) => `<option>${id}</option>`).join('');
   if (ids.length) { $('#audit-list').value = ids[0]; viewAudit(); }
   else { $('#audit').textContent = '暂无记录，先去聊一句。'; $('#audit-summary').textContent = ''; $('#audit-blocks').innerHTML = ''; }
@@ -533,7 +618,7 @@ function esc(s) { return String(s ?? '').replace(/</g, '&lt;'); }
 async function viewAudit() {
   const id = $('#audit-list').value;
   if (!id) return;
-  const a = await (await fetch('/api/audit/' + id)).json();
+  const a = await (await api('/api/audit/' + id)).json();
   const mem = a.memory || {};
   const up = a.upstream_usage || {};
   const est = a.estimate_tokens ?? a.total_tokens;
@@ -581,7 +666,7 @@ function renderLogEntries(entries) {
 function stopLogStream() { if (logES) { logES.close(); logES = null; } }
 async function openLogs() {
   stopLogStream();
-  const j = await (await fetch('/api/logs?limit=400')).json();
+  const j = await (await api('/api/logs?limit=400')).json();
   const view = $('#log-view');
   view.innerHTML = '';
   logSince = 0;
@@ -592,7 +677,7 @@ async function openLogs() {
 }
 function startLogStream() {
   stopLogStream();
-  logES = new EventSource('/api/logs/stream');
+  logES = new EventSource(withToken('/api/logs/stream'));
   logES.addEventListener('log', (ev) => {
     try { renderLogEntries([JSON.parse(ev.data)]); } catch {}
     if ($('#log-autoscroll').checked) { const v = $('#log-view'); v.scrollTop = v.scrollHeight; }
@@ -603,7 +688,7 @@ function startLogStream() {
 $('#btn-log-refresh').onclick = () => asyncAction($('#btn-log-refresh'), openLogs);
 $('#log-live').onchange = () => { if ($('#log-live').checked) startLogStream(); else { stopLogStream(); $('#log-state').textContent = '已暂停'; } };
 $('#log-level').onchange = async () => {
-  await fetch('/api/logs', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ level: $('#log-level').value }) });
+  await api('/api/logs', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ level: $('#log-level').value }) });
   openLogs();
 };
 $('#btn-log-copy').onclick = () => asyncAction($('#btn-log-copy'), async () => {
@@ -619,15 +704,15 @@ function applyAvatarSize() {
 }
 function syncChatHead() {
   $('#chat-char-name').textContent = settings.char;
-  fetch('/api/characters/' + encodeURIComponent(settings.char)).then((r) => r.json()).then((j) => {
-    $('#chat-avatar').src = j.avatar_url || 'data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==';
+  api('/api/characters/' + encodeURIComponent(settings.char)).then((r) => r.json()).then((j) => {
+    $('#chat-avatar').src = imgURL(j.avatar_url) || 'data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==';
   }).catch(() => {});
 }
 
 /* ---------- characters: self-contained packages ---------- */
 let editingNew = false;
 async function refreshChars() {
-  const { characters } = await (await fetch('/api/characters')).json();
+  const { characters } = await (await api('/api/characters')).json();
   const list = characters || [];
   const grid = $('#char-grid');
   if (!list.length) {
@@ -635,7 +720,7 @@ async function refreshChars() {
   } else {
     grid.innerHTML = list.map((c) => `
       <div class="char-card ${c.name === settings.char ? 'on' : ''}" data-name="${c.name}">
-        <img class="avatar sq" src="${c.avatar_url || 'data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw=='}" alt="">
+        <img class="avatar sq" src="${imgURL(c.avatar_url) || 'data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw=='}" alt="">
         <div>
           <div class="cc-name">${c.name}</div>
           <div class="cc-desc">${(c.description || '（暂无描述，点卡片后编辑）').replace(/</g, '&lt;')}</div>
@@ -653,7 +738,7 @@ async function refreshChars() {
 async function selectChar(name) {
   settings.char = name;
   store.set('settings', settings);
-  await fetch('/api/settings', {
+  await api('/api/settings', {
     method: 'PUT', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ current_char: name }),
   });
@@ -675,10 +760,10 @@ function openEditor(name, isNew) {
     $('#char-name').readOnly = false;
     $('#btn-char-delete').style.display = 'none';
   } else {
-    fetch('/api/characters/' + encodeURIComponent(name)).then((r) => r.json()).then((j) => {
+    api('/api/characters/' + encodeURIComponent(name)).then((r) => r.json()).then((j) => {
       $('#char-name').value = j.name || name;
       $('#char-desc').value = j.description || '';
-      $('#char-avatar').src = j.avatar_url || 'data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==';
+      $('#char-avatar').src = imgURL(j.avatar_url) || 'data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==';
       $('#char-expr').textContent = (j.expressions || []).length ? '表情：' + j.expressions.join(', ') : '';
     });
     $('#char-name').readOnly = true;
@@ -692,13 +777,13 @@ $('#btn-char-save').onclick = async () => {
   const desc = $('#char-desc').value;
   if (!name) { alert('角色名不能为空'); return; }
   if (editingNew) {
-    const r = await fetch('/api/characters', {
+    const r = await api('/api/characters', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name, description: desc }),
     });
     if (!r.ok) { alert('创建失败：' + (await r.text())); return; }
   } else {
-    await fetch('/api/characters/' + encodeURIComponent(name) + '/card', {
+    await api('/api/characters/' + encodeURIComponent(name) + '/card', {
       method: 'PUT', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ description: desc }),
     });
@@ -711,7 +796,7 @@ $('#btn-char-delete').onclick = async () => {
   const name = $('#char-name').value.trim();
   if (!name) return;
   if (!confirm(`删除角色「${name}」？默认保留聊天数据（只删角色卡与头像）。`)) return;
-  await fetch('/api/characters/' + encodeURIComponent(name), { method: 'DELETE' });
+  await api('/api/characters/' + encodeURIComponent(name), { method: 'DELETE' });
   $('#char-editor').classList.add('hidden');
   refreshChars();
 };
@@ -722,16 +807,16 @@ $('#char-file').onchange = async (e) => {
   if (!name) { alert('先填角色名'); e.target.value = ''; return; }
   const fd = new FormData();
   fd.append('file', f);
-  const r = await fetch('/api/characters/' + encodeURIComponent(name) + '/avatar', { method: 'PUT', body: fd });
+  const r = await api('/api/characters/' + encodeURIComponent(name) + '/avatar', { method: 'PUT', body: fd });
   const j = await r.json();
-  if (j.avatar_url) { $('#char-avatar').src = j.avatar_url; syncChatHead(); }
+  if (j.avatar_url) { $('#char-avatar').src = imgURL(j.avatar_url); syncChatHead(); }
   e.target.value = '';
 };
 
 /* ---------- memory (server-backed) ---------- */
 async function loadServerSettings() {
   try {
-    const s = await (await fetch('/api/settings')).json();
+    const s = await (await api('/api/settings')).json();
     if (s.upstream) $('#set-upstream').value = s.upstream;
     if (s.rerank_url) $('#set-rerank').value = s.rerank_url;
     if (s.max_tokens && !settings.max_tokens) settings.max_tokens = s.max_tokens;
@@ -752,7 +837,7 @@ async function loadServerSettings() {
   } catch { return null; }
 }
 async function saveMemory(silent) {
-  const r = await fetch('/api/settings', {
+  const r = await api('/api/settings', {
     method: 'PUT', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       mcp_url: $('#mem-url').value.trim(),
@@ -776,14 +861,14 @@ $('#btn-mem-test').onclick = async () => {
   const q = $('#mem-test-q').value.trim() || '测试';
   $('#mem-test-out').textContent = '检索中…';
   try {
-    const j = await (await fetch('/api/memory/search', {
+    const j = await (await api('/api/memory/search', {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ query: q }),
     })).json();
     $('#mem-test-out').textContent = JSON.stringify(j, null, 2).slice(0, 4000);
   } catch (e) { $('#mem-test-out').textContent = '失败：' + e; }
 };
 async function saveNtfy(silent) {
-  await fetch('/api/settings', {
+  await api('/api/settings', {
     method: 'PUT', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ ntfy_url: $('#set-ntfy-url').value.trim(), ntfy_topic: $('#set-ntfy-topic').value.trim() }),
   });
@@ -798,7 +883,7 @@ $('#btn-ntfy-save').onclick = () => asyncAction($('#btn-ntfy-save'), () => saveN
 let distillDefaultPrompt = '';
 async function loadDistill() {
   try {
-    const j = await (await fetch('/api/distilled?session=' + encodeURIComponent(settings.char))).json();
+    const j = await (await api('/api/distilled?session=' + encodeURIComponent(settings.char))).json();
     distillDefaultPrompt = j.default_prompt || '';
     $('#dmem-enabled').checked = !!j.enabled;
     $('#dmem-interval').value = j.interval || 8;
@@ -814,7 +899,7 @@ async function loadDistill() {
   } catch (e) { toast('蒸馏信息加载失败：' + e.message, 'err'); }
 }
 async function saveDistill(silent) {
-  await fetch('/api/settings', {
+  await api('/api/settings', {
     method: 'PUT', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       distill_enabled: $('#dmem-enabled').checked,
@@ -833,7 +918,7 @@ $('#btn-dmem-save').onclick = () => asyncAction($('#btn-dmem-save'), () => saveD
 });
 $('#btn-dmem-run').onclick = () => asyncAction($('#btn-dmem-run'), async () => {
   $('#dmem-meta').textContent = '蒸馏中…（可能耗时数十秒，请勿关闭）';
-  const r = await fetch('/api/distilled/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ session: settings.char }) });
+  const r = await api('/api/distilled/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ session: settings.char }) });
   const j = await r.json();
   if (!j.ok) throw new Error(j.error || ('HTTP ' + r.status));
   toast('蒸馏完成');
@@ -849,7 +934,7 @@ $('#btn-dmem-prompt-view').onclick = () => loadDistill();
 /* ---------- models ---------- */
 async function refreshModels() {
   try {
-    const j = await (await fetch('/api/models')).json();
+    const j = await (await api('/api/models')).json();
     const ids = (j.data || []).map((m) => m.id).filter(Boolean);
     const sel = $('#set-model');
     sel.innerHTML = ids.map((id) => `<option value="${id}">${id}</option>`).join('');
@@ -887,7 +972,7 @@ async function saveSettings(silent) {
   settings.model = $('#set-model').value || settings.model;
   store.set('settings', settings);
   applyUiScale();
-  const r = await fetch('/api/settings', {
+  const r = await api('/api/settings', {
     method: 'PUT', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       upstream: $('#set-upstream').value.trim(),
@@ -919,7 +1004,11 @@ document.addEventListener('visibilitychange', () => {
 });
 
 /* ---------- init ---------- */
+const _loginForm = $('#login-form');
+if (_loginForm) _loginForm.addEventListener('submit', (e) => { e.preventDefault(); doLogin(); });
+if ($('#btn-logout')) $('#btn-logout').onclick = doLogout;
 async function init() {
+  if (!(await bootAuth())) return; // gate: stop booting until logged in
   fillSettingsForm();
   applyUiScale();
   await loadServerSettings();

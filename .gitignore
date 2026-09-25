@@ -1,6 +1,7 @@
 data/audit/
 data/chats/
 data/settings.json
+data/sessions.json
 data/characters/
 data/presets/default.json
 data/memory/

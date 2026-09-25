@@ -147,9 +147,22 @@ void setAwaitingReply(bool v) {
 
 // ---- server REST helpers (plain HTTP, alongside the Ollama shim) ----
 
+/// Custom headers the user set in Settings (host headers dialog). Used for the
+/// TavernLab auth gate: set {"Authorization": "Bearer <app-token>"} once and
+/// every request below authenticates silently (no repeated login prompt).
+Map<String, String> serverHeaders() {
+  try {
+    final raw = prefs?.getString("hostHeaders") ?? "{}";
+    final m = jsonDecode(raw) as Map;
+    return m.map((k, v) => MapEntry(k.toString(), v.toString()));
+  } catch (_) {
+    return const {};
+  }
+}
+
 Future<Map<String, dynamic>> apiGet(String path, {int seconds = 15}) async {
   final r = await http
-      .get(Uri.parse("$host$path"))
+      .get(Uri.parse("$host$path"), headers: serverHeaders())
       .timeout(Duration(seconds: seconds));
   return jsonDecode(r.body) as Map<String, dynamic>;
 }
@@ -161,7 +174,7 @@ Future<void> setCurrentChar(String name) async {
   try {
     await http.put(
       Uri.parse("$host/api/settings"),
-      headers: {"Content-Type": "application/json"},
+      headers: {"Content-Type": "application/json", ...serverHeaders()},
       body: jsonEncode({"current_char": name}),
     );
   } catch (_) {}
@@ -264,6 +277,7 @@ Widget buildImageWidget(String uri,
         width: width,
         height: height,
         fit: fit,
+        headers: serverHeaders(),
         gaplessPlayback: true,
         errorBuilder: (c, e, s) => const Icon(Icons.broken_image));
   }
@@ -280,7 +294,7 @@ Future<Map<String, dynamic>> apiPost(
     {int seconds = 15}) async {
   final r = await http
       .post(Uri.parse("$host$path"),
-          headers: {"Content-Type": "application/json"},
+          headers: {"Content-Type": "application/json", ...serverHeaders()},
           body: jsonEncode(body))
       .timeout(Duration(seconds: seconds));
   return jsonDecode(r.body) as Map<String, dynamic>;
@@ -732,6 +746,7 @@ void startEvents() {
           "GET",
           Uri.parse("$host/api/events?session=${Uri.encodeComponent(currentChar)}"));
       req.headers["Accept"] = "text/event-stream";
+      req.headers.addAll(serverHeaders());
       final resp = await http.Client().send(req);
       eventSub = resp.stream
           .transform(utf8.decoder)
@@ -787,8 +802,9 @@ Future<void> chooseCharacter(BuildContext context, Function setState) async {
                 final selected = name == currentChar;
                 return ListTile(
                   leading: CircleAvatar(
-                    backgroundImage:
-                        avatar.isEmpty ? null : NetworkImage("$host$avatar"),
+                    backgroundImage: avatar.isEmpty
+                        ? null
+                        : NetworkImage("$host$avatar", headers: serverHeaders()),
                     child: avatar.isEmpty ? const Icon(Icons.person) : null,
                   ),
                   title: Text(name),
@@ -1193,7 +1209,7 @@ class _MainAppState extends State<MainApp> with WidgetsBindingObserver {
                           .withValues(alpha: 0.08),
                       backgroundImage: charAvatarUrl.isEmpty
                           ? null
-                          : NetworkImage(charAvatarUrl),
+                          : NetworkImage(charAvatarUrl, headers: serverHeaders()),
                       onBackgroundImageError:
                           charAvatarUrl.isEmpty ? null : (_, __) {},
                       child: charAvatarUrl.isEmpty
@@ -1396,6 +1412,7 @@ class _MainAppState extends State<MainApp> with WidgetsBindingObserver {
                                 imageBuilder: (uri, title, alt) {
                                   if (uri.isAbsolute) {
                                     return Image.network(uri.toString(),
+                                        headers: serverHeaders(),
                                         errorBuilder:
                                             (context, error, stackTrace) {
                                       return InkWell(

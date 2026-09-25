@@ -31,6 +31,24 @@ ONEAPI_KEY=sk-xxx go run . --port 8080
 
 打开 http://127.0.0.1:8080
 
+## 登录鉴权（可选，服务端设定）
+
+与 rag-mcp-server 同一套 one-api 风格门禁。默认关闭（`admin_user` 为空）。
+
+```bash
+# 密码 hash（hex(sha256(password))）
+HASH=$(printf '%s' '你的密码' | sha256sum | awk '{print $1}')
+# 方式一：环境变量（推荐给 systemd）
+TAVERNLAB_ADMIN_USER=admin TAVERNLAB_ADMIN_SHA256=$HASH \
+TAVERNLAB_APP_TOKEN=<手机App用的长随机串> ./tavernlab --port 8888 --data ./data
+```
+
+- 凭据只从服务端读：flags/env 优先，其次 `data/settings.json` 的 `admin_user`/`admin_password_sha256`/`session_days`（0600）。WebUI **无法**设置或读取密码。
+- 浏览器端：登录一次后 token 存 sessionStorage；勾「记住我」存 localStorage（默认 30 天），不会反复弹框。EventSource / `<img>` 走 `?token=` 回退。
+- 手机 App：在设置里把 host headers 设为 `{"Authorization":"Bearer <app-token>"}`，此后静默鉴权（App 无登录 UI）。
+- 密码或 app token 变更（或重启时 `sessions.json` 指纹不匹配）会令所有旧 token 失效，需重新登录。
+- 放行清单：`/api/health`、`/api/login`、`/api/logout`、`/api/me` 与静态前端；其余 `/api/*`、`/v1/*`、`/chars/*` 需鉴权。
+
 ## 迁移（rclone友好）
 
 - 二进制按arch分发一次，`data/` 用 `rclone copy --copy-links` 搬家

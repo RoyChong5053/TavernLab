@@ -25,6 +25,7 @@
     <div class="side-foot">
       <div id="health" class="health">…</div>
       <div class="hint">Go thin core · data/可rclone</div>
+      <button id="btn-logout" class="meta hidden" title="退出登录">退出登录</button>
     </div>
   </aside>
   <main class="content">
@@ -223,6 +224,17 @@
   </main>
 </div>
 <div id="toast-wrap"></div>
+<div id="login-overlay" class="login-overlay hidden">
+  <form id="login-form" class="login-card glass" autocomplete="on">
+    <div class="login-brand"><img src="/icon.png" alt="" class="brand-logo"> TavernLab <span class="sub">IDE</span></div>
+    <p class="meta">需要登录（与 rag-mcp-server 同一套 admin 鉴权）</p>
+    <label>用户名 <input id="login-user" autocomplete="username" placeholder="admin"></label>
+    <label>密码 <input id="login-pass" type="password" autocomplete="current-password" placeholder="••••••••"></label>
+    <label class="meta"><input type="checkbox" id="login-remember" checked> 记住我（本浏览器 30 天）</label>
+    <div id="login-err" class="login-err"></div>
+    <button type="submit" class="primary">登录</button>
+  </form>
+</div>
 <script src="app.js"></script>
 </body>
 </html>

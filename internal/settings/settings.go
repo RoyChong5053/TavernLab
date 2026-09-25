@@ -20,13 +20,13 @@ type Settings struct {
 	MCPEnabled        bool    `json:"mcp_enabled"`
 	MCPTopK           int     `json:"mcp_topk,omitempty"`
 	MCPTimeout        int     `json:"mcp_timeout,omitempty"`
-	MCPThreshold      float64 `json:"mcp_threshold,omitempty"` // <0 = omit (server default)
+	MCPThreshold      float64 `json:"mcp_threshold,omitempty"`     // <0 = omit (server default)
 	MCPBudgetTokens   int     `json:"mcp_budget_tokens,omitempty"` // token budget for injected memory (default 2000)
 	MCPPerHitChars    int     `json:"mcp_per_hit_chars,omitempty"` // per-hit char cap (default 2000, backend chunks ~500char, jina cap 1024tok)
-	MaxTokens         int     `json:"max_tokens,omitempty"` // upstream generation cap, independent of response_reserve (default 4096)
-	CurrentChar       string  `json:"current_char,omitempty"`  // source of truth for web + app
-	UserName          string  `json:"user_name,omitempty"`     // export attribution / {{user}}
-	NtfyURL           string  `json:"ntfy_url,omitempty"`      // self-hosted ntfy base, empty = disabled
+	MaxTokens         int     `json:"max_tokens,omitempty"`        // upstream generation cap, independent of response_reserve (default 4096)
+	CurrentChar       string  `json:"current_char,omitempty"`      // source of truth for web + app
+	UserName          string  `json:"user_name,omitempty"`         // export attribution / {{user}}
+	NtfyURL           string  `json:"ntfy_url,omitempty"`          // self-hosted ntfy base, empty = disabled
 	NtfyTopic         string  `json:"ntfy_topic,omitempty"`
 	DistillEnabled    bool    `json:"distill_enabled"`               // auto-distill every N user turns
 	DistillInterval   int     `json:"distill_interval,omitempty"`    // user turns between runs (default 8)
@@ -34,6 +34,11 @@ type Settings struct {
 	DistillRetainDays int     `json:"distill_retain_days,omitempty"` // always keep at least N days (default 3)
 	DistillModel      string  `json:"distill_model,omitempty"`       // empty = main model
 	DistillPrompt     string  `json:"distill_prompt,omitempty"`      // empty = built-in default
+	// Login gate (server-side only: flags/env or direct file edit + restart;
+	// the WebUI can never change these). Empty AdminUser = auth disabled.
+	AdminUser           string `json:"admin_user,omitempty"`
+	AdminPasswordSHA256 string `json:"admin_password_sha256,omitempty"` // hex(sha256(password))
+	SessionDays         int    `json:"session_days,omitempty"`          // login token TTL, default 30
 }
 
 // Defaults for a fresh checkout talking to the home LAN.
@@ -130,6 +135,15 @@ func Load(root string) Settings {
 	}
 	if f.DistillPrompt != "" {
 		s.DistillPrompt = f.DistillPrompt
+	}
+	if f.AdminUser != "" {
+		s.AdminUser = f.AdminUser
+	}
+	if f.AdminPasswordSHA256 != "" {
+		s.AdminPasswordSHA256 = f.AdminPasswordSHA256
+	}
+	if f.SessionDays > 0 {
+		s.SessionDays = f.SessionDays
 	}
 	return s
 }

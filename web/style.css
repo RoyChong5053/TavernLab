@@ -137,3 +137,17 @@ button.danger{background:rgba(255,80,80,.15);border-color:rgba(255,80,80,.4);col
   .mood{font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .msg-img{max-width:160px}
 }
+/* login overlay (shown only when the server gate is on and unauthenticated) */
+.login-overlay{position:fixed;inset:0;z-index:90;display:flex;align-items:center;justify-content:center;padding:16px;background:rgba(6,9,14,.82);backdrop-filter:blur(6px)}
+.login-overlay.hidden{display:none}
+.login-card{width:100%;max-width:340px;padding:20px;display:flex;flex-direction:column;gap:10px}
+.login-card label{display:flex;flex-direction:column;gap:6px;font-size:13px;color:var(--mut)}
+.login-card input{padding:10px;border-radius:10px;border:1px solid var(--line);background:rgba(0,0,0,.35);color:inherit;font-size:14px}
+.login-card label.meta{flex-direction:row;align-items:center;gap:8px}
+.login-card label.meta input{width:auto}
+.login-brand{font-size:20px;font-weight:700;display:flex;align-items:center;gap:8px}
+.login-brand .sub{font-size:12px;color:var(--mut);font-weight:500}
+.login-err{color:#ff9d9d;font-size:12px;min-height:16px}
+.login-card button.primary{padding:10px;border-radius:10px;font-size:15px}
+#btn-logout{margin-top:8px;background:none;border:1px solid var(--line);border-radius:8px;color:var(--mut);padding:4px 10px;cursor:pointer;font-size:12px}
+#btn-logout.hidden{display:none}
