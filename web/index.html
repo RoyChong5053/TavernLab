@@ -10,6 +10,7 @@
 </head>
 <body>
 <button id="hamburger" aria-label="菜单">☰</button>
+<div id="app">
 <div class="shell">
   <aside class="sidebar glass" id="sidebar">
     <div class="brand"><img src="/icon.png" alt="" class="brand-logo"> TavernLab <span class="sub">IDE</span></div>
@@ -83,15 +84,18 @@
     </section>
     <!-- BLOCKS -->
     <section class="page" id="page-blocks">
-      <h2>Blocks <small>order=位置；去 priority，改用预计算 token + 自动窗口档位</small></h2>
+      <h2>Blocks <small>order=位置；Level=超预算时的淘汰级别</small></h2>
       <div id="budget" class="glass budget"></div>
       <div class="row">
+        <button id="btn-add-block" class="primary">＋ 新增 block</button>
         <button id="btn-assemble">试算 Assemble</button>
         <button id="btn-preview">👁 Preview（模拟试算）</button>
         <button id="btn-save-blocks">保存</button>
         <button id="btn-reload-blocks">重载</button>
       </div>
-      <p class="meta">拖动卡片排序。窗口自动选 8k/16k/32k 中最小可容纳档；最近轮优先保留，超 32k 会标红 overflow。</p>
+      <p class="meta">拖动卡片排序。预算：<b>输入 = 上下文窗口 − 回复预留</b>。超预算时按级别淘汰：
+        <b>L1 锁定</b>（system/角色卡/distilled 记忆，永不裁剪）→ <b>L3 弹性</b>（实验块，整个先砍）→
+        <b>L2 可裁剪</b>（RAG 按 reranker 分数砍最低分，chat 从最旧轮淘汰、保底 4 轮）。</p>
       <div id="blocks"></div>
       <div id="preview-modal" class="modal hidden">
         <div class="modal-box glass">
@@ -184,12 +188,11 @@
         <label>API Key <input id="set-apikey" type="password" size="30" placeholder="空=保持不变" autocomplete="new-password"></label>
         <span id="set-key-state" class="meta"></span>
         <div class="row">
-          <label>窗口档位 <input id="set-tiers" size="18" value="8192,16384,32768"></label>
-          <label>回复预留 <input id="set-reserve" type="number" value="4096" style="width:80px" title="输入预算预留，不是生成上限"></label>
-          <label>生成上限 <input id="set-maxtokens" type="number" min="256" max="32768" value="4096" style="width:80px" title="发给上游的 max_tokens，独立于预留"></label>
-          <label>保底轮数 <input id="set-minrounds" type="number" value="4" style="width:56px"></label>
+          <label>上下文窗口 <input id="set-window" type="number" min="2048" max="131072" step="1024" value="16384" style="width:92px" title="输入+回复的总预算"></label>
+          <label>回复预留 <input id="set-reserve" type="number" min="256" max="65536" value="4096" style="width:80px" title="留给回复的预算，同时作为上游 max_tokens"></label>
+          <label>保底轮数 <input id="set-minrounds" type="number" min="1" max="50" value="4" style="width:56px" title="滑动窗口至少保留的对话轮数"></label>
         </div>
-        <p class="meta">回复预留 = 输入侧留给回复的预算（选档用）；生成上限 = 发给上游的 max_tokens（决定回多长，截断看 Audit finish_reason）。</p>
+        <p class="meta">输入预算 = 上下文窗口 − 回复预留（例如 16384 − 4096 = 12288）。窗口内先放锁定块，RAG 与对话按级别淘汰。</p>
         <div class="row">
           <label>界面缩放 <input id="set-uiscale" type="number" min="80" max="150" value="100" style="width:64px"> %（存本机，替代浏览器130%）</label>
         </div>
@@ -222,6 +225,7 @@
       </div>
     </section>
   </main>
+</div>
 </div>
 <div id="toast-wrap"></div>
 <div id="login-overlay" class="login-overlay hidden">

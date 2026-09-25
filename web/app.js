@@ -13,18 +13,16 @@ const store = {
   set(k, v) { localStorage.setItem('tavernlab.' + k, JSON.stringify(v)); },
 };
 
-const DEFAULT_TIERS = [8192, 16384, 32768];
 let blocks = [];
 const settings = Object.assign(
   {
-    tiers: DEFAULT_TIERS, response_reserve: 4096, recent_chat_min_turns: 4,
+    context_window: 16384, reply_reserve: 4096, history_min_turns: 4,
     rerank_url: 'http://127.0.0.1:11437', char: 'Leer乐儿', model: '',
     stream: false, visible_turns: 10, user_name: 'RoyChong', avatar_px: 88,
-    max_tokens: 4096, ui_scale: 100,
+    ui_scale: 100,
   },
   store.get('settings', {}),
 );
-if (!Array.isArray(settings.tiers) || !settings.tiers.length) settings.tiers = DEFAULT_TIERS;
 
 /* ---------- auth (Bearer, one-api style; optional server-side gate) ---------- */
 // Token lives in sessionStorage by default, localStorage when "remember me".
@@ -117,9 +115,24 @@ async function bootAuth() {
 }
 
 /* ---------- ui scale (persisted, replaces browser 130% zoom) ---------- */
+// Compensated transform instead of body.zoom: body.zoom + overflow:hidden used
+// to clip the layout so the page could not scroll once zoomed in.
 function applyUiScale() {
   const s = Math.min(150, Math.max(80, +settings.ui_scale || 100));
-  try { document.body.style.zoom = s + '%'; } catch {}
+  const app = document.getElementById('app');
+  if (app) {
+    const z = s / 100;
+    if (z === 1) {
+      app.style.transform = '';
+      app.style.width = '';
+      app.style.height = '';
+    } else {
+      app.style.transformOrigin = 'top left';
+      app.style.transform = `scale(${z})`;
+      app.style.width = (100 / z) + '%';
+      app.style.height = (100 / z) + 'vh';
+    }
+  }
   const el = $('#set-uiscale');
   if (el) el.value = s;
 }
@@ -218,6 +231,12 @@ async function saveBlocks(quiet) {
   }
 }
 let dragId = null;
+const LEVELS = [
+  { v: 1, t: 'L1 锁定（永不裁剪）' },
+  { v: 2, t: 'L2 可裁剪（保底后淘汰）' },
+  { v: 3, t: 'L3 弹性（最先整个砍）' },
+];
+const SOURCES = ['static', 'character', 'distilled', 'mcp', 'chat'];
 function renderBlocks() {
   const el = $('#blocks');
   el.innerHTML = '';
@@ -226,25 +245,46 @@ function renderBlocks() {
     d.className = 'block';
     d.draggable = true;
     d.dataset.id = b.id;
-    const bmax = (b.budget && b.budget.max) || 0;
+    const lvl = b.level || 3;
+    const src = (b.source && b.source.type) || 'static';
+    const levelOpts = LEVELS.map((x) => `<option value="${x.v}" ${x.v === lvl ? 'selected' : ''}>${x.t}</option>`).join('');
+    const srcOpts = SOURCES.map((s) => `<option value="${s}" ${s === src ? 'selected' : ''}>${s}</option>`).join('');
+    const roleOpts = ['system', 'user', 'assistant'].map((r) => `<option value="${r}" ${r === b.role ? 'selected' : ''}>${r}</option>`).join('');
     d.innerHTML = `
       <div class="hd">
         <label><span class="grip" title="只从这里拖动排序">⠿</span><input type="checkbox" data-id="${b.id}" data-k="enabled" ${b.enabled ? 'checked' : ''}> <b>${b.id}</b></label>
-        <span>order <input type="number" data-id="${b.id}" data-k="order" value="${b.order}"> max <input type="number" data-id="${b.id}" data-k="max" value="${bmax}"></span>
+        <span class="blk-actions">
+          <select data-id="${b.id}" data-k="level" title="级别决定超预算时的淘汰顺序">${levelOpts}</select>
+          <button class="danger" data-del="${b.id}" title="删除此 block">✕</button>
+        </span>
       </div>
-      <div class="meta">${b.role} · ${b.source.type}${b.source.collection ? ':' + b.source.collection : ''}</div>
-      <textarea rows="2" data-id="${b.id}" data-k="template">${(b.template || '').replace(/</g, '&lt;')}</textarea>`;
+      <div class="meta blk-meta">
+        role <select data-id="${b.id}" data-k="role">${roleOpts}</select>
+        source <select data-id="${b.id}" data-k="source">${srcOpts}</select>
+        ${b.source && b.source.collection ? '<span>collection: ' + b.source.collection + '</span>' : ''}
+      </div>
+      <textarea rows="2" data-id="${b.id}" data-k="template" placeholder="模板；list 源用 {{rag}} / {{items}} 占位">${(b.template || '').replace(/</g, '&lt;')}</textarea>`;
     el.appendChild(d);
   });
-  el.querySelectorAll('input,textarea').forEach((inp) => {
+  el.querySelectorAll('input,textarea,select').forEach((inp) => {
     inp.onchange = () => {
       const b = blocks.find((x) => x.id === inp.dataset.id);
       if (!b) return;
       const k = inp.dataset.k;
       if (k === 'enabled') b.enabled = inp.checked;
-      else if (k === 'max') b.budget = Object.assign({}, b.budget, { max: +inp.value });
-      else if (k === 'order') b.order = +inp.value;
+      else if (k === 'level') b.level = +inp.value;
+      else if (k === 'role') b.role = inp.value;
+      else if (k === 'source') b.source = Object.assign({}, b.source, { type: inp.value });
       else b[k] = inp.value;
+      scheduleBlockSave();
+    };
+  });
+  el.querySelectorAll('[data-del]').forEach((btn) => {
+    btn.onclick = () => {
+      const id = btn.dataset.del;
+      if (!confirm(`删除 block「${id}」？`)) return;
+      blocks = blocks.filter((x) => x.id !== id);
+      renderBlocks();
       scheduleBlockSave();
     };
   });
@@ -294,19 +334,19 @@ function reorderBlocks(fromId, toId, after) {
   renderBlocks();
   scheduleBlockSave();
 }
-function parseTiers(s) {
-  const t = String(s || '').split(',').map((x) => parseInt(x.trim(), 10)).filter((n) => n > 0);
-  return t.length ? t : DEFAULT_TIERS;
-}
 function ctxCfg() {
-  return { tiers: settings.tiers, response_reserve: settings.response_reserve, recent_chat_min_turns: settings.recent_chat_min_turns };
+  return {
+    context_window: settings.context_window,
+    reply_reserve: settings.reply_reserve,
+    history_min_turns: settings.history_min_turns,
+  };
 }
 function budgetLine(res) {
-  const tier = res.tier ? `${Math.round(res.tier / 1024)}k` : '?';
   const drop = (res.dropped || []).join(', ') || '无';
-  const blocksTxt = (res.blocks || []).map((b) => `${b.id}:${b.tokens}${b.truncated ? '✂' : ''}`).join(' · ');
-  const overflow = res.overflow ? ' · <span style="color:#ffb4b4">⚠ OVERFLOW（超过最大档）</span>' : '';
-  return `<b>${res.total_tokens}</b> / ${res.budget_tokens} tokens · tier ${tier} · dropped: ${drop}${overflow}<br>${blocksTxt}`;
+  const blocksTxt = (res.blocks || []).map((b) => `${b.id}(L${b.level}):${b.tokens}${b.truncated ? '✂' : ''}`).join(' · ');
+  const overflow = res.overflow ? ' · <span style="color:#ffb4b4">⚠ OVERFLOW（超过输入预算）</span>' : '';
+  const win = res.window ? `窗口 ${Math.round(res.window / 1024)}k · ` : '';
+  return `<b>${res.total_tokens}</b> / ${res.budget_tokens} 输入 tokens · ${win}dropped: ${drop}${overflow}<br>${blocksTxt}`;
 }
 async function assemble() {
   const r = await api('/api/assemble', {
@@ -529,7 +569,7 @@ async function send() {
   if (cbox) scrollToBottom(cbox);
   const stream = !!settings.stream;
   const seqAtStart = assistantSseSeq;
-  const maxTokens = Math.min(32768, Math.max(256, +settings.max_tokens || 4096));
+  const maxTokens = Math.min(65536, Math.max(256, +settings.reply_reserve || 4096));
   const body = { model: settings.model || undefined, session: settings.char, text, images: imgs, stream, blocks, context: ctxCfg(), max_tokens: maxTokens };
   try {
     if (stream) {
@@ -639,6 +679,18 @@ $('#btn-preview-close').onclick = () => $('#preview-modal').classList.add('hidde
 $('#preview-modal').addEventListener('click', (e) => { if (e.target.id === 'preview-modal') e.target.classList.add('hidden'); });
 $('#btn-save-blocks').onclick = () => asyncAction($('#btn-save-blocks'), async () => { await saveBlocks(false); assemble(); });
 $('#btn-reload-blocks').onclick = () => asyncAction($('#btn-reload-blocks'), async () => { await loadBlocks(); toast('已重载'); });
+$('#btn-add-block').onclick = () => {
+  const id = (prompt('新 block 的名字（英文/数字，唯一）') || '').trim();
+  if (!id) return;
+  if (blocks.some((b) => b.id === id)) { toast('名字已存在', 'err'); return; }
+  const maxOrder = blocks.reduce((m, b) => Math.max(m, b.order || 0), 0);
+  blocks.push({
+    id, role: 'system', order: maxOrder + 1, enabled: true, level: 3,
+    budget: {}, source: { type: 'static' }, template: '',
+  });
+  renderBlocks();
+  scheduleBlockSave();
+};
 
 /* ---------- export / archive (moved to settings) ---------- */
 $('#btn-export').onclick = () => {
@@ -676,21 +728,21 @@ async function viewAudit() {
   const act = a.actual_tokens || up.prompt_tokens || 0;
   const comp = a.completion_tokens || up.completion_tokens || 0;
   const fin = a.finish_reason || '';
-  const truncWarn = fin === 'length' ? ' · <span style="color:#ffb4b4">⚠ 生成被截断（finish=length），调大“生成上限”</span>' : '';
-  const overWarn = a.overflow ? ' · <span style="color:#ffb4b4">⚠ OVERFLOW（超最大档）</span>' : '';
+  const truncWarn = fin === 'length' ? ' · <span style="color:#ffb4b4">⚠ 生成被截断（finish=length），调大“回复预留”</span>' : '';
+  const overWarn = a.overflow ? ' · <span style="color:#ffb4b4">⚠ OVERFLOW（超过输入预算）</span>' : '';
   const memTxt = mem.enabled
     ? `记忆：${esc(mem.collection || '')} · query=「${esc((mem.query || '').slice(0, 60))}」 · hits=${mem.hits ?? '?'} · 预算${mem.budget_tokens ?? '?'}用了${mem.used_tokens ?? '?'}${mem.error ? ' · ⚠ ' + esc(mem.error) : ''}`
     : '记忆：未启用';
   $('#audit-summary').innerHTML =
-    `<b>${a.total_tokens}</b> / ${a.budget_tokens} tokens（估算${est} vs 实际${act || '?'}` +
+    `<b>${a.total_tokens}</b> / ${a.budget_tokens} 输入 tokens（估算${est} vs 实际${act || '?'}` +
     `${comp ? ' · 补全' + comp : ''} · max_tokens${a.max_tokens || '?'}${fin ? ' · finish=' + esc(fin) : ''}` +
-    `）· tier ${a.tier ? Math.round(a.tier / 1024) + 'k' : '?'} · dropped: ${esc((a.dropped || []).join(', ') || '无')}` +
+    `）· 窗口 ${a.window ? Math.round(a.window / 1024) + 'k' : '?'} · dropped: ${esc((a.dropped || []).join(', ') || '无')}` +
     `${truncWarn}${overWarn}<br>${memTxt}` +
-    `<br><span class="meta">滑动窗口：固定块先占 ${a.total_tokens} 中的非chat部分，剩余预算从最新轮往回填（保底最近轮），旧轮被丢；窗口档取 8k/16k/32k 最小可容纳档。</span>`;
+    `<br><span class="meta">滑动窗口：输入预算 = 窗口 − 回复预留。L1 永不裁剪；L3 先整个砍；L2 按级别淘汰（RAG 砍最低分，chat 淘汰最旧、保底 4 轮）。</span>`;
   const rows = (a.blocks || []).map((b) =>
-    `<tr><td>${esc(b.id)}</td><td>${esc(b.role)}</td><td>${b.order}</td><td>${b.tokens}</td><td>${b.truncated ? '✂' : ''}</td><td class="meta">${esc(b.note || '')}</td></tr>`).join('');
+    `<tr><td>${esc(b.id)}</td><td>L${b.level || '?'}</td><td>${esc(b.role)}</td><td>${b.tokens}</td><td>${b.truncated ? '✂' : ''}</td><td class="meta">${esc(b.note || '')}</td></tr>`).join('');
   $('#audit-blocks').innerHTML =
-    `<table><tr><th>block</th><th>role</th><th>order</th><th>tokens</th><th>截断</th><th>备注</th></tr>${rows}</table>`;
+    `<table><tr><th>block</th><th>级别</th><th>role</th><th>tokens</th><th>淘汰</th><th>备注</th></tr>${rows}</table>`;
   $('#audit').textContent = JSON.stringify(a, null, 2);
 }
 $('#btn-audit-list').onclick = refreshAudit;
@@ -870,7 +922,10 @@ async function loadServerSettings() {
     const s = await (await api('/api/settings')).json();
     if (s.upstream) $('#set-upstream').value = s.upstream;
     if (s.rerank_url) $('#set-rerank').value = s.rerank_url;
-    if (s.max_tokens && !settings.max_tokens) settings.max_tokens = s.max_tokens;
+    if (s.context_window) settings.context_window = s.context_window;
+    if (s.reply_reserve) settings.reply_reserve = s.reply_reserve;
+    if (s.history_min_turns) settings.history_min_turns = s.history_min_turns;
+    store.set('settings', settings);
     $('#set-key-state').textContent = s.api_key_set ? ('API Key 已设置 ' + (s.api_key_hint || '')) : 'API Key 未设置';
     $('#mem-url').value = s.mcp_url || '';
     $('#mem-collection').value = s.mcp_collection || '';
@@ -998,11 +1053,10 @@ $('#set-model').onchange = (e) => { settings.model = e.target.value; store.set('
 
 /* ---------- settings ---------- */
 function fillSettingsForm() {
-  $('#set-tiers').value = settings.tiers.join(',');
-  $('#set-reserve').value = settings.response_reserve;
-  $('#set-maxtokens').value = settings.max_tokens || 4096;
+  $('#set-window').value = settings.context_window || 16384;
+  $('#set-reserve').value = settings.reply_reserve || 4096;
   $('#set-uiscale').value = settings.ui_scale || 100;
-  $('#set-minrounds').value = settings.recent_chat_min_turns;
+  $('#set-minrounds').value = settings.history_min_turns || 4;
   $('#set-rerank').value = settings.rerank_url;
   $('#set-stream').checked = !!settings.stream;
   $('#set-visible').value = settings.visible_turns || 10;
@@ -1010,11 +1064,10 @@ function fillSettingsForm() {
   $('#set-avatar-size').value = settings.avatar_px || 88;
 }
 async function saveSettings(silent) {
-  settings.tiers = parseTiers($('#set-tiers').value);
-  settings.response_reserve = +$('#set-reserve').value || 4096;
-  settings.max_tokens = Math.min(32768, Math.max(256, +$('#set-maxtokens').value || 4096));
+  settings.context_window = Math.min(131072, Math.max(2048, +$('#set-window').value || 16384));
+  settings.reply_reserve = Math.min(65536, Math.max(256, +$('#set-reserve').value || 4096));
   settings.ui_scale = Math.min(150, Math.max(80, +$('#set-uiscale').value || 100));
-  settings.recent_chat_min_turns = +$('#set-minrounds').value || 4;
+  settings.history_min_turns = Math.min(50, Math.max(1, +$('#set-minrounds').value || 4));
   settings.rerank_url = $('#set-rerank').value.trim() || settings.rerank_url;
   settings.stream = $('#set-stream').checked;
   settings.visible_turns = Math.min(200, Math.max(5, +$('#set-visible').value || 10));
@@ -1029,7 +1082,9 @@ async function saveSettings(silent) {
   const body = {
     rerank_url: $('#set-rerank').value.trim(),
     user_name: settings.user_name,
-    max_tokens: settings.max_tokens,
+    context_window: settings.context_window,
+    reply_reserve: settings.reply_reserve,
+    history_min_turns: settings.history_min_turns,
   };
   if (upstreamDirty) body.upstream = $('#set-upstream').value.trim();
   if (apiKeyDirty && $('#set-apikey').value) body.api_key = $('#set-apikey').value;
@@ -1052,7 +1107,7 @@ function scheduleSettingsSave() {
   clearTimeout(settingsSaveTimer);
   settingsSaveTimer = setTimeout(() => saveSettings(true).catch((e) => toast('偏好保存失败：' + e.message, 'err')), 600);
 }
-['set-tiers', 'set-reserve', 'set-maxtokens', 'set-uiscale', 'set-minrounds', 'set-rerank', 'set-stream', 'set-visible', 'set-avatar-size', 'set-user']
+['set-window', 'set-reserve', 'set-uiscale', 'set-minrounds', 'set-rerank', 'set-stream', 'set-visible', 'set-avatar-size', 'set-user']
   .forEach((id) => { const el = document.getElementById(id); if (el) el.addEventListener('change', scheduleSettingsSave); });
 // upstream/key are saved only via the explicit button (dirty-tracked).
 let upstreamDirty = false, apiKeyDirty = false;

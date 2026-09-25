@@ -104,13 +104,8 @@ func TestResolveMCPTimeoutCancelsRequest(t *testing.T) {
 		MCPTopK:      10,
 		MCPThreshold: -1,
 	}
-	blocks := []engine.Block{{
-		ID: "rag_mcp", Enabled: true,
-		Source:   engine.Source{Type: "mcp"},
-		Template: "{{rag}}",
-	}}
 	started := time.Now()
-	info := resolveMCP(context.Background(), s, blocks, []engine.Message{{Role: "user", Content: "query"}})
+	_, info := resolveMCP(context.Background(), s, []engine.Message{{Role: "user", Content: "query"}})
 	if elapsed := time.Since(started); elapsed > 1500*time.Millisecond {
 		t.Fatalf("MCP timeout was not honored: %s", elapsed)
 	}

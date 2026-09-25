@@ -129,15 +129,42 @@ func renderBlocks(root, session, userName string, blocks []engine.Block) []engin
 
 // normalizeBlocks migrates legacy block data in place: the "character" block
 // must use source.type=="character" so the card is injected (older files had
-// it as "static"). The removed numeric priority is ignored on load and
-// dropped on save.
+// it as "static"). Retired fields are cleaned up: the per-block numeric
+// "max" cap (budget control moved to Level + L2 eviction) and the old
+// "vectra" RAG block (the RAG database is fully MCP now). Missing levels are
+// inferred from the block id/source for old presets.
 func normalizeBlocks(blocks []engine.Block) []engine.Block {
-	for i := range blocks {
-		if blocks[i].ID == "character" && blocks[i].Source.Type != "character" {
-			blocks[i].Source.Type = "character"
+	out := blocks[:0]
+	for _, b := range blocks {
+		if b.Source.Type == "vectra" {
+			continue // retired: RAG is fully MCP
 		}
+		if b.ID == "character" && b.Source.Type != "character" {
+			b.Source.Type = "character"
+		}
+		if b.Level < engine.LevelLocked || b.Level > engine.LevelElastic {
+			b.Level = defaultLevel(b)
+		}
+		b.Budget = engine.Budget{}
+		out = append(out, b)
 	}
-	return blocks
+	return out
+}
+
+// defaultLevel infers the eviction level for legacy blocks that predate the
+// L1/L2/L3 model.
+func defaultLevel(b engine.Block) engine.Level {
+	switch b.Source.Type {
+	case "chat", "mcp", "vectra":
+		return engine.LevelTrim
+	}
+	switch b.ID {
+	case "system", "time_anchor", "character", "distilled":
+		return engine.LevelLocked
+	case "rag_mcp", "rag_vectra", "chat":
+		return engine.LevelTrim
+	}
+	return engine.LevelElastic
 }
 
 func applyMacros(s string, now time.Time, userName string) string {

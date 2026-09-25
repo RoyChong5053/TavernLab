@@ -15,11 +15,11 @@ Prompt IDE + 薄Chat UI，替代 SillyTavern 臃肿部分。Plan v2 定案。
 
 ## 核心抽象
 
-- `order` = 放哪里，`priority` = 超预算谁先被压
-  - LOCKED(100): time_anchor, system
-  - HIGH(90): character, 最近4轮, distilled
-  - ELASTIC(40): RAG, 旧chat
-- Context Budget = MaxTokens - ResponseReserve，默认 `16384-4096`
+- `order` = 放哪里；`Level` = 超预算时谁先被淘汰
+  - L1 locked: time_anchor, system, character, distilled（永不裁剪）
+  - L2 trim: RAG 命中、chat（按 rerank 分数 / 轮龄淘汰，保底 4 轮）
+  - L3 elastic: 实验性 block（空间不够整个先砍）
+- Context Budget = `context_window − reply_reserve`，默认 `16384 − 4096 = 12288`（reply_reserve 同时作为上游 max_tokens）
 - Audit 即核心：每次生成存 `data/audit/<id>.json`（各块tokens/Dropped/raw/reply/upstream usage），支持 Replay / Edit&Replay
 
 ## 运行

@@ -62,6 +62,22 @@ type runtimeSettings struct {
 	cur settings.Settings
 }
 
+// ctxFromSettings builds the engine's ContextConfig. Settings are the single
+// source of truth for web + app so both clients behave identically.
+func ctxFromSettings(s settings.Settings) engine.ContextConfig {
+	c := engine.DefaultConfig()
+	if s.ContextWindow > 0 {
+		c.Window = s.ContextWindow
+	}
+	if s.ReplyReserve > 0 {
+		c.ReplyReserve = s.ReplyReserve
+	}
+	if s.HistoryMinTurns > 0 {
+		c.HistoryMinTurns = s.HistoryMinTurns
+	}
+	return c
+}
+
 func (r *runtimeSettings) get() settings.Settings {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -126,7 +142,16 @@ func (r *runtimeSettings) update(root string, patch map[string]any) settings.Set
 		r.cur.MCPPerHitChars = int(v)
 	}
 	if v, ok := patch["max_tokens"].(float64); ok && v > 0 {
-		r.cur.MaxTokens = int(v)
+		r.cur.ReplyReserve = int(v)
+	}
+	if v, ok := patch["context_window"].(float64); ok && v > 0 {
+		r.cur.ContextWindow = int(v)
+	}
+	if v, ok := patch["reply_reserve"].(float64); ok && v > 0 {
+		r.cur.ReplyReserve = int(v)
+	}
+	if v, ok := patch["history_min_turns"].(float64); ok && v > 0 {
+		r.cur.HistoryMinTurns = int(v)
 	}
 	if v, ok := patch["current_char"].(string); ok && v != "" {
 		r.cur.CurrentChar = v
@@ -204,7 +229,7 @@ func main() {
 		Port: *port, DataRoot: *data, Upstream: rt.get().Upstream,
 		APIKey:        rt.get().APIKey,
 		DefaultBlocks: engine.DefaultBlocks(),
-		Ctx:           engine.DefaultConfig(),
+		Ctx:           ctxFromSettings(rt.get()),
 	}
 	st := store.New(cfg.DataRoot)
 	st.MigrateLegacyChats()
@@ -329,7 +354,7 @@ func main() {
 				"mcp_url": s.MCPURL, "mcp_collection": s.MCPCollection,
 				"mcp_enabled": s.MCPEnabled, "mcp_topk": s.MCPTopK, "mcp_timeout": s.MCPTimeout, "mcp_threshold": s.MCPThreshold,
 				"mcp_budget_tokens": s.MCPBudgetTokens, "mcp_per_hit_chars": s.MCPPerHitChars,
-				"max_tokens":   s.MaxTokens,
+				"context_window": s.ContextWindow, "reply_reserve": s.ReplyReserve, "history_min_turns": s.HistoryMinTurns,
 				"current_char": s.CurrentChar, "user_name": s.UserName,
 				"ntfy_url": s.NtfyURL, "ntfy_topic": s.NtfyTopic,
 				"distill_enabled": s.DistillEnabled, "distill_interval": s.DistillInterval,
@@ -503,8 +528,8 @@ func main() {
 			blocks = loadBlocks()
 		}
 		ctx := in.Context
-		if len(ctx.Tiers) == 0 && ctx.MaxTokens == 0 {
-			ctx = cfg.Ctx
+		if ctx.Window <= 0 {
+			ctx = ctxFromSettings(rt.get())
 		}
 		session := firstNonEmpty(in.Session, rt.get().CurrentChar, "main")
 		turns := engineTurns(in.Chat)
@@ -514,11 +539,11 @@ func main() {
 			}
 		}
 		blocks = renderBlocks(cfg.DataRoot, session, rt.get().UserName, blocks)
-		memInfo := resolveMCP(r.Context(), rt.get(), blocks, turns)
-		res := engine.Assemble(engine.Input{Blocks: blocks, Cfg: ctx, Turns: turns})
+		ragItems, memInfo := resolveMCP(r.Context(), rt.get(), turns)
+		res := engine.Assemble(engine.Input{Blocks: blocks, Cfg: ctx, Turns: turns, Lists: listInputs(blocks, ragItems)})
 		out := map[string]any{
 			"messages": res.Messages, "blocks": res.Blocks, "total_tokens": res.TotalTok,
-			"budget_tokens": res.BudgetTok, "tier": res.Tier, "overflow": res.Overflow,
+			"budget_tokens": res.BudgetTok, "window": res.Window, "overflow": res.Overflow,
 			"dropped": res.Dropped, "prompt_text": res.PromptText,
 			"memory": memInfo,
 		}
@@ -547,8 +572,8 @@ func main() {
 			blocks = loadBlocks()
 		}
 		ctx := in.Context
-		if len(ctx.Tiers) == 0 && ctx.MaxTokens == 0 {
-			ctx = cfg.Ctx
+		if ctx.Window <= 0 {
+			ctx = ctxFromSettings(s)
 		}
 		session := store.CleanSession(firstNonEmpty(in.Session, s.CurrentChar, "main"))
 		// New path: frontend sends only the fresh message; full context slides
@@ -579,18 +604,19 @@ func main() {
 			turns = rawToTurns(in.Messages)
 		}
 		blocks = renderBlocks(cfg.DataRoot, session, s.UserName, blocks)
-		memInfo := resolveMCP(r.Context(), s, blocks, turns)
-		res := engine.Assemble(engine.Input{Blocks: blocks, Cfg: ctx, Turns: turns})
-
-		// Build upstream body from assembled messages (attach fresh images).
-		upMsgs := buildUpMessages(res.Messages, upImages)
 		model := in.Model
 		if model == nil || model == "" {
 			model = "default"
 		}
+		setActiveModel(fmt.Sprint(model))
+		ragItems, memInfo := resolveMCP(r.Context(), s, turns)
+		res := engine.Assemble(engine.Input{Blocks: blocks, Cfg: ctx, Turns: turns, Lists: listInputs(blocks, ragItems)})
+
+		// Build upstream body from assembled messages (attach fresh images).
+		upMsgs := buildUpMessages(res.Messages, upImages)
 		maxTokens := in.MaxTokens
 		if maxTokens <= 0 {
-			maxTokens = s.MaxTokens
+			maxTokens = s.ReplyReserve
 		}
 		if maxTokens <= 0 {
 			maxTokens = 4096
@@ -616,7 +642,7 @@ func main() {
 			_ = st.SaveAudit(toAudit(auditID, model, res, upBody, rebuilt, usage, memInfo))
 			reply := strings.TrimSpace(rebuiltText(rebuilt))
 			logTurn("chat.stream", status, model, session, res, reply, memInfo, usagePromptTokens(usage))
-			updateCalibration(cfg.DataRoot, res.TotalTok, usagePromptTokens(usage))
+			updateCalibration(cfg.DataRoot, fmt.Sprint(model), res.TotalTok, usagePromptTokens(usage))
 			if reply != "" {
 				msg, _ := st.AppendChat(session, "assistant", reply)
 				events.publish(session, msg)
@@ -632,7 +658,7 @@ func main() {
 		_ = st.SaveAudit(toAudit(auditID, model, res, upBody, respBody, usage, memInfo))
 		reply := strings.TrimSpace(replyText(respBody))
 		logTurn("chat", status, model, session, res, reply, memInfo, usagePromptTokens(usage))
-		updateCalibration(cfg.DataRoot, res.TotalTok, usagePromptTokens(usage))
+		updateCalibration(cfg.DataRoot, fmt.Sprint(model), res.TotalTok, usagePromptTokens(usage))
 		if status >= 400 {
 			obs.Warn("upstream error", map[string]any{"path": "/v1/chat/completions", "status": status, "body": excerpt(string(respBody), 300)})
 		}
@@ -1052,10 +1078,15 @@ func main() {
 		all, _ := st.LoadAll(session)
 		turns := chatToTurns(cfg.DataRoot, session, all)
 		blocks := renderBlocks(cfg.DataRoot, session, s.UserName, loadBlocks())
-		memInfo := resolveMCP(r.Context(), s, blocks, turns)
-		res := engine.Assemble(engine.Input{Blocks: blocks, Cfg: cfg.Ctx, Turns: turns})
+		setActiveModel(model)
+		ragItems, memInfo := resolveMCP(r.Context(), s, turns)
+		res := engine.Assemble(engine.Input{Blocks: blocks, Cfg: ctxFromSettings(s), Turns: turns, Lists: listInputs(blocks, ragItems)})
 		upMsgs := buildUpMessages(res.Messages, upImages)
-		upBody := streamUpBody(model, upMsgs, in.Stream, s.MaxTokens)
+		mt := s.ReplyReserve
+		if mt <= 0 {
+			mt = 4096
+		}
+		upBody := streamUpBody(model, upMsgs, in.Stream, mt)
 		auditID := time.Now().Format("20060102-150405.000")
 
 		if !in.Stream {
@@ -1063,7 +1094,7 @@ func main() {
 			reply := replyText(respBody)
 			_ = st.SaveAudit(toAudit(auditID, model, res, upBody, respBody, usage, memInfo))
 			logTurn("app.request", status, model, session, res, reply, memInfo, usagePromptTokens(usage))
-			updateCalibration(cfg.DataRoot, res.TotalTok, usagePromptTokens(usage))
+			updateCalibration(cfg.DataRoot, fmt.Sprint(model), res.TotalTok, usagePromptTokens(usage))
 			if status >= 400 {
 				obs.Warn("upstream error", map[string]any{"path": "/api/chat", "status": status, "body": excerpt(string(respBody), 300)})
 			}
@@ -1106,7 +1137,7 @@ func main() {
 		rebuilt, _ := json.Marshal(rebuiltBody)
 		_ = st.SaveAudit(toAudit(auditID, model, res, upBody, rebuilt, usage, memInfo))
 		logTurn("app.stream", status, model, session, res, strings.TrimSpace(full), memInfo, usagePromptTokens(usage))
-		updateCalibration(cfg.DataRoot, res.TotalTok, usagePromptTokens(usage))
+		updateCalibration(cfg.DataRoot, fmt.Sprint(model), res.TotalTok, usagePromptTokens(usage))
 		if strings.TrimSpace(full) != "" {
 			msg, _ := st.AppendChat(session, "assistant", full)
 			events.publish(session, msg)
@@ -1245,7 +1276,7 @@ func toAudit(id string, model any, res engine.AssembleResult, upBody, respBody [
 	}
 	rows := make([]store.BlockRow, 0, len(res.Blocks))
 	for _, b := range res.Blocks {
-		rows = append(rows, store.BlockRow{ID: b.ID, Role: b.Role, Order: b.Order, Tokens: b.Tokens, Cut: b.Truncated, Note: b.DroppedNote})
+		rows = append(rows, store.BlockRow{ID: b.ID, Role: b.Role, Order: b.Order, Level: b.Level, Tokens: b.Tokens, Cut: b.Truncated, Note: b.DroppedNote})
 	}
 	actual := 0
 	completion := 0
@@ -1281,7 +1312,7 @@ func toAudit(id string, model any, res engine.AssembleResult, upBody, respBody [
 	}
 	return store.Audit{
 		ID: id, Time: time.Now().Format(time.RFC3339), Model: mName,
-		Tier: res.Tier, Overflow: res.Overflow,
+		Window: res.Window, Overflow: res.Overflow,
 		Budget: res.BudgetTok, TotalTok: res.TotalTok, Estimate: res.TotalTok, Actual: actual,
 		Completion: completion, Finish: finish, StreamError: streamErr, MaxTokens: maxTok, ImageCount: imgCount,
 		Blocks:  rows,
@@ -1318,18 +1349,28 @@ func loadCharMeta(base string) map[string]any {
 // through verbatim (no name prefix) — prefixing used to teach the model to
 // emit "角色名: " in its own replies; attribution for export comes from
 // timelineMD instead, which reads the JSONL directly.
+//
+// Only the newest user turn's images are actually attached upstream (see
+// buildUpMessages), so only that turn carries ImageTokens. Counting older
+// images used to inflate the estimate and shrink the sliding window for a
+// payload that was never sent.
 func chatToTurns(root, session string, msgs []store.ChatMessage) []engine.Message {
 	turns := make([]engine.Message, 0, len(msgs))
+	lastUser := -1
+	var lastImgs []string
 	for _, m := range msgs {
 		role := m.Role
 		if role != "user" && role != "assistant" && role != "system" {
 			continue // e.g. distilled_memory: recorded in JSONL, injected as a block
 		}
-		turns = append(turns, engine.Message{
-			Role:        role,
-			Content:     m.Text,
-			ImageTokens: imageTokensForMedia(root, session, m.Images),
-		})
+		turns = append(turns, engine.Message{Role: role, Content: m.Text})
+		if role == "user" {
+			lastUser = len(turns) - 1
+			lastImgs = m.Images
+		}
+	}
+	if lastUser >= 0 && len(lastImgs) > 0 {
+		turns[lastUser].ImageTokens = imageTokensForMedia(root, session, lastImgs)
 	}
 	return turns
 }
@@ -1768,13 +1809,15 @@ func searchMCP(ctx context.Context, s settings.Settings, query string) ([]memory
 	return hits, err
 }
 
-// resolveMCP fills enabled mcp-source blocks by searching rag-mcp-server with
-// the latest user utterance. Fail-open: errors are recorded, chat continues.
-// Returns an audit-friendly summary (also served by /api/assemble preview).
-func resolveMCP(ctx context.Context, s settings.Settings, blocks []engine.Block, chat []engine.Message) map[string]any {
+// resolveMCP searches rag-mcp-server with the latest user utterance and
+// returns the hits as engine list items (best-first, ranked by reranker
+// score) plus an audit-friendly summary. Fail-open: errors are recorded and
+// the chat continues. The engine then decides how many chunks survive under
+// budget pressure (lowest score evicted first).
+func resolveMCP(ctx context.Context, s settings.Settings, chat []engine.Message) ([]engine.Item, map[string]any) {
 	info := map[string]any{"enabled": false}
 	if !s.MCPEnabled {
-		return info
+		return nil, info
 	}
 	info["enabled"] = true
 	info["collection"] = firstNonEmpty(s.MCPCollection, "(server default)")
@@ -1782,17 +1825,17 @@ func resolveMCP(ctx context.Context, s settings.Settings, blocks []engine.Block,
 	info["query"] = query
 	if query == "" {
 		info["hits"] = 0
-		return info
+		return nil, info
 	}
 	hits, err := searchMCP(ctx, s, query)
 	if err != nil {
 		info["error"] = err.Error()
 		info["hits"] = 0
-		return info
+		return nil, info
 	}
 	// Budget mode: doc count is decided by rag-mcp-server (top_k is only a hint).
-	// TavernLab only enforces a token/char window so a 500char/chunk backend
-	// behind a 1024-token jina reranker never blows the prompt.
+	// TavernLab enforces a coarse token/char cap here; the engine does the fine
+	// per-chunk eviction by score.
 	budget := s.MCPBudgetTokens
 	if budget <= 0 {
 		budget = 2000
@@ -1801,7 +1844,8 @@ func resolveMCP(ctx context.Context, s settings.Settings, blocks []engine.Block,
 	if perHit <= 0 {
 		perHit = 2000
 	}
-	kept := hits[:0]
+	sort.SliceStable(hits, func(i, j int) bool { return hits[i].Score > hits[j].Score })
+	var items []engine.Item
 	used := 0
 	for _, h := range hits {
 		t := h.Text
@@ -1809,34 +1853,39 @@ func resolveMCP(ctx context.Context, s settings.Settings, blocks []engine.Block,
 			t = string(r[:perHit]) + "\n[…per-hit truncated…]"
 		}
 		cost := engine.EstimateTokens(t)
-		if used+cost > budget && len(kept) > 0 {
+		if used+cost > budget && len(items) > 0 {
 			break
 		}
-		h.Text = t
-		kept = append(kept, h)
+		items = append(items, engine.Item{Text: t, EvictRank: h.Score})
 		used += cost
 	}
-	hits = kept
-	text := mcp.Format(hits)
-	for i := range blocks {
-		if blocks[i].Source.Type == "mcp" && blocks[i].Enabled {
-			if strings.Contains(blocks[i].Template, "{{rag}}") {
-				blocks[i].Content = strings.ReplaceAll(blocks[i].Template, "{{rag}}", text)
-			} else {
-				blocks[i].Content = text
-			}
-		}
-	}
-	info["hits"] = len(hits)
+	info["hits"] = len(items)
 	info["budget_tokens"] = budget
 	info["used_tokens"] = used
 	info["per_hit_chars"] = perHit
-	info["note"] = "top_k仅为服务端hint，数量由rag-mcp-server定；TavernLab只按token预算裁剪"
-	if len(hits) > 0 {
-		top := hits[0]
-		info["top"] = map[string]any{"score": top.Score, "source": top.Source, "excerpt": excerpt(top.Text, 160)}
+	info["note"] = "top_k仅为服务端hint；L2按reranker分数在引擎内淘汰最低分"
+	if len(items) > 0 {
+		info["top"] = map[string]any{"score": items[0].EvictRank, "excerpt": excerpt(items[0].Text, 160)}
 	}
-	return info
+	return items, info
+}
+
+// listInputs binds the RAG hits to every enabled mcp/vectra block so the
+// engine treats them as L2 evictable lists.
+func listInputs(blocks []engine.Block, rag []engine.Item) []engine.ItemList {
+	if len(rag) == 0 {
+		return nil
+	}
+	var out []engine.ItemList
+	for _, b := range blocks {
+		if !b.Enabled {
+			continue
+		}
+		if b.Source.Type == "mcp" || b.Source.Type == "vectra" {
+			out = append(out, engine.ItemList{BlockID: b.ID, Items: rag, Floor: 0, FloorFromHead: true, Weight: 1})
+		}
+	}
+	return out
 }
 
 // logTurn emits one structured line per generation so the Logs page shows
@@ -1844,7 +1893,7 @@ func resolveMCP(ctx context.Context, s settings.Settings, blocks []engine.Block,
 func logTurn(kind string, status int, model any, session string, res engine.AssembleResult, reply string, mem map[string]any, actual int) {
 	fields := map[string]any{
 		"kind": kind, "status": status, "model": fmt.Sprint(model), "session": session,
-		"tier": res.Tier, "tokens": res.TotalTok, "overflow": res.Overflow,
+		"window": res.Window, "budget": res.BudgetTok, "tokens": res.TotalTok, "overflow": res.Overflow,
 		"reply_len": len(reply),
 	}
 	if actual > 0 {

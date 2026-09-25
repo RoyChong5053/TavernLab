@@ -12,28 +12,34 @@ import (
 
 // Settings is the runtime-tunable config. Empty APIKey on PUT means "keep".
 type Settings struct {
-	Upstream          string  `json:"upstream,omitempty"`
-	APIKey            string  `json:"api_key,omitempty"`
-	RerankURL         string  `json:"rerank_url,omitempty"`
-	MCPURL            string  `json:"mcp_url,omitempty"`
-	MCPCollection     string  `json:"mcp_collection,omitempty"`
-	MCPEnabled        bool    `json:"mcp_enabled"`
-	MCPTopK           int     `json:"mcp_topk,omitempty"`
-	MCPTimeout        int     `json:"mcp_timeout,omitempty"`
-	MCPThreshold      float64 `json:"mcp_threshold,omitempty"`     // <0 = omit (server default)
-	MCPBudgetTokens   int     `json:"mcp_budget_tokens,omitempty"` // token budget for injected memory (default 2000)
-	MCPPerHitChars    int     `json:"mcp_per_hit_chars,omitempty"` // per-hit char cap (default 2000, backend chunks ~500char, jina cap 1024tok)
-	MaxTokens         int     `json:"max_tokens,omitempty"`        // upstream generation cap, independent of response_reserve (default 4096)
-	CurrentChar       string  `json:"current_char,omitempty"`      // source of truth for web + app
-	UserName          string  `json:"user_name,omitempty"`         // export attribution / {{user}}
-	NtfyURL           string  `json:"ntfy_url,omitempty"`          // self-hosted ntfy base, empty = disabled
-	NtfyTopic         string  `json:"ntfy_topic,omitempty"`
-	DistillEnabled    bool    `json:"distill_enabled"`               // auto-distill every N user turns
-	DistillInterval   int     `json:"distill_interval,omitempty"`    // user turns between runs (default 8)
-	DistillMaxChars   int     `json:"distill_max_chars,omitempty"`   // fact-sheet character budget (default 4000)
-	DistillRetainDays int     `json:"distill_retain_days,omitempty"` // always keep at least N days (default 3)
-	DistillModel      string  `json:"distill_model,omitempty"`       // empty = main model
-	DistillPrompt     string  `json:"distill_prompt,omitempty"`      // empty = built-in default
+	Upstream        string  `json:"upstream,omitempty"`
+	APIKey          string  `json:"api_key,omitempty"`
+	RerankURL       string  `json:"rerank_url,omitempty"`
+	MCPURL          string  `json:"mcp_url,omitempty"`
+	MCPCollection   string  `json:"mcp_collection,omitempty"`
+	MCPEnabled      bool    `json:"mcp_enabled"`
+	MCPTopK         int     `json:"mcp_topk,omitempty"`
+	MCPTimeout      int     `json:"mcp_timeout,omitempty"`
+	MCPThreshold    float64 `json:"mcp_threshold,omitempty"`     // <0 = omit (server default)
+	MCPBudgetTokens int     `json:"mcp_budget_tokens,omitempty"` // token budget for injected memory (default 2000)
+	MCPPerHitChars  int     `json:"mcp_per_hit_chars,omitempty"` // per-hit char cap (default 2000, backend chunks ~500char, jina cap 1024tok)
+	// Context budget (SillyTavern-style): ContextWindow is the total
+	// (input + reply), ReplyReserve is held back for the answer. input =
+	// ContextWindow - ReplyReserve. ReplyReserve is also sent upstream as
+	// max_tokens, so it is the single "reply length" knob.
+	ContextWindow     int    `json:"context_window,omitempty"`    // default 16384
+	ReplyReserve      int    `json:"reply_reserve,omitempty"`     // default 4096
+	HistoryMinTurns   int    `json:"history_min_turns,omitempty"` // chat rounds kept above the floor (default 4)
+	CurrentChar       string `json:"current_char,omitempty"`      // source of truth for web + app
+	UserName          string `json:"user_name,omitempty"`         // export attribution / {{user}}
+	NtfyURL           string `json:"ntfy_url,omitempty"`          // self-hosted ntfy base, empty = disabled
+	NtfyTopic         string `json:"ntfy_topic,omitempty"`
+	DistillEnabled    bool   `json:"distill_enabled"`               // auto-distill every N user turns
+	DistillInterval   int    `json:"distill_interval,omitempty"`    // user turns between runs (default 8)
+	DistillMaxChars   int    `json:"distill_max_chars,omitempty"`   // fact-sheet character budget (default 4000)
+	DistillRetainDays int    `json:"distill_retain_days,omitempty"` // always keep at least N days (default 3)
+	DistillModel      string `json:"distill_model,omitempty"`       // empty = main model
+	DistillPrompt     string `json:"distill_prompt,omitempty"`      // empty = built-in default
 	// Login gate (server-side only: flags/env or direct file edit + restart;
 	// the WebUI can never change these). Empty AdminUser = auth disabled.
 	AdminUser           string `json:"admin_user,omitempty"`
@@ -55,7 +61,9 @@ func Defaults() Settings {
 		MCPThreshold:      -1,
 		MCPBudgetTokens:   2000,
 		MCPPerHitChars:    2000,
-		MaxTokens:         4096,
+		ContextWindow:     16384,
+		ReplyReserve:      4096,
+		HistoryMinTurns:   4,
 		CurrentChar:       "Leer乐儿",
 		UserName:          "RoyChong",
 		DistillInterval:   8,
@@ -106,8 +114,26 @@ func Load(root string) Settings {
 	if f.MCPPerHitChars > 0 {
 		s.MCPPerHitChars = f.MCPPerHitChars
 	}
-	if f.MaxTokens > 0 {
-		s.MaxTokens = f.MaxTokens
+	if f.ContextWindow > 0 {
+		s.ContextWindow = f.ContextWindow
+	}
+	if f.ReplyReserve > 0 {
+		s.ReplyReserve = f.ReplyReserve
+	} else {
+		// Migration from the pre-2026-09-26 fields.
+		var legacy struct {
+			MaxTokens       int `json:"max_tokens"`
+			ResponseReserve int `json:"response_reserve"`
+		}
+		_ = json.Unmarshal(b, &legacy)
+		if legacy.MaxTokens > 0 {
+			s.ReplyReserve = legacy.MaxTokens
+		} else if legacy.ResponseReserve > 0 {
+			s.ReplyReserve = legacy.ResponseReserve
+		}
+	}
+	if f.HistoryMinTurns > 0 {
+		s.HistoryMinTurns = f.HistoryMinTurns
 	}
 	if f.CurrentChar != "" {
 		s.CurrentChar = f.CurrentChar

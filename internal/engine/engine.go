@@ -1,19 +1,36 @@
 // Package engine implements the Context Budget Engine.
 //
-// Design (priority removed 2026-09-23):
-//   - order decides WHERE a block lands in the final prompt.
-//   - There is no numeric priority. Budget control is deterministic:
-//     pre-compute every block's tokens, pick the smallest window tier that
-//     fits, then fill the recent-chat window from the newest turn backwards.
-//     Recent conversation is therefore never evicted by a large RAG block or
-//     a heavy image payload — older turns are dropped instead.
-//   - Window tiers are 8k / 16k / 32k (configurable). Exceeding the largest
-//     tier is surfaced as Overflow (a system error), never silently sent.
+// Design (2026-09-26: sliding-window rewrite):
+//   - context_window is the TOTAL budget (input + reply), SillyTavern-style.
+//     input_budget = context_window - reply_reserve.
+//   - Every block carries a Level:
+//   - L1 LevelLocked  : never trimmed. If L1 alone exceeds input_budget the
+//     result is Overflow (a system error), never a silent send.
+//   - L2 LevelTrim    : evictable, kept above a floor. Chat turns and RAG hits
+//     share ONE eviction primitive (an ordered unit list + eviction rank +
+//     floor), so a future source (news cards, ...) plugs in with no new code.
+//   - L3 LevelElastic : dropped entirely before any L2 item is touched.
+//
+// Eviction is global across all L2 lists by a normalised 0..1 "staleness /
+// irrelevance" rank (0 = cut first): chat is ranked by age (oldest first),
+// RAG by reranker score (lowest first). Floors protect the newest turns and
+// the best hits.
 package engine
 
 import (
+	"math"
 	"sort"
 	"strings"
+)
+
+// Level is the eviction tier. Zero value is treated as LevelLocked for
+// legacy block data (safest: never silently trimmed).
+type Level int
+
+const (
+	LevelLocked  Level = 1 // L1: never trimmed
+	LevelTrim    Level = 2 // L2: evictable, guarded by a floor
+	LevelElastic Level = 3 // L3: dropped entirely first
 )
 
 // Block is a single prompt unit in the IDE.
@@ -22,16 +39,18 @@ type Block struct {
 	Role     string `json:"role"` // system | user | assistant
 	Order    int    `json:"order"`
 	Enabled  bool   `json:"enabled"`
+	Level    Level  `json:"level"`
 	Budget   Budget `json:"budget"`
 	Source   Source `json:"source"`
 	Template string `json:"template"`
 	// Content is resolved text for this turn (after source fetch +
-	// template render). Empty means "use Template as-is".
+	// template render). Empty means "use Template as-is" or "filled from a
+	// list source at assemble time".
 	Content string `json:"content,omitempty"`
 }
 
 // Budget per block. Max=0 means no cap; Min is retained for data
-// compatibility but the new engine does not use it.
+// compatibility but the engine does not use it.
 type Budget struct {
 	Max int `json:"max"` // 0 = no cap
 	Min int `json:"min,omitempty"`
@@ -39,37 +58,51 @@ type Budget struct {
 
 // Source describes where block content comes from.
 type Source struct {
-	Type       string `json:"type"` // static | character | chat | distilled | vectra | mcp
+	Type       string `json:"type"` // static | character | chat | distilled | vectra | mcp | list
 	Collection string `json:"collection,omitempty"`
 }
 
-// ContextConfig is the global budget. Tiers is an ascending list of window
-// sizes; the engine picks the smallest one that fits. MaxTokens (legacy)
-// forces a single fixed window when Tiers is empty.
+// ContextConfig is the global budget. Window is the total context (input +
+// reply) and ReplyReserve is what is held back for the model's answer; the
+// input budget the sliding window fills is Window - ReplyReserve.
 type ContextConfig struct {
-	Tiers             []int `json:"tiers"`
-	ResponseReserve   int   `json:"response_reserve"`
-	RecentChatMinTurn int   `json:"recent_chat_min_turns"`
-	MaxTokens         int   `json:"max_tokens"` // legacy fixed-window fallback
+	Window          int `json:"context_window"`
+	ReplyReserve    int `json:"reply_reserve"`
+	HistoryMinTurns int `json:"history_min_turns"`
 }
 
-// DefaultConfig: 8k/16k/32k auto tiers, 4k reserved for the reply, at least
-// the last 4 turns always kept.
+// DefaultConfig: 16k total window, 4k reply, keep at least 4 rounds of chat.
 func DefaultConfig() ContextConfig {
-	return ContextConfig{
-		Tiers:             []int{8192, 16384, 32768},
-		ResponseReserve:   4096,
-		RecentChatMinTurn: 4,
-	}
+	return ContextConfig{Window: 16384, ReplyReserve: 4096, HistoryMinTurns: 4}
 }
 
 // Message is an OpenAI-style chat message. ImageTokens carries the estimated
-// cost of any images attached to this turn (0 for text-only) so the budget
-// engine reserves room for multimodal payloads it cannot see in Content.
+// cost of the images actually sent on this turn so the budget engine reserves
+// room for the multimodal payload it cannot see in Content.
 type Message struct {
 	Role        string `json:"role"`
 	Content     string `json:"content"`
 	ImageTokens int    `json:"image_tokens,omitempty"`
+}
+
+// Item is one evictable unit inside an L2 list block (a chat turn, a RAG hit,
+// a future news card...). EvictRank is a normalised 0..1 score where LOWER is
+// evicted first; it is only used for non-chat lists (chat is ranked by age).
+type Item struct {
+	Role        string  `json:"role,omitempty"`
+	Text        string  `json:"text"`
+	ImageTokens int     `json:"image_tokens,omitempty"`
+	EvictRank   float64 `json:"evict_rank,omitempty"`
+}
+
+// ItemList binds evictable items to a block id (chat blocks build their list
+// from Input.Turns instead).
+type ItemList struct {
+	BlockID       string
+	Items         []Item
+	Floor         int  // min items to keep
+	FloorFromHead bool // true: protect the first N items (best-scored first)
+	Weight        float64
 }
 
 // BlockUsage is per-block audit info.
@@ -77,6 +110,7 @@ type BlockUsage struct {
 	ID          string `json:"id"`
 	Role        string `json:"role"`
 	Order       int    `json:"order"`
+	Level       int    `json:"level"`
 	Tokens      int    `json:"tokens"`
 	Truncated   bool   `json:"truncated"`
 	DroppedNote string `json:"dropped_note,omitempty"`
@@ -87,8 +121,8 @@ type AssembleResult struct {
 	Messages   []Message    `json:"messages"`
 	Blocks     []BlockUsage `json:"blocks"`
 	TotalTok   int          `json:"total_tokens"`
-	BudgetTok  int          `json:"budget_tokens"`
-	Tier       int          `json:"tier"`
+	BudgetTok  int          `json:"budget_tokens"` // input budget
+	Window     int          `json:"window"`
 	Overflow   bool         `json:"overflow"`
 	Dropped    []string     `json:"dropped"`
 	PromptText string       `json:"prompt_text"`
@@ -98,7 +132,8 @@ type AssembleResult struct {
 type Input struct {
 	Blocks []Block
 	Cfg    ContextConfig
-	Turns  []Message // structured chat history, oldest first (newest last)
+	Turns  []Message  // structured chat history, oldest first (newest last)
+	Lists  []ItemList // extra L2 list sources (RAG hits, future cards)
 }
 
 // EstimateTokens is a script-aware heuristic: CJK/kana/hangul runs count
@@ -135,252 +170,363 @@ func isWide(r rune) bool {
 	return false
 }
 
-// Assembled messages size for a turn (role + content overhead is small; we
-// count content plus a flat per-message overhead).
+// msgOverhead approximates the per-message role/format overhead.
 const msgOverhead = 4
 
-func turnsTokens(turns []Message) []int {
-	out := make([]int, len(turns))
-	for i, t := range turns {
-		out[i] = EstimateTokens(t.Content) + msgOverhead + t.ImageTokens
-	}
-	return out
+// l2List is the runtime form of an L2 evictable list.
+type l2List struct {
+	id        string
+	role      string
+	order     int
+	isChat    bool
+	tmpl      string
+	items     []Item
+	tok       []int
+	rank      []float64
+	protected []bool
+	keep      []bool
+	weight    float64
+	sumAll    int
 }
 
 // Assemble builds the final prompt.
-//
-// Steps:
-//  1. Keep enabled, non-empty blocks; apply each block's Budget.Max cap.
-//  2. Separate the chat block (source.type=="chat") from fixed blocks.
-//  3. fixedTok = sum of fixed blocks. Pick the smallest tier where
-//     fixedTok + (last RecentChatMinTurn turns) fits in tier-reserve.
-//  4. Fill the remaining budget with turns newest-first.
-//  5. If even the largest tier cannot hold fixed + min turns -> Overflow
-//     and best-effort trim elastic blocks.
 func Assemble(in Input) AssembleResult {
 	cfg := in.Cfg
-	if len(cfg.Tiers) == 0 {
-		if cfg.MaxTokens > 0 {
-			cfg.Tiers = []int{cfg.MaxTokens}
-		} else {
-			cfg.Tiers = []int{16384}
-		}
+	if cfg.Window <= 0 {
+		cfg.Window = 16384
 	}
-	sort.Ints(cfg.Tiers)
-	if cfg.ResponseReserve < 0 {
-		cfg.ResponseReserve = 0
+	if cfg.ReplyReserve < 0 {
+		cfg.ReplyReserve = 0
+	}
+	minTurns := cfg.HistoryMinTurns
+	if minTurns <= 0 {
+		minTurns = 4
+	}
+	minMsgs := minTurns * 2
+
+	inputBudget := cfg.Window - cfg.ReplyReserve
+	if inputBudget < 0 {
+		inputBudget = 0
 	}
 
 	var dropped []string
-	fixed := make([]Block, 0, len(in.Blocks))
-	chatEnabled := false
-	chatOrder := 1 << 30
+
+	lockedText := map[string]string{}
+	lockedTok := map[string]int{}
+	elasticText := map[string]string{}
+	elasticTok := map[string]int{}
+	l2byID := map[string]*l2List{}
+	var l2order []string
+
+	listByID := map[string]ItemList{}
+	for _, il := range in.Lists {
+		listByID[il.BlockID] = il
+	}
+
+	// Enabled blocks in prompt order (also the emission order later).
+	ordered := make([]Block, 0, len(in.Blocks))
 	for _, b := range in.Blocks {
 		if !b.Enabled {
 			dropped = append(dropped, b.ID+" (disabled)")
 			continue
 		}
+		ordered = append(ordered, b)
+	}
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i].Order < ordered[j].Order })
+
+	// Classify blocks into L1 / L2 / L3.
+	for _, b := range ordered {
+		if b.Source.Type == "chat" {
+			items := make([]Item, len(in.Turns))
+			for i, t := range in.Turns {
+				items[i] = Item{Role: t.Role, Text: t.Content, ImageTokens: t.ImageTokens}
+			}
+			l2byID[b.ID] = &l2List{id: b.ID, role: b.Role, order: b.Order, isChat: true, items: items, weight: 1}
+			l2order = append(l2order, b.ID)
+			continue
+		}
+		if il, ok := listByID[b.ID]; ok {
+			l := &l2List{id: b.ID, role: b.Role, order: b.Order, tmpl: b.Template, items: il.Items, weight: il.Weight}
+			if l.weight <= 0 {
+				l.weight = 1
+			}
+			n := len(l.items)
+			l.protected = make([]bool, n)
+			f := il.Floor
+			if f > n {
+				f = n
+			}
+			if il.FloorFromHead {
+				for i := 0; i < f; i++ {
+					l.protected[i] = true
+				}
+			} else {
+				for i := n - f; i < n; i++ {
+					if i >= 0 {
+						l.protected[i] = true
+					}
+				}
+			}
+			l2byID[b.ID] = l
+			l2order = append(l2order, b.ID)
+			continue
+		}
+		// Fixed text block.
 		text := b.Content
 		if text == "" {
 			text = b.Template
-		}
-		if b.Source.Type == "chat" {
-			chatEnabled = true
-			chatOrder = b.Order
-			continue // turns are structured, not part of fixed text
 		}
 		if strings.TrimSpace(text) == "" {
 			dropped = append(dropped, b.ID+" (empty)")
 			continue
 		}
-		// Content empty + unresolved macro in the template means no source
-		// filled this block (e.g. distilled/vectra not wired yet). Sending the
-		// literal "{{...}}" would pollute the prompt, so drop it.
+		// Unresolved macro with no resolved content means no source filled it
+		// (e.g. distilled/vectra not wired). Sending the literal "{{...}}"
+		// would pollute the prompt, so drop it.
 		if b.Content == "" && strings.Contains(text, "{{") {
 			dropped = append(dropped, b.ID+" (unresolved)")
 			continue
 		}
-		b.Content = text
-		fixed = append(fixed, b)
-	}
-	sort.Slice(fixed, func(i, j int) bool { return fixed[i].Order < fixed[j].Order })
-
-	// 1. per-block cap
-	usage := make([]BlockUsage, 0, len(fixed))
-	fixedTok := 0
-	for i := range fixed {
-		t := EstimateTokens(fixed[i].Content)
-		cut := false
-		if m := fixed[i].Budget.Max; m > 0 && t > m {
-			fixed[i].Content = truncateToTokens(fixed[i].Content, m, keepHead(fixed[i].Source.Type))
-			t = EstimateTokens(fixed[i].Content)
-			cut = true
+		if m := b.Budget.Max; m > 0 && EstimateTokens(text) > m {
+			text = truncateToTokens(text, m, keepHead(b.Source.Type))
 		}
-		usage = append(usage, BlockUsage{ID: fixed[i].ID, Role: fixed[i].Role, Order: fixed[i].Order, Tokens: t, Truncated: cut})
-		fixedTok += t
-	}
-
-	// 2. token size of each turn
-	tok := turnsTokens(in.Turns)
-
-	// 3. pick smallest tier fitting fixed + recent min turns
-	budget := 0
-	overflow := false
-	chosen := cfg.Tiers[len(cfg.Tiers)-1]
-	for _, tier := range cfg.Tiers {
-		b := tier - cfg.ResponseReserve
-		if b < 0 {
-			b = 0
-		}
-		if fixedTok <= b && recentMinFits(tok, cfg.RecentChatMinTurn, b-fixedTok) {
-			chosen = tier
-			budget = b
-			goto picked
+		tk := EstimateTokens(text)
+		switch b.Level {
+		case LevelElastic:
+			elasticText[b.ID] = text
+			elasticTok[b.ID] = tk
+		case LevelTrim:
+			// A fixed L2 block is a one-item evictable list.
+			l2byID[b.ID] = &l2List{id: b.ID, role: b.Role, order: b.Order, items: []Item{{Text: text}}, weight: 0.5}
+			l2order = append(l2order, b.ID)
+		default:
+			lockedText[b.ID] = text
+			lockedTok[b.ID] = tk
 		}
 	}
-	// nothing fits: use largest tier, best-effort, flag overflow
-	chosen = cfg.Tiers[len(cfg.Tiers)-1]
-	budget = chosen - cfg.ResponseReserve
-	if budget < 0 {
-		budget = 0
+
+	// Prepare L2 arrays (tokens + eviction rank + protected floor).
+	for _, id := range l2order {
+		l := l2byID[id]
+		n := len(l.items)
+		l.tok = make([]int, n)
+		l.rank = make([]float64, n)
+		l.keep = make([]bool, n)
+		if l.protected == nil {
+			l.protected = make([]bool, n)
+		}
+		for i := range l.items {
+			l.tok[i] = EstimateTokens(l.items[i].Text) + l.items[i].ImageTokens
+			if l.isChat {
+				l.tok[i] += msgOverhead
+			}
+			l.keep[i] = true
+			l.sumAll += l.tok[i]
+		}
+		if l.isChat {
+			if n > 1 {
+				for i := range l.items {
+					l.rank[i] = float64(i) / float64(n-1)
+				}
+			} else if n == 1 {
+				l.rank[0] = 1
+			}
+			f := minMsgs
+			if f > n {
+				f = n
+			}
+			for i := n - f; i < n; i++ {
+				if i >= 0 {
+					l.protected[i] = true
+				}
+			}
+		} else {
+			mn, mx := math.Inf(1), math.Inf(-1)
+			for i := range l.items {
+				r := l.items[i].EvictRank
+				if r < mn {
+					mn = r
+				}
+				if r > mx {
+					mx = r
+				}
+			}
+			for i := range l.items {
+				if mx > mn {
+					l.rank[i] = (l.items[i].EvictRank - mn) / (mx - mn)
+				} else {
+					l.rank[i] = 0
+				}
+			}
+		}
 	}
-	overflow = true
-	// best-effort trim elastic fixed blocks (RAG/distilled) to fit recent min
-	trimElastic(fixed, usage, &fixedTok, budget, tok, cfg.RecentChatMinTurn)
 
-picked:
-
-	// 4. choose turns newest-first within remaining budget
-	chatBudget := budget - fixedTok
-	if chatBudget < 0 {
-		chatBudget = 0
+	// Totals.
+	lockedTotal := 0
+	for _, id := range lockedText {
+		lockedTotal += lockedTok[id]
 	}
-	chosenTurns, turnCut, turnDropped := slideTurns(in.Turns, tok, chatBudget, cfg.RecentChatMinTurn)
+	elasticTotal := 0
+	for id := range elasticText {
+		elasticTotal += elasticTok[id]
+	}
+	l2Total := 0
+	for _, id := range l2order {
+		l2Total += l2byID[id].sumAll
+	}
 
-	// 5. build messages: fixed blocks in order, chat turns at chat block order
-	msgs := make([]Message, 0, len(fixed)+len(chosenTurns))
+	overflow := lockedTotal > inputBudget
+	target := inputBudget - lockedTotal
+	if target < 0 {
+		target = 0
+	}
+
+	// Evict L2 items (lowest weighted rank first) until they fit the target.
+	cur := l2Total
+	for cur > target {
+		best := math.Inf(1)
+		var bi *l2List
+		bii := -1
+		for _, id := range l2order {
+			l := l2byID[id]
+			for i := range l.items {
+				if !l.keep[i] || l.protected[i] {
+					continue
+				}
+				er := l.rank[i] * l.weight
+				if er < best {
+					best = er
+					bi = l
+					bii = i
+				}
+			}
+		}
+		if bi == nil {
+			break
+		}
+		bi.keep[bii] = false
+		cur -= bi.tok[bii]
+	}
+	l2Kept := cur
+	if cur > target {
+		overflow = true
+	}
+
+	// L3 is all-or-nothing, and only after L1 + L2 are placed.
+	keepElastic := false
+	if elasticTotal > 0 {
+		if room := inputBudget - lockedTotal - l2Kept; elasticTotal <= room {
+			keepElastic = true
+		}
+	}
+
+	// Emit messages in block order.
+	var msgs []Message
 	var sb strings.Builder
-	for _, b := range fixed {
-		msgs = append(msgs, Message{Role: b.Role, Content: b.Content})
-		sb.WriteString("----- [" + b.ID + " order=" + itoa(b.Order) + "] -----\n")
-		sb.WriteString(b.Content)
-		sb.WriteString("\n\n")
-	}
-	if chatEnabled && len(chosenTurns) > 0 {
-		sb.WriteString("----- [chat order=" + itoa(chatOrder) + "] -----\n")
-		for _, t := range chosenTurns {
-			msgs = append(msgs, t)
-			sb.WriteString(t.Role + ": " + t.Content + "\n")
-		}
-		sb.WriteString("\n")
-	}
-	if len(chosenTurns) > 0 {
-		tt := 0
-		for _, n := range turnCut {
-			tt += n
-		}
-		usage = append(usage, BlockUsage{ID: "chat", Role: "user", Order: chatOrder, Tokens: tt, Truncated: turnDropped > 0})
+	var usage []BlockUsage
+	total := 0
+
+	writeHeader := func(id string, order int) {
+		sb.WriteString("----- [" + id + " order=" + itoa(order) + "] -----\n")
 	}
 
-	total := fixedTok
-	for _, n := range turnCut {
-		total += n
+	for _, b := range ordered {
+		id := b.ID
+		if l, ok := l2byID[id]; ok {
+			if l.isChat {
+				kept := 0
+				any := false
+				for i := range l.items {
+					if !l.keep[i] {
+						continue
+					}
+					any = true
+					kept += l.tok[i]
+					msgs = append(msgs, Message{Role: l.items[i].Role, Content: l.items[i].Text, ImageTokens: l.items[i].ImageTokens})
+					sb.WriteString(l.items[i].Role + ": " + l.items[i].Text + "\n")
+				}
+				if any {
+					total += kept
+					usage = append(usage, BlockUsage{ID: id, Role: b.Role, Order: b.Order, Level: int(LevelTrim), Tokens: kept, Truncated: kept < l.sumAll})
+				}
+				continue
+			}
+			var parts []string
+			for i := range l.items {
+				if l.keep[i] {
+					parts = append(parts, l.items[i].Text)
+				}
+			}
+			if len(parts) > 0 {
+				content := renderListContent(l.tmpl, strings.Join(parts, "\n\n"))
+				tk := EstimateTokens(content)
+				msgs = append(msgs, Message{Role: b.Role, Content: content})
+				total += tk
+				usage = append(usage, BlockUsage{ID: id, Role: b.Role, Order: b.Order, Level: int(LevelTrim), Tokens: tk, Truncated: len(parts) < len(l.items)})
+				writeHeader(id, b.Order)
+				sb.WriteString(content + "\n\n")
+			} else if l.sumAll > 0 {
+				dropped = append(dropped, id+" (evicted)")
+			}
+			continue
+		}
+		// Fixed L1 / L3.
+		if b.Level == LevelElastic {
+			if !keepElastic {
+				dropped = append(dropped, id+" (elastic dropped)")
+				continue
+			}
+			text := elasticText[id]
+			msgs = append(msgs, Message{Role: b.Role, Content: text})
+			total += elasticTok[id]
+			usage = append(usage, BlockUsage{ID: id, Role: b.Role, Order: b.Order, Level: int(LevelElastic), Tokens: elasticTok[id]})
+			writeHeader(id, b.Order)
+			sb.WriteString(text + "\n\n")
+			continue
+		}
+		if text, ok := lockedText[id]; ok {
+			msgs = append(msgs, Message{Role: b.Role, Content: text})
+			total += lockedTok[id]
+			usage = append(usage, BlockUsage{ID: id, Role: b.Role, Order: b.Order, Level: int(LevelLocked), Tokens: lockedTok[id]})
+			writeHeader(id, b.Order)
+			sb.WriteString(text + "\n\n")
+		}
 	}
+
+	if total > inputBudget {
+		overflow = true
+	}
+
 	return AssembleResult{
 		Messages:   msgs,
 		Blocks:     usage,
 		TotalTok:   total,
-		BudgetTok:  budget,
-		Tier:       chosen,
+		BudgetTok:  inputBudget,
+		Window:     cfg.Window,
 		Overflow:   overflow,
 		Dropped:    dropped,
 		PromptText: sb.String(),
 	}
 }
 
-// recentMinFits reports whether the last n turns (or all if fewer) fit in
-// the given token budget.
-func recentMinFits(tok []int, n, budget int) bool {
-	if n <= 0 || len(tok) == 0 {
-		return true
+// renderListContent substitutes joined items into a list block template.
+func renderListContent(tmpl, joined string) string {
+	if joined == "" {
+		return ""
 	}
-	sum := 0
-	for i := len(tok) - 1; i >= 0 && len(tok)-i <= n; i-- {
-		sum += tok[i]
+	if tmpl == "" {
+		return joined
 	}
-	return sum <= budget
-}
-
-// slideTurns keeps as many trailing turns as fit in budget, but always at
-// least minKeep. Returns the kept turns (oldest first), their token sizes,
-// and how many were dropped.
-func slideTurns(turns []Message, tok []int, budget, minKeep int) ([]Message, []int, int) {
-	if len(turns) == 0 {
-		return nil, nil, 0
+	if strings.Contains(tmpl, "{{rag}}") {
+		return strings.ReplaceAll(tmpl, "{{rag}}", joined)
 	}
-	// always keep at least the newest turn
-	start := len(turns) - 1
-	sum := tok[start]
-	for start > 0 {
-		keep := len(turns) - start
-		if sum+tok[start-1] > budget && keep >= minKeep {
-			break
-		}
-		start--
-		sum += tok[start]
+	if strings.Contains(tmpl, "{{items}}") {
+		return strings.ReplaceAll(tmpl, "{{items}}", joined)
 	}
-	return turns[start:], tok[start:], start
-}
-
-// trimElastic hard-trims elastic blocks (RAG/distilled/vectra) when fixed
-// text alone cannot fit the largest tier, so recent chat still has room.
-func trimElastic(fixed []Block, usage []BlockUsage, fixedTok *int, budget int, tok []int, minKeep int) {
-	// target: fixed must leave room for min recent turns
-	recent := 0
-	for i := len(tok) - 1; i >= 0 && len(tok)-i <= minKeep; i-- {
-		recent += tok[i]
+	if strings.Contains(tmpl, "{{") {
+		return tmpl + "\n" + joined
 	}
-	target := budget - recent
-	if target < 0 {
-		target = 0
-	}
-	for *fixedTok > target {
-		// find last elastic block with tokens
-		idx := -1
-		for i := len(fixed) - 1; i >= 0; i-- {
-			if elastic(fixed[i].Source.Type) && usage[i].Tokens > 0 {
-				idx = i
-				break
-			}
-		}
-		if idx < 0 {
-			break
-		}
-		over := *fixedTok - target
-		cur := usage[idx].Tokens
-		cut := over
-		if cut > cur {
-			cut = cur
-		}
-		newTok := cur - cut
-		if newTok < 0 {
-			newTok = 0
-		}
-		fixed[idx].Content = truncateToTokens(fixed[idx].Content, newTok, true)
-		got := EstimateTokens(fixed[idx].Content)
-		usage[idx].Tokens = got
-		usage[idx].Truncated = true
-		usage[idx].DroppedNote = "overflow trim"
-		*fixedTok -= cur - got
-	}
-}
-
-func elastic(t string) bool {
-	switch t {
-	case "mcp", "vectra", "distilled":
-		return true
-	}
-	return false
+	return joined
 }
 
 // keepHead reports whether truncation should preserve the beginning
@@ -403,7 +549,6 @@ func truncateToTokens(s string, tok int, head bool) string {
 		return s
 	}
 	runes := []rune(s)
-	// convert token budget to a rune budget with the same script ratio
 	keep := estimateRuneBudget(s, tok)
 	if keep >= len(runes) {
 		return s

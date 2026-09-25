@@ -37,8 +37,8 @@ type Audit struct {
 	ID          string         `json:"id"`
 	Time        string         `json:"time"`
 	Model       string         `json:"model"`
-	Tier        int            `json:"tier,omitempty"`     // chosen budget window
-	Overflow    bool           `json:"overflow,omitempty"` // assembled prompt exceeded largest tier
+	Window      int            `json:"window,omitempty"`   // configured total context window
+	Overflow    bool           `json:"overflow,omitempty"` // assembled prompt exceeded the input budget
 	Budget      int            `json:"budget_tokens"`
 	TotalTok    int            `json:"total_tokens"`
 	Estimate    int            `json:"estimate_tokens,omitempty"` // heuristic pre-call estimate
@@ -61,6 +61,7 @@ type BlockRow struct {
 	ID     string `json:"id"`
 	Role   string `json:"role"`
 	Order  int    `json:"order"`
+	Level  int    `json:"level,omitempty"`
 	Tokens int    `json:"tokens"`
 	Cut    bool   `json:"truncated"`
 	Note   string `json:"dropped_note,omitempty"`
