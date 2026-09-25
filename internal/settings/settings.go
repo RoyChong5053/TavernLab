@@ -21,6 +21,9 @@ type Settings struct {
 	MCPTopK           int     `json:"mcp_topk,omitempty"`
 	MCPTimeout        int     `json:"mcp_timeout,omitempty"`
 	MCPThreshold      float64 `json:"mcp_threshold,omitempty"` // <0 = omit (server default)
+	MCPBudgetTokens   int     `json:"mcp_budget_tokens,omitempty"` // token budget for injected memory (default 2000)
+	MCPPerHitChars    int     `json:"mcp_per_hit_chars,omitempty"` // per-hit char cap (default 2000, backend chunks ~500char, jina cap 1024tok)
+	MaxTokens         int     `json:"max_tokens,omitempty"` // upstream generation cap, independent of response_reserve (default 4096)
 	CurrentChar       string  `json:"current_char,omitempty"`  // source of truth for web + app
 	UserName          string  `json:"user_name,omitempty"`     // export attribution / {{user}}
 	NtfyURL           string  `json:"ntfy_url,omitempty"`      // self-hosted ntfy base, empty = disabled
@@ -44,6 +47,9 @@ func Defaults() Settings {
 		MCPTopK:           10,
 		MCPTimeout:        120,
 		MCPThreshold:      -1,
+		MCPBudgetTokens:   2000,
+		MCPPerHitChars:    2000,
+		MaxTokens:         4096,
 		CurrentChar:       "Leer乐儿",
 		UserName:          "RoyChong",
 		DistillInterval:   8,
@@ -87,6 +93,15 @@ func Load(root string) Settings {
 	}
 	if f.MCPThreshold >= 0 {
 		s.MCPThreshold = f.MCPThreshold
+	}
+	if f.MCPBudgetTokens > 0 {
+		s.MCPBudgetTokens = f.MCPBudgetTokens
+	}
+	if f.MCPPerHitChars > 0 {
+		s.MCPPerHitChars = f.MCPPerHitChars
+	}
+	if f.MaxTokens > 0 {
+		s.MaxTokens = f.MaxTokens
 	}
 	if f.CurrentChar != "" {
 		s.CurrentChar = f.CurrentChar

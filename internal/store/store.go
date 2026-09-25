@@ -43,6 +43,10 @@ type Audit struct {
 	TotalTok  int            `json:"total_tokens"`
 	Estimate  int            `json:"estimate_tokens,omitempty"` // heuristic pre-call estimate
 	Actual    int            `json:"actual_tokens,omitempty"`   // upstream usage.prompt_tokens
+	Completion int           `json:"completion_tokens,omitempty"`
+	Finish    string         `json:"finish_reason,omitempty"` // stop | length | ...
+	MaxTokens int            `json:"max_tokens,omitempty"`
+	ImageCount int           `json:"image_count,omitempty"`
 	Blocks    []BlockRow     `json:"blocks"`
 	Dropped   []string       `json:"dropped"`
 	Raw       map[string]any `json:"raw_request"`

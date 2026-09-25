@@ -40,6 +40,7 @@
       <div class="glass chat-box">
         <div class="row" style="justify-content:center"><button id="btn-earlier" class="meta">↑ 加载更早</button></div>
         <div id="chat"></div>
+        <button id="btn-bottom" class="meta hidden" title="回到最新">↓ 回到底部</button>
       </div>
       <div class="composer glass">
         <button id="btn-attach" class="icon-btn" title="上传图片">＋</button>
@@ -108,6 +109,8 @@
         <select id="audit-list"></select>
         <button id="btn-audit-view">查看</button>
       </div>
+      <div id="audit-summary" class="glass budget"></div>
+      <div id="audit-blocks" class="glass pad"></div>
       <pre id="audit" class="glass audit"></pre>
     </section>
     <!-- MEMORY -->
@@ -117,11 +120,16 @@
         <label>MCP 地址 <input id="mem-url" size="28" placeholder="http://192.168.10.2:8199"></label>
         <label>Collection ID（空=服务端默认 global_memory） <input id="mem-collection" size="18" placeholder="空=默认"></label>
         <div class="row">
-          <label>top-k <input id="mem-topk" type="number" value="10" style="width:56px"></label>
+          <label>top-k（仅服务端hint，数量由rag-mcp-server定） <input id="mem-topk" type="number" value="10" style="width:56px"></label>
+          <label>记忆预算 <input id="mem-budget" type="number" min="200" value="2000" style="width:80px"> tokens</label>
+          <label>单条上限 <input id="mem-perhit" type="number" min="200" value="2000" style="width:80px"> chars</label>
+        </div>
+        <div class="row">
           <label>timeout（秒） <input id="mem-timeout" type="number" min="1" value="120" style="width:64px"></label>
           <label>threshold（-1=服务端默认） <input id="mem-threshold" type="number" step="0.01" value="-1" style="width:64px"></label>
           <label><input type="checkbox" id="mem-enabled"> 每轮自动检索</label>
         </div>
+        <p class="meta">TavernLab 不决定拿几条 docs，只按“记忆预算 tokens”裁剪；后端 chunk 约 500char，jina reranker 上限 1024 tokens，超长单条会被截断并在 Audit 标注。</p>
         <div class="row">
           <input id="mem-test-q" size="30" placeholder="测试查询，如：我上周睡眠咋样">
           <button id="btn-mem-test">测试检索</button>
@@ -176,8 +184,13 @@
         <span id="set-key-state" class="meta"></span>
         <div class="row">
           <label>窗口档位 <input id="set-tiers" size="18" value="8192,16384,32768"></label>
-          <label>回复预留 <input id="set-reserve" type="number" value="4096" style="width:80px"></label>
+          <label>回复预留 <input id="set-reserve" type="number" value="4096" style="width:80px" title="输入预算预留，不是生成上限"></label>
+          <label>生成上限 <input id="set-maxtokens" type="number" min="256" max="32768" value="4096" style="width:80px" title="发给上游的 max_tokens，独立于预留"></label>
           <label>保底轮数 <input id="set-minrounds" type="number" value="4" style="width:56px"></label>
+        </div>
+        <p class="meta">回复预留 = 输入侧留给回复的预算（选档用）；生成上限 = 发给上游的 max_tokens（决定回多长，截断看 Audit finish_reason）。</p>
+        <div class="row">
+          <label>界面缩放 <input id="set-uiscale" type="number" min="80" max="150" value="100" style="width:64px"> %（存本机，替代浏览器130%）</label>
         </div>
         <label>Reranker（表情判定） <input id="set-rerank" size="26" value="http://127.0.0.1:11437"></label>
         <label>模型 <select id="set-model" style="max-width:230px"></select>（存本机，刷新不丢）</label>

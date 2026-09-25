@@ -113,6 +113,15 @@ func (r *runtimeSettings) update(root string, patch map[string]any) settings.Set
 	if v, ok := patch["mcp_threshold"].(float64); ok {
 		r.cur.MCPThreshold = v
 	}
+	if v, ok := patch["mcp_budget_tokens"].(float64); ok && v > 0 {
+		r.cur.MCPBudgetTokens = int(v)
+	}
+	if v, ok := patch["mcp_per_hit_chars"].(float64); ok && v > 0 {
+		r.cur.MCPPerHitChars = int(v)
+	}
+	if v, ok := patch["max_tokens"].(float64); ok && v > 0 {
+		r.cur.MaxTokens = int(v)
+	}
 	if v, ok := patch["current_char"].(string); ok && v != "" {
 		r.cur.CurrentChar = v
 	}
@@ -258,6 +267,8 @@ func main() {
 				"api_key_hint": settings.Mask(s.APIKey), "rerank_url": s.RerankURL,
 				"mcp_url": s.MCPURL, "mcp_collection": s.MCPCollection,
 				"mcp_enabled": s.MCPEnabled, "mcp_topk": s.MCPTopK, "mcp_timeout": s.MCPTimeout, "mcp_threshold": s.MCPThreshold,
+				"mcp_budget_tokens": s.MCPBudgetTokens, "mcp_per_hit_chars": s.MCPPerHitChars,
+				"max_tokens": s.MaxTokens,
 				"current_char": s.CurrentChar, "user_name": s.UserName,
 				"ntfy_url": s.NtfyURL, "ntfy_topic": s.NtfyTopic,
 				"distill_enabled": s.DistillEnabled, "distill_interval": s.DistillInterval,
@@ -450,15 +461,16 @@ func main() {
 		s := rt.get()
 		body, _ := io.ReadAll(r.Body)
 		var in struct {
-			Model    any                  `json:"model"`
-			Messages []map[string]any     `json:"messages"`
-			Stream   bool                 `json:"stream"`
-			Session  string               `json:"session"`
-			Text     string               `json:"text"`   // new path: single fresh user message
-			Images   []string             `json:"images"` // data URLs / raw base64 for the fresh message
-			Blocks   []engine.Block       `json:"blocks"`
-			Context  engine.ContextConfig `json:"context"`
-			Chat     []map[string]string  `json:"chat"` // legacy: explicit turns (assemble/preview compat)
+			Model     any                  `json:"model"`
+			Messages  []map[string]any     `json:"messages"`
+			Stream    bool                 `json:"stream"`
+			Session   string               `json:"session"`
+			Text      string               `json:"text"`   // new path: single fresh user message
+			Images    []string             `json:"images"` // data URLs / raw base64 for the fresh message
+			Blocks    []engine.Block       `json:"blocks"`
+			Context   engine.ContextConfig `json:"context"`
+			Chat      []map[string]string  `json:"chat"` // legacy: explicit turns (assemble/preview compat)
+			MaxTokens int                  `json:"max_tokens"`
 		}
 		_ = json.Unmarshal(body, &in)
 		blocks := in.Blocks
@@ -480,7 +492,13 @@ func main() {
 		if userText != "" || len(in.Images) > 0 {
 			// New path: the frontend sends only the fresh message. Images may
 			// arrive with or without a caption (image-only is allowed).
-			paths, dataURLs, _ := saveImages(cfg.DataRoot, session, in.Images)
+			// P0: never silently drop images — surface decode failures loudly.
+			paths, dataURLs, imgErr := saveImages(cfg.DataRoot, session, in.Images)
+			if len(in.Images) > 0 && len(paths) == 0 && len(dataURLs) == 0 {
+				obs.Warn("image save failed", map[string]any{"session": session, "error": imgErrString(imgErr)})
+				http.Error(w, "图片保存失败："+imgErrString(imgErr), 400)
+				return
+			}
 			upImages = dataURLs
 			msg, _ := st.AppendChat(session, "user", userText, paths...)
 			events.publish(session, msg)
@@ -501,7 +519,14 @@ func main() {
 		if model == nil || model == "" {
 			model = "default"
 		}
-		upBody := streamUpBody(model, upMsgs, in.Stream)
+		maxTokens := in.MaxTokens
+		if maxTokens <= 0 {
+			maxTokens = s.MaxTokens
+		}
+		if maxTokens <= 0 {
+			maxTokens = 4096
+		}
+		upBody := streamUpBody(model, upMsgs, in.Stream, maxTokens)
 		auditID := time.Now().Format("20060102-150405.000")
 
 		// Legacy path (no Text, no Images): user turn arrived inside in.Chat.
@@ -945,7 +970,12 @@ func main() {
 		}
 		var upImages []string
 		if strings.TrimSpace(freshText) != "" || len(freshImages) > 0 {
-			paths, dataURLs, _ := saveImages(cfg.DataRoot, session, freshImages)
+			paths, dataURLs, imgErr := saveImages(cfg.DataRoot, session, freshImages)
+			if len(freshImages) > 0 && len(paths) == 0 && len(dataURLs) == 0 {
+				obs.Warn("app image save failed", map[string]any{"session": session, "error": imgErrString(imgErr)})
+				http.Error(w, "图片保存失败："+imgErrString(imgErr), 400)
+				return
+			}
 			upImages = dataURLs
 			msg, _ := st.AppendChat(session, "user", strings.TrimSpace(freshText), paths...)
 			events.publish(session, msg)
@@ -956,7 +986,7 @@ func main() {
 		memInfo := resolveMCP(r.Context(), s, blocks, turns)
 		res := engine.Assemble(engine.Input{Blocks: blocks, Cfg: cfg.Ctx, Turns: turns})
 		upMsgs := buildUpMessages(res.Messages, upImages)
-		upBody := streamUpBody(model, upMsgs, in.Stream)
+		upBody := streamUpBody(model, upMsgs, in.Stream, s.MaxTokens)
 		auditID := time.Now().Format("20060102-150405.000")
 
 		if !in.Stream {
@@ -1077,12 +1107,14 @@ func toAudit(id string, model any, res engine.AssembleResult, upBody, respBody [
 	var resp map[string]any
 	_ = json.Unmarshal(respBody, &resp)
 	reply := ""
+	finish := ""
 	if resp != nil {
 		if ch, ok := resp["choices"].([]any); ok && len(ch) > 0 {
 			if m, ok := ch[0].(map[string]any); ok {
 				if msg, ok := m["message"].(map[string]any); ok {
 					reply, _ = msg["content"].(string)
 				}
+				finish, _ = m["finish_reason"].(string)
 			}
 		}
 	}
@@ -1095,15 +1127,42 @@ func toAudit(id string, model any, res engine.AssembleResult, upBody, respBody [
 		rows = append(rows, store.BlockRow{ID: b.ID, Role: b.Role, Order: b.Order, Tokens: b.Tokens, Cut: b.Truncated, Note: b.DroppedNote})
 	}
 	actual := 0
+	completion := 0
 	if usage != nil {
 		if v, ok := usage["prompt_tokens"].(float64); ok {
 			actual = int(v)
+		}
+		if v, ok := usage["completion_tokens"].(float64); ok {
+			completion = int(v)
+		}
+	}
+	maxTok := 0
+	if raw != nil {
+		if v, ok := raw["max_tokens"].(float64); ok {
+			maxTok = int(v)
+		}
+	}
+	imgCount := 0
+	if raw != nil {
+		if msgs, ok := raw["messages"].([]any); ok {
+			for _, mm := range msgs {
+				if mp, ok := mm.(map[string]any); ok {
+					if parts, ok := mp["content"].([]any); ok {
+						for _, p := range parts {
+							if pm, ok := p.(map[string]any); ok && pm["type"] == "image_url" {
+								imgCount++
+							}
+						}
+					}
+				}
+			}
 		}
 	}
 	return store.Audit{
 		ID: id, Time: time.Now().Format(time.RFC3339), Model: mName,
 		Tier: res.Tier, Overflow: res.Overflow,
 		Budget: res.BudgetTok, TotalTok: res.TotalTok, Estimate: res.TotalTok, Actual: actual,
+		Completion: completion, Finish: finish, MaxTokens: maxTok, ImageCount: imgCount,
 		Blocks:  rows,
 		Dropped: res.Dropped, Raw: raw, ReplyText: reply, Upstream: usage,
 		Memory: mem,
@@ -1311,6 +1370,13 @@ func sniffImageMime(data []byte) string {
 	return "image/png"
 }
 
+func imgErrString(err error) string {
+	if err == nil {
+		return "空图片或解码失败（可能是过大/非图片/base64损坏）"
+	}
+	return err.Error()
+}
+
 // timelineMD renders stored rows in raw_chat_timeline_process.py timeline
 // shape: "# A & B Chat: YYYY-MM-DD ~ YYYY-MM-DD" + "**Name** [ts]: text".
 func timelineMD(session, userName string, msgs []store.ChatMessage) string {
@@ -1404,8 +1470,13 @@ func upstreamModelIDs(client *http.Client, upstream, apiKey string) []string {
 // streamUpBody builds the upstream body, adding stream_options.include_usage
 // for streams so OpenAI-compatible providers return token usage in the final
 // chunk (needed for estimate self-calibration and overflow detection).
-func streamUpBody(model any, msgs []map[string]any, stream bool) []byte {
+// maxTokens<=0 omits max_tokens (upstream default); otherwise sent as the
+// generation cap, independent of response_reserve (which only reserves input budget).
+func streamUpBody(model any, msgs []map[string]any, stream bool, maxTokens int) []byte {
 	body := map[string]any{"model": model, "messages": msgs, "stream": stream}
+	if maxTokens > 0 {
+		body["max_tokens"] = maxTokens
+	}
 	if stream {
 		body["stream_options"] = map[string]any{"include_usage": true}
 	}
@@ -1533,7 +1604,11 @@ func mcpTimeout(s settings.Settings) time.Duration {
 
 func searchMCP(ctx context.Context, s settings.Settings, query string) ([]memory.Hit, error) {
 	timeout := mcpTimeout(s)
-	searchCtx, cancel := context.WithTimeout(ctx, timeout)
+	// Detach from the request context: a mid-search client disconnect (or any
+	// parent cancel) used to abort search_memory and zero out mcp_hits while
+	// the turn still completed. Bound only by mcp_timeout so slow vectra loads
+	// can finish; if the caller is already gone the write path fails later.
+	searchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
 	defer cancel()
 	hits, err := mcp.NewWithTimeout(firstNonEmpty(s.MCPURL, "http://192.168.10.2:8199"), timeout).
 		Search(searchCtx, query, s.MCPCollection, s.MCPTopK, s.MCPThreshold)
@@ -1565,6 +1640,33 @@ func resolveMCP(ctx context.Context, s settings.Settings, blocks []engine.Block,
 		info["hits"] = 0
 		return info
 	}
+	// Budget mode: doc count is decided by rag-mcp-server (top_k is only a hint).
+	// TavernLab only enforces a token/char window so a 500char/chunk backend
+	// behind a 1024-token jina reranker never blows the prompt.
+	budget := s.MCPBudgetTokens
+	if budget <= 0 {
+		budget = 2000
+	}
+	perHit := s.MCPPerHitChars
+	if perHit <= 0 {
+		perHit = 2000
+	}
+	kept := hits[:0]
+	used := 0
+	for _, h := range hits {
+		t := h.Text
+		if r := []rune(t); len(r) > perHit {
+			t = string(r[:perHit]) + "\n[…per-hit truncated…]"
+		}
+		cost := engine.EstimateTokens(t)
+		if used+cost > budget && len(kept) > 0 {
+			break
+		}
+		h.Text = t
+		kept = append(kept, h)
+		used += cost
+	}
+	hits = kept
 	text := mcp.Format(hits)
 	for i := range blocks {
 		if blocks[i].Source.Type == "mcp" && blocks[i].Enabled {
@@ -1576,6 +1678,10 @@ func resolveMCP(ctx context.Context, s settings.Settings, blocks []engine.Block,
 		}
 	}
 	info["hits"] = len(hits)
+	info["budget_tokens"] = budget
+	info["used_tokens"] = used
+	info["per_hit_chars"] = perHit
+	info["note"] = "top_k仅为服务端hint，数量由rag-mcp-server定；TavernLab只按token预算裁剪"
 	if len(hits) > 0 {
 		top := hits[0]
 		info["top"] = map[string]any{"score": top.Score, "source": top.Source, "excerpt": excerpt(top.Text, 160)}

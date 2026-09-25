@@ -20,10 +20,19 @@ const settings = Object.assign(
     tiers: DEFAULT_TIERS, response_reserve: 4096, recent_chat_min_turns: 4,
     rerank_url: 'http://127.0.0.1:11437', char: 'Leer乐儿', model: '',
     stream: false, visible_turns: 10, user_name: 'RoyChong', avatar_px: 88,
+    max_tokens: 4096, ui_scale: 100,
   },
   store.get('settings', {}),
 );
 if (!Array.isArray(settings.tiers) || !settings.tiers.length) settings.tiers = DEFAULT_TIERS;
+
+/* ---------- ui scale (persisted, replaces browser 130% zoom) ---------- */
+function applyUiScale() {
+  const s = Math.min(150, Math.max(80, +settings.ui_scale || 100));
+  try { document.body.style.zoom = s + '%'; } catch {}
+  const el = $('#set-uiscale');
+  if (el) el.value = s;
+}
 
 /* ---------- ui feedback: toast + async button helper ---------- */
 function toast(msg, kind = 'ok', ms = 2600) {
@@ -222,8 +231,32 @@ async function assemble() {
 /* ---------- chat ---------- */
 // Display window only: DOM holds the recent N turns; full context slides
 // server-side out of the character's JSONL, so window size never affects the model.
+// Scroll policy: stick-to-bottom only when the user is already near the bottom;
+// loading earlier preserves anchor so refresh never jumps.
 let historyShown = 0;
+let userPinned = true;
 const seenMsgIds = new Set();
+function chatBox() { return document.querySelector('.chat-box'); }
+function isNearBottom(box, px = 120) {
+  if (!box) return true;
+  return box.scrollHeight - box.scrollTop - box.clientHeight < px;
+}
+function scrollToBottom(box) {
+  if (!box) return;
+  box.scrollTop = box.scrollHeight;
+}
+document.addEventListener('DOMContentLoaded', () => {
+  const box = chatBox();
+  if (box) {
+    box.addEventListener('scroll', () => {
+      userPinned = isNearBottom(box);
+      const b = $('#btn-bottom');
+      if (b) b.classList.toggle('hidden', userPinned);
+    });
+  }
+  const bb = $('#btn-bottom');
+  if (bb) bb.onclick = () => { const b2 = chatBox(); if (b2) { scrollToBottom(b2); userPinned = true; bb.classList.add('hidden'); } };
+});
 function renderMsg(role, text, who, prepend, images, id) {
   const d = document.createElement('div');
   d.className = 'msg ' + (role === 'user' ? 'user' : role === 'assistant' ? 'ai' : 'sys');
@@ -249,8 +282,9 @@ function renderMsg(role, text, who, prepend, images, id) {
     d.appendChild(im);
   }
   const box = $('#chat');
+  const cbox = chatBox();
   if (prepend && box.firstChild) box.insertBefore(d, box.firstChild);
-  else { box.appendChild(d); if (!prepend) d.scrollIntoView({ block: 'end' }); }
+  else { box.appendChild(d); if (!prepend && (!cbox || userPinned)) d.scrollIntoView({ block: 'end' }); }
   return d;
 }
 function addMsg(role, text, who, images) { return renderMsg(role, text, who, false, images); }
@@ -259,19 +293,26 @@ async function loadHistory() {
   seenMsgIds.clear();
   $('#chat').innerHTML = '';
   await loadEarlier();
-  const box = $('#chat');
-  box.scrollTop = box.scrollHeight;
+  const box = chatBox();
+  if (box) { scrollToBottom(box); userPinned = true; }
 }
 async function loadEarlier() {
   const q = new URLSearchParams({ session: settings.char, limit: settings.visible_turns, before: historyShown });
   const j = await (await fetch('/api/history?' + q)).json();
   const msgs = j.messages || [];
   if (!msgs.length) { $('#btn-earlier').textContent = '没有更早了'; return; }
-  const box = $('#chat');
-  const oldH = box.scrollHeight;
+  const chat = $('#chat');
+  const cbox = chatBox();
+  // Anchor preservation: keep the first visible message stable.
+  const anchor = chat.firstChild;
+  const oldTop = anchor ? anchor.getBoundingClientRect().top : 0;
+  const oldScroll = cbox ? cbox.scrollTop : 0;
   [...msgs].reverse().forEach((m) => renderMsg(m.role, m.text, null, true, m.images, m.id));
   historyShown += msgs.length;
-  box.scrollTop = box.scrollHeight - oldH;
+  if (cbox && anchor) {
+    const newTop = anchor.getBoundingClientRect().top;
+    cbox.scrollTop = oldScroll + (newTop - oldTop);
+  }
   $('#btn-earlier').textContent = j.has_more ? '↑ 加载更早' : '没有更早了';
 }
 $('#btn-earlier').onclick = loadEarlier;
@@ -309,6 +350,22 @@ async function classifyAndBadge(text) {
 }
 /* ---------- image attach ---------- */
 let pendingImages = [];
+const MAX_IMG_MB = 8;
+function addPendingImage(dataUrl, name) {
+  if (!dataUrl || !dataUrl.startsWith('data:image/')) {
+    toast('不支持的图片格式' + (name ? '：' + name : ''), 'err');
+    return false;
+  }
+  // ~4/3 overhead for base64; reject loudly instead of silent drop (P0).
+  const mb = (dataUrl.length * 3 / 4) / 1024 / 1024;
+  if (mb > MAX_IMG_MB) {
+    toast(`图片太大（约${mb.toFixed(1)}MB，上限${MAX_IMG_MB}MB），请压缩后重发`, 'err', 4200);
+    return false;
+  }
+  pendingImages = [dataUrl];
+  renderImgPreview();
+  return true;
+}
 function renderImgPreview() {
   const box = $('#img-preview');
   box.innerHTML = '';
@@ -327,8 +384,14 @@ $('#img-file').onchange = async (e) => {
   const files = [...(e.target.files || [])];
   // Single image only: most vision APIs can't handle multiple. New pick replaces.
   const f = files.find((x) => x.type.startsWith('image/'));
-  if (f) {
-    pendingImages = [await new Promise((res) => { const r = new FileReader(); r.onload = () => res(r.result); r.readAsDataURL(f); })];
+  if (!f) { if (files.length) toast('选中的不是图片', 'err'); }
+  else if (f.size > MAX_IMG_MB * 1024 * 1024) {
+    toast(`图片太大（${(f.size / 1048576).toFixed(1)}MB，上限${MAX_IMG_MB}MB）`, 'err', 4200);
+  } else if (f) {
+    try {
+      const d = await new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = rej; r.readAsDataURL(f); });
+      addPendingImage(d, f.name);
+    } catch { toast('图片读取失败', 'err'); }
   }
   renderImgPreview();
   e.target.value = '';
@@ -339,13 +402,17 @@ async function send() {
   const text = ta.value.trim();
   const imgs = pendingImages.slice();
   if (!text && !imgs.length) return;
-  addMsg('user', text, null, imgs);
+  addMsg('user', text || '(图片)', null, imgs);
   ta.value = '';
   pendingImages = [];
   renderImgPreview();
   setPending(true);
+  userPinned = true;
+  const cbox = chatBox();
+  if (cbox) scrollToBottom(cbox);
   const stream = !!settings.stream;
-  const body = { model: settings.model || undefined, session: settings.char, text, images: imgs, stream, blocks, context: ctxCfg() };
+  const maxTokens = Math.min(32768, Math.max(256, +settings.max_tokens || 4096));
+  const body = { model: settings.model || undefined, session: settings.char, text, images: imgs, stream, blocks, context: ctxCfg(), max_tokens: maxTokens };
   try {
     if (stream) {
       const r = await fetch('/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
@@ -378,8 +445,14 @@ async function send() {
     }
     const r = await fetch('/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     const j = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error('HTTP ' + r.status + ' ' + JSON.stringify(j).slice(0, 200));
+    if (!r.ok) {
+      const detail = (typeof j === 'string' ? j : JSON.stringify(j)).slice(0, 300);
+      if (r.status === 400 && /图片/.test(detail)) throw new Error('图片被拒：' + detail);
+      throw new Error('HTTP ' + r.status + ' ' + detail);
+    }
     const reply = j.choices?.[0]?.message?.content || '（无内容）';
+    const finish = j.choices?.[0]?.finish_reason || '';
+    if (finish === 'length') toast('回复被长度截断（finish=length），可调大“生成上限”', 'err', 4200);
     addMsg('assistant', reply);
     setPending(false);
     classifyAndBadge(reply);
@@ -406,7 +479,11 @@ $('#input').addEventListener('paste', async (e) => {
   e.preventDefault();
   const f = items[0].getAsFile();
   if (f) {
-    pendingImages = [await new Promise((res) => { const r = new FileReader(); r.onload = () => res(r.result); r.readAsDataURL(f); })];
+    if (f.size > MAX_IMG_MB * 1024 * 1024) { toast('粘贴图片太大，请压缩后重发', 'err'); return; }
+    try {
+      const d = await new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = rej; r.readAsDataURL(f); });
+      addPendingImage(d, 'paste');
+    } catch { toast('图片读取失败', 'err'); }
   }
   renderImgPreview();
 });
@@ -416,7 +493,7 @@ $('#btn-preview').onclick = async () => {
   if (!res) return;
   const m = res.memory || {};
   $('#preview-memory').textContent = m.enabled
-    ? `MCP: ${m.collection} · query=「${(m.query || '').slice(0, 60)}」 · hits=${m.hits ?? '?'}${m.error ? ' · ⚠ ' + m.error : ''}`
+    ? `MCP: ${m.collection} · query=「${(m.query || '').slice(0, 60)}」 · hits=${m.hits ?? '?'} · 预算${m.budget_tokens ?? '?'}用了${m.used_tokens ?? '?'}${m.error ? ' · ⚠ ' + m.error : ''}`
     : 'MCP 未启用：本轮无记忆注入';
   $('#preview-blocks').innerHTML = budgetLine(res);
   $('#preview-text').textContent = res.prompt_text || '(空)';
@@ -450,12 +527,35 @@ async function refreshAudit() {
   const { ids } = await (await fetch('/api/audit')).json();
   $('#audit-list').innerHTML = ids.map((id) => `<option>${id}</option>`).join('');
   if (ids.length) { $('#audit-list').value = ids[0]; viewAudit(); }
-  else $('#audit').textContent = '暂无记录，先去聊一句。';
+  else { $('#audit').textContent = '暂无记录，先去聊一句。'; $('#audit-summary').textContent = ''; $('#audit-blocks').innerHTML = ''; }
 }
+function esc(s) { return String(s ?? '').replace(/</g, '&lt;'); }
 async function viewAudit() {
   const id = $('#audit-list').value;
   if (!id) return;
-  $('#audit').textContent = JSON.stringify(await (await fetch('/api/audit/' + id)).json(), null, 2);
+  const a = await (await fetch('/api/audit/' + id)).json();
+  const mem = a.memory || {};
+  const up = a.upstream_usage || {};
+  const est = a.estimate_tokens ?? a.total_tokens;
+  const act = a.actual_tokens || up.prompt_tokens || 0;
+  const comp = a.completion_tokens || up.completion_tokens || 0;
+  const fin = a.finish_reason || '';
+  const truncWarn = fin === 'length' ? ' · <span style="color:#ffb4b4">⚠ 生成被截断（finish=length），调大“生成上限”</span>' : '';
+  const overWarn = a.overflow ? ' · <span style="color:#ffb4b4">⚠ OVERFLOW（超最大档）</span>' : '';
+  const memTxt = mem.enabled
+    ? `记忆：${esc(mem.collection || '')} · query=「${esc((mem.query || '').slice(0, 60))}」 · hits=${mem.hits ?? '?'} · 预算${mem.budget_tokens ?? '?'}用了${mem.used_tokens ?? '?'}${mem.error ? ' · ⚠ ' + esc(mem.error) : ''}`
+    : '记忆：未启用';
+  $('#audit-summary').innerHTML =
+    `<b>${a.total_tokens}</b> / ${a.budget_tokens} tokens（估算${est} vs 实际${act || '?'}` +
+    `${comp ? ' · 补全' + comp : ''} · max_tokens${a.max_tokens || '?'}${fin ? ' · finish=' + esc(fin) : ''}` +
+    `）· tier ${a.tier ? Math.round(a.tier / 1024) + 'k' : '?'} · dropped: ${esc((a.dropped || []).join(', ') || '无')}` +
+    `${truncWarn}${overWarn}<br>${memTxt}` +
+    `<br><span class="meta">滑动窗口：固定块先占 ${a.total_tokens} 中的非chat部分，剩余预算从最新轮往回填（保底最近轮），旧轮被丢；窗口档取 8k/16k/32k 最小可容纳档。</span>`;
+  const rows = (a.blocks || []).map((b) =>
+    `<tr><td>${esc(b.id)}</td><td>${esc(b.role)}</td><td>${b.order}</td><td>${b.tokens}</td><td>${b.truncated ? '✂' : ''}</td><td class="meta">${esc(b.note || '')}</td></tr>`).join('');
+  $('#audit-blocks').innerHTML =
+    `<table><tr><th>block</th><th>role</th><th>order</th><th>tokens</th><th>截断</th><th>备注</th></tr>${rows}</table>`;
+  $('#audit').textContent = JSON.stringify(a, null, 2);
 }
 $('#btn-audit-list').onclick = refreshAudit;
 $('#btn-audit-view').onclick = viewAudit;
@@ -634,10 +734,13 @@ async function loadServerSettings() {
     const s = await (await fetch('/api/settings')).json();
     if (s.upstream) $('#set-upstream').value = s.upstream;
     if (s.rerank_url) $('#set-rerank').value = s.rerank_url;
+    if (s.max_tokens && !settings.max_tokens) settings.max_tokens = s.max_tokens;
     $('#set-key-state').textContent = s.api_key_set ? ('API Key 已设置 ' + (s.api_key_hint || '')) : 'API Key 未设置';
     $('#mem-url').value = s.mcp_url || '';
     $('#mem-collection').value = s.mcp_collection || '';
     $('#mem-topk').value = s.mcp_topk ?? 10;
+    $('#mem-budget').value = s.mcp_budget_tokens ?? 2000;
+    $('#mem-perhit').value = s.mcp_per_hit_chars ?? 2000;
     $('#mem-timeout').value = s.mcp_timeout ?? 120;
     $('#mem-threshold').value = s.mcp_threshold ?? -1;
     $('#mem-enabled').checked = !!s.mcp_enabled;
@@ -655,6 +758,8 @@ async function saveMemory(silent) {
       mcp_url: $('#mem-url').value.trim(),
       mcp_collection: $('#mem-collection').value.trim(),
       mcp_topk: +$('#mem-topk').value || 10,
+      mcp_budget_tokens: +$('#mem-budget').value || 2000,
+      mcp_per_hit_chars: +$('#mem-perhit').value || 2000,
       mcp_timeout: +$('#mem-timeout').value || 120,
       mcp_threshold: +$('#mem-threshold').value,
       mcp_enabled: $('#mem-enabled').checked,
@@ -664,7 +769,7 @@ async function saveMemory(silent) {
   if (!silent) toast('Memory 设置已保存');
 }
 $('#btn-mem-save').onclick = () => asyncAction($('#btn-mem-save'), () => saveMemory(false));
-['mem-url', 'mem-collection', 'mem-topk', 'mem-timeout', 'mem-threshold', 'mem-enabled'].forEach((id) => {
+['mem-url', 'mem-collection', 'mem-topk', 'mem-budget', 'mem-perhit', 'mem-timeout', 'mem-threshold', 'mem-enabled'].forEach((id) => {
   const el = document.getElementById(id); if (el) el.addEventListener('change', () => saveMemory(true).catch((e) => toast('Memory 保存失败：' + e.message, 'err')));
 });
 $('#btn-mem-test').onclick = async () => {
@@ -759,6 +864,8 @@ $('#set-model').onchange = (e) => { settings.model = e.target.value; store.set('
 function fillSettingsForm() {
   $('#set-tiers').value = settings.tiers.join(',');
   $('#set-reserve').value = settings.response_reserve;
+  $('#set-maxtokens').value = settings.max_tokens || 4096;
+  $('#set-uiscale').value = settings.ui_scale || 100;
   $('#set-minrounds').value = settings.recent_chat_min_turns;
   $('#set-rerank').value = settings.rerank_url;
   $('#set-stream').checked = !!settings.stream;
@@ -769,6 +876,8 @@ function fillSettingsForm() {
 async function saveSettings(silent) {
   settings.tiers = parseTiers($('#set-tiers').value);
   settings.response_reserve = +$('#set-reserve').value || 4096;
+  settings.max_tokens = Math.min(32768, Math.max(256, +$('#set-maxtokens').value || 4096));
+  settings.ui_scale = Math.min(150, Math.max(80, +$('#set-uiscale').value || 100));
   settings.recent_chat_min_turns = +$('#set-minrounds').value || 4;
   settings.rerank_url = $('#set-rerank').value.trim() || settings.rerank_url;
   settings.stream = $('#set-stream').checked;
@@ -777,6 +886,7 @@ async function saveSettings(silent) {
   settings.user_name = $('#set-user').value.trim() || 'user';
   settings.model = $('#set-model').value || settings.model;
   store.set('settings', settings);
+  applyUiScale();
   const r = await fetch('/api/settings', {
     method: 'PUT', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -784,6 +894,7 @@ async function saveSettings(silent) {
       api_key: $('#set-apikey').value,
       rerank_url: $('#set-rerank').value.trim(),
       user_name: settings.user_name,
+      max_tokens: settings.max_tokens,
     }),
   });
   if (!r.ok) throw new Error('HTTP ' + r.status);
@@ -799,19 +910,21 @@ function scheduleSettingsSave() {
   clearTimeout(settingsSaveTimer);
   settingsSaveTimer = setTimeout(() => saveSettings(true).catch((e) => toast('偏好保存失败：' + e.message, 'err')), 600);
 }
-['set-tiers', 'set-reserve', 'set-minrounds', 'set-rerank', 'set-stream', 'set-visible', 'set-avatar-size', 'set-user', 'set-upstream', 'set-apikey']
+['set-tiers', 'set-reserve', 'set-maxtokens', 'set-uiscale', 'set-minrounds', 'set-rerank', 'set-stream', 'set-visible', 'set-avatar-size', 'set-user', 'set-upstream', 'set-apikey']
   .forEach((id) => { const el = document.getElementById(id); if (el) el.addEventListener('change', scheduleSettingsSave); });
 
 /* ---------- cross-device refresh on tab focus ---------- */
 document.addEventListener('visibilitychange', () => {
-  if (!document.hidden) { loadHistory(); subscribeChat(); }
+  if (!document.hidden) { subscribeChat(); }
 });
 
 /* ---------- init ---------- */
 async function init() {
   fillSettingsForm();
+  applyUiScale();
   await loadServerSettings();
   fillSettingsForm();
+  applyUiScale();
   $('#chat-char-name').textContent = settings.char;
   applyAvatarSize();
   loadBlocks();
