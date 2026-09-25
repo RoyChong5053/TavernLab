@@ -89,6 +89,7 @@ func (r *runtimeSettings) update(root string, patch map[string]any) settings.Set
 	delete(patch, "admin_user")
 	delete(patch, "admin_password_sha256")
 	delete(patch, "session_days")
+	delete(patch, "app_token")
 	if v, ok := patch["upstream"].(string); ok && v != "" {
 		r.cur.Upstream = v
 	}
@@ -196,7 +197,7 @@ func main() {
 		firstNonEmpty(*adminUser, os.Getenv("TAVERNLAB_ADMIN_USER"), rt.get().AdminUser),
 		firstNonEmpty(os.Getenv("TAVERNLAB_ADMIN_SHA256"), rt.get().AdminPasswordSHA256),
 		rt.get().SessionDays,
-		firstNonEmpty(*appToken, os.Getenv("TAVERNLAB_APP_TOKEN")),
+		firstNonEmpty(*appToken, os.Getenv("TAVERNLAB_APP_TOKEN"), rt.get().AppToken),
 	)
 
 	cfg := Config{

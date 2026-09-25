@@ -39,6 +39,7 @@ type Settings struct {
 	AdminUser           string `json:"admin_user,omitempty"`
 	AdminPasswordSHA256 string `json:"admin_password_sha256,omitempty"` // hex(sha256(password))
 	SessionDays         int    `json:"session_days,omitempty"`          // login token TTL, default 30
+	AppToken            string `json:"app_token,omitempty"`             // static Bearer for the Flutter app
 }
 
 // Defaults for a fresh checkout talking to the home LAN.
@@ -144,6 +145,9 @@ func Load(root string) Settings {
 	}
 	if f.SessionDays > 0 {
 		s.SessionDays = f.SessionDays
+	}
+	if f.AppToken != "" {
+		s.AppToken = f.AppToken
 	}
 	return s
 }
