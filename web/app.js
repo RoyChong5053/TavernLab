@@ -321,6 +321,14 @@ async function assemble() {
 let historyShown = 0;
 let userPinned = true;
 const seenMsgIds = new Set();
+// The in-flight assistant bubble. The server publishes the saved reply over SSE
+// possibly before our own stream/response has finished rendering, so we adopt
+// that event into this bubble instead of appending a duplicate.
+let pendingAssistant = null;
+// Bumped whenever an assistant message arrives over SSE, so the non-stream
+// sender can tell "SSE already rendered my reply" from a legitimately repeated
+// identical reply across turns.
+let assistantSseSeq = 0;
 function chatBox() { return document.querySelector('.chat-box'); }
 function isNearBottom(box, px = 120) {
   if (!box) return true;
@@ -412,12 +420,31 @@ function subscribeChat() {
     if (!m || !m.role) return;
     if (m.id && seenMsgIds.has(m.id)) return;
     const domRole = m.role === 'assistant' ? 'ai' : (m.role === 'user' ? 'user' : 'sys');
+    // Our own reply can race the SSE event: absorb it into the in-flight bubble
+    // (mid-stream or exact match) rather than adding a second identical bubble.
+    if (m.role === 'assistant' && pendingAssistant) {
+      const pb = pendingAssistant.querySelector('.body');
+      if (pb && (pb.classList.contains('cursor') || pb.textContent === m.text)) {
+        pb.textContent = m.text;
+        pb.classList.remove('cursor');
+        if (m.id) { pendingAssistant.dataset.id = m.id; seenMsgIds.add(m.id); }
+        pendingAssistant = null;
+        assistantSseSeq++;
+        return;
+      }
+    }
     const bodies = [...document.querySelectorAll('#chat .msg.' + domRole + ' .body')];
-    if (bodies.length && bodies[bodies.length - 1].textContent === m.text) {
-      if (m.id) seenMsgIds.add(m.id);
+    const lastBody = bodies[bodies.length - 1];
+    // Only absorb into a LOCAL (id-less) bubble we rendered optimistically; a
+    // server bubble already carries data-id, so a legitimately repeated
+    // identical reply still renders as its own message.
+    if (lastBody && lastBody.textContent === m.text && lastBody.parentElement && !lastBody.parentElement.dataset.id) {
+      if (m.id) { lastBody.parentElement.dataset.id = m.id; seenMsgIds.add(m.id); }
+      if (m.role === 'assistant') assistantSseSeq++;
       return;
     }
     renderMsg(m.role, m.text, null, false, m.images, m.id);
+    if (m.role === 'assistant') assistantSseSeq++;
     if (m.role === 'assistant' && m.text) classifyAndBadge(m.text);
   });
   chatES.onerror = () => { /* browser auto-reconnects */ };
@@ -496,6 +523,7 @@ async function send() {
   const cbox = chatBox();
   if (cbox) scrollToBottom(cbox);
   const stream = !!settings.stream;
+  const seqAtStart = assistantSseSeq;
   const maxTokens = Math.min(32768, Math.max(256, +settings.max_tokens || 4096));
   const body = { model: settings.model || undefined, session: settings.char, text, images: imgs, stream, blocks, context: ctxCfg(), max_tokens: maxTokens };
   try {
@@ -506,6 +534,7 @@ async function send() {
       const dec = new TextDecoder();
       let buf = '', full = '';
       const box = addMsg('assistant', '');
+      pendingAssistant = box;
       const belly = box.querySelector('.body');
       belly.classList.add('cursor');
       for (;;) {
@@ -523,6 +552,7 @@ async function send() {
         }
       }
       belly.classList.remove('cursor');
+      pendingAssistant = null;
       if (!full.trim()) { belly.textContent = '（空回复）'; }
       setPending(false);
       if (full.trim()) classifyAndBadge(full);
@@ -538,11 +568,16 @@ async function send() {
     const reply = j.choices?.[0]?.message?.content || '（无内容）';
     const finish = j.choices?.[0]?.finish_reason || '';
     if (finish === 'length') toast('回复被长度截断（finish=length），可调大“生成上限”', 'err', 4200);
-    addMsg('assistant', reply);
+    // SSE may have already rendered this reply (server publishes before our HTTP
+    // response lands); only add the bubble if it isn't already the last one.
+    const lastAi = [...document.querySelectorAll('#chat .msg.ai .body')].pop();
+    const sseRenderedMine = lastAi && lastAi.textContent === reply && assistantSseSeq > seqAtStart;
+    if (!sseRenderedMine) addMsg('assistant', reply);
     setPending(false);
     classifyAndBadge(reply);
   } catch (e) {
     setPending(false);
+    pendingAssistant = null;
     const box = addMsg('assistant', '⚠ 发送失败：' + (e.message || e), 'err');
     const btn = document.createElement('button');
     btn.className = 'retry';
