@@ -101,7 +101,7 @@ async function doLogout() {
 }
 async function bootAuth() {
   try {
-    const me = await (await fetch('/api/me')).json();
+    const me = await (await fetch('/api/me', { headers: authHeaders({}) })).json();
     authEnabled = !!me.auth_enabled;
     authUser = me.user || '';
     const lo = $('#btn-logout');

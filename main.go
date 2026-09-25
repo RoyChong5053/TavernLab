@@ -1124,9 +1124,14 @@ func main() {
 		})
 	})
 
-	// Static frontend.
+	// Static frontend. no-cache: the embedded assets have zero modtime, so
+	// without this a browser may serve a stale app.js after an upgrade.
 	sub, _ := fs.Sub(webFS, "web")
-	mux.Handle("/", http.FileServer(http.FS(sub)))
+	fileServer := http.FileServer(http.FS(sub))
+	mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-cache, must-revalidate")
+		fileServer.ServeHTTP(w, r)
+	}))
 
 	addr := fmt.Sprintf("0.0.0.0:%d", cfg.Port)
 	obs.Info("tavernlab listening", map[string]any{"addr": addr, "upstream": cfg.Upstream, "data": cfg.DataRoot, "auth_enabled": auth.Enabled()})
