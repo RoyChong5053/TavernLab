@@ -1012,17 +1012,23 @@ async function saveSettings(silent) {
   settings.model = $('#set-model').value || settings.model;
   store.set('settings', settings);
   applyUiScale();
+  // Only persist upstream/key when the user actually edited them. The browser's
+  // password manager otherwise autofills this form with the saved login
+  // username/password, which would overwrite the real One-API config.
+  const body = {
+    rerank_url: $('#set-rerank').value.trim(),
+    user_name: settings.user_name,
+    max_tokens: settings.max_tokens,
+  };
+  if (upstreamDirty) body.upstream = $('#set-upstream').value.trim();
+  if (apiKeyDirty && $('#set-apikey').value) body.api_key = $('#set-apikey').value;
   const r = await api('/api/settings', {
     method: 'PUT', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      upstream: $('#set-upstream').value.trim(),
-      api_key: $('#set-apikey').value,
-      rerank_url: $('#set-rerank').value.trim(),
-      user_name: settings.user_name,
-      max_tokens: settings.max_tokens,
-    }),
+    body: JSON.stringify(body),
   });
   if (!r.ok) throw new Error('HTTP ' + r.status);
+  upstreamDirty = false;
+  apiKeyDirty = false;
   $('#set-apikey').value = '';
   applyAvatarSize();
   if (!silent) toast('偏好已保存');
@@ -1035,8 +1041,12 @@ function scheduleSettingsSave() {
   clearTimeout(settingsSaveTimer);
   settingsSaveTimer = setTimeout(() => saveSettings(true).catch((e) => toast('偏好保存失败：' + e.message, 'err')), 600);
 }
-['set-tiers', 'set-reserve', 'set-maxtokens', 'set-uiscale', 'set-minrounds', 'set-rerank', 'set-stream', 'set-visible', 'set-avatar-size', 'set-user', 'set-upstream', 'set-apikey']
+['set-tiers', 'set-reserve', 'set-maxtokens', 'set-uiscale', 'set-minrounds', 'set-rerank', 'set-stream', 'set-visible', 'set-avatar-size', 'set-user']
   .forEach((id) => { const el = document.getElementById(id); if (el) el.addEventListener('change', scheduleSettingsSave); });
+// upstream/key are saved only via the explicit button (dirty-tracked).
+let upstreamDirty = false, apiKeyDirty = false;
+{ const u = $('#set-upstream'); if (u) u.addEventListener('input', () => { upstreamDirty = true; }); }
+{ const k = $('#set-apikey'); if (k) k.addEventListener('input', () => { apiKeyDirty = true; }); }
 
 /* ---------- cross-device refresh on tab focus ---------- */
 document.addEventListener('visibilitychange', () => {

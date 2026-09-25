@@ -180,8 +180,8 @@
     <section class="page" id="page-settings">
       <h2>设置</h2>
       <div class="glass pad form">
-        <label>上游 One-API <input id="set-upstream" size="30" placeholder="http://192.168.10.2:3000"></label>
-        <label>API Key <input id="set-apikey" type="password" size="30" placeholder="空=保持不变" autocomplete="off"></label>
+        <label>上游 One-API <input id="set-upstream" size="30" placeholder="http://192.168.10.2:3000" autocomplete="off"></label>
+        <label>API Key <input id="set-apikey" type="password" size="30" placeholder="空=保持不变" autocomplete="new-password"></label>
         <span id="set-key-state" class="meta"></span>
         <div class="row">
           <label>窗口档位 <input id="set-tiers" size="18" value="8192,16384,32768"></label>
@@ -200,7 +200,7 @@
         <div class="row">
           <label>聊天头像大小 <input id="set-avatar-size" type="number" min="32" max="240" value="88" style="width:64px"> px</label>
         </div>
-        <label>导出时我的名字 <input id="set-user" size="12" placeholder="RoyChong"></label>
+        <label>导出时我的名字 <input id="set-user" size="12" placeholder="RoyChong" autocomplete="off"></label>
         <div class="row"><button id="btn-settings-save" class="primary">保存偏好</button><button id="btn-models-refresh">刷新模型列表</button></div>
         <p class="meta">upstream/key/current_char 存后端 data/settings.json（0600，不进 git）；其余存浏览器 localStorage。</p>
       </div>
