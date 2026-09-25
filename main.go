@@ -27,7 +27,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -180,6 +179,15 @@ func (r *runtimeSettings) update(root string, patch map[string]any) settings.Set
 	}
 	if v, ok := patch["distill_retain_days"].(float64); ok && v > 0 {
 		r.cur.DistillRetainDays = int(v)
+	}
+	if v, ok := patch["distill_state_max_days"].(float64); ok && v > 0 {
+		r.cur.DistillStateMaxDays = int(v)
+	}
+	if v, ok := patch["distill_max_log_per_day"].(float64); ok && v > 0 {
+		r.cur.DistillMaxLogPerDay = int(v)
+	}
+	if v, ok := patch["distill_max_entry_chars"].(float64); ok && v > 0 {
+		r.cur.DistillMaxEntryChars = int(v)
 	}
 	if v, ok := patch["distill_model"]; ok {
 		if s, ok := v.(string); ok {
@@ -359,6 +367,8 @@ func main() {
 				"ntfy_url": s.NtfyURL, "ntfy_topic": s.NtfyTopic,
 				"distill_enabled": s.DistillEnabled, "distill_interval": s.DistillInterval,
 				"distill_max_chars": s.DistillMaxChars, "distill_retain_days": s.DistillRetainDays,
+				"distill_state_max_days":  s.DistillStateMaxDays,
+				"distill_max_log_per_day": s.DistillMaxLogPerDay, "distill_max_entry_chars": s.DistillMaxEntryChars,
 				"distill_model":  s.DistillModel,
 				"distill_prompt": s.DistillPrompt, "distill_prompt_default": distill.DefaultPrompt,
 				"estimate_scale": engine.TextScale(),
@@ -419,10 +429,13 @@ func main() {
 		}
 		writeJSON(w, map[string]any{
 			"session": session, "sheet": sheet, "meta": distill.LoadMeta(cfg.DataRoot, session),
+			"state": distill.LoadState(cfg.DataRoot, session, 0), "days": len(distill.LogDays(cfg.DataRoot, session)),
 			"enabled": s.DistillEnabled, "interval": s.DistillInterval,
 			"max_chars": s.DistillMaxChars, "retain_days": s.DistillRetainDays,
-			"model":  s.DistillModel,
-			"prompt": prompt, "default_prompt": distill.DefaultPrompt,
+			"state_max_days": s.DistillStateMaxDays, "max_log_per_day": s.DistillMaxLogPerDay,
+			"max_entry_chars": s.DistillMaxEntryChars,
+			"model":           s.DistillModel,
+			"prompt":          prompt, "default_prompt": distill.DefaultPrompt,
 		})
 	})
 	mux.HandleFunc("/api/distilled/run", func(w http.ResponseWriter, r *http.Request) {
@@ -444,6 +457,49 @@ func main() {
 			return
 		}
 		writeJSON(w, map[string]any{"ok": true, "sheet": sheet})
+	})
+	// One-off backfill: replay every distilled_memory row in chat.jsonl and
+	// union them into the canonical record, recovering days the old parser
+	// dropped. Deterministic (no LLM); backs the record up first.
+	mux.HandleFunc("/api/distilled/rebuild", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			http.Error(w, "method not allowed", 405)
+			return
+		}
+		var in struct {
+			Session string `json:"session"`
+		}
+		b, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(b, &in)
+		s := rt.get()
+		session := store.CleanSession(firstNonEmpty(in.Session, s.CurrentChar, "main"))
+		all, err := st.LoadAll(session)
+		if err != nil {
+			http.Error(w, "load chat failed: "+err.Error(), 500)
+			return
+		}
+		var sheets []string
+		for _, m := range all {
+			if m.Role == "distilled_memory" && strings.TrimSpace(m.Text) != "" {
+				sheets = append(sheets, m.Text)
+			}
+		}
+		if len(sheets) == 0 {
+			writeJSON(w, map[string]any{"ok": false, "error": "没有可回填的 distilled_memory 记录"})
+			return
+		}
+		base := filepath.Join(cfg.DataRoot, "characters", store.CleanSession(session))
+		if cur := distill.Load(cfg.DataRoot, session); cur != "" {
+			_ = os.WriteFile(filepath.Join(base, "distilled.md.bak"), []byte(cur+"\n"), 0o644)
+		}
+		final := distill.Retain(distill.Rebuild(sheets), s.DistillMaxChars, s.DistillRetainDays,
+			s.DistillStateMaxDays, s.DistillMaxLogPerDay, s.DistillMaxEntryChars)
+		if err := distill.Save(cfg.DataRoot, session, final); err != nil {
+			http.Error(w, "save failed: "+err.Error(), 500)
+			return
+		}
+		obs.Info("distill rebuild", map[string]any{"session": session, "sheets": len(sheets), "days": distill.DayCount(final), "chars": len(final)})
+		writeJSON(w, map[string]any{"ok": true, "sheets": len(sheets), "days": distill.DayCount(final), "sheet": final})
 	})
 
 	// Memory test probe: POST {"query":"..."} -> MCP chunks (for the Memory page button).
@@ -540,7 +596,7 @@ func main() {
 		}
 		blocks = renderBlocks(cfg.DataRoot, session, rt.get().UserName, blocks)
 		ragItems, memInfo := resolveMCP(r.Context(), rt.get(), turns)
-		res := engine.Assemble(engine.Input{Blocks: blocks, Cfg: ctx, Turns: turns, Lists: listInputs(blocks, ragItems)})
+		res := engine.Assemble(engine.Input{Blocks: blocks, Cfg: ctx, Turns: turns, Lists: listInputs(blocks, ragItems, cfg.DataRoot, session, rt.get().DistillRetainDays)})
 		out := map[string]any{
 			"messages": res.Messages, "blocks": res.Blocks, "total_tokens": res.TotalTok,
 			"budget_tokens": res.BudgetTok, "window": res.Window, "overflow": res.Overflow,
@@ -610,7 +666,7 @@ func main() {
 		}
 		setActiveModel(fmt.Sprint(model))
 		ragItems, memInfo := resolveMCP(r.Context(), s, turns)
-		res := engine.Assemble(engine.Input{Blocks: blocks, Cfg: ctx, Turns: turns, Lists: listInputs(blocks, ragItems)})
+		res := engine.Assemble(engine.Input{Blocks: blocks, Cfg: ctx, Turns: turns, Lists: listInputs(blocks, ragItems, cfg.DataRoot, session, s.DistillRetainDays)})
 
 		// Build upstream body from assembled messages (attach fresh images).
 		upMsgs := buildUpMessages(res.Messages, upImages)
@@ -1080,7 +1136,7 @@ func main() {
 		blocks := renderBlocks(cfg.DataRoot, session, s.UserName, loadBlocks())
 		setActiveModel(model)
 		ragItems, memInfo := resolveMCP(r.Context(), s, turns)
-		res := engine.Assemble(engine.Input{Blocks: blocks, Cfg: ctxFromSettings(s), Turns: turns, Lists: listInputs(blocks, ragItems)})
+		res := engine.Assemble(engine.Input{Blocks: blocks, Cfg: ctxFromSettings(s), Turns: turns, Lists: listInputs(blocks, ragItems, cfg.DataRoot, session, s.DistillRetainDays)})
 		upMsgs := buildUpMessages(res.Messages, upImages)
 		mt := s.ReplyReserve
 		if mt <= 0 {
@@ -1870,22 +1926,46 @@ func resolveMCP(ctx context.Context, s settings.Settings, chat []engine.Message)
 	return items, info
 }
 
-// listInputs binds the RAG hits to every enabled mcp/vectra block so the
-// engine treats them as L2 evictable lists.
-func listInputs(blocks []engine.Block, rag []engine.Item) []engine.ItemList {
-	if len(rag) == 0 {
-		return nil
-	}
+// listInputs binds the RAG hits to every enabled mcp/vectra block and the
+// diary to every enabled distilled_log block, so the engine treats them as L2
+// evictable lists. Both work even when the other source is empty.
+func listInputs(blocks []engine.Block, rag []engine.Item, root, session string, retainDays int) []engine.ItemList {
 	var out []engine.ItemList
 	for _, b := range blocks {
 		if !b.Enabled {
 			continue
 		}
-		if b.Source.Type == "mcp" || b.Source.Type == "vectra" {
-			out = append(out, engine.ItemList{BlockID: b.ID, Items: rag, Floor: 0, FloorFromHead: true, Weight: 1})
+		switch b.Source.Type {
+		case "mcp", "vectra":
+			if len(rag) > 0 {
+				out = append(out, engine.ItemList{BlockID: b.ID, Items: rag, Floor: 0, FloorFromHead: true, Weight: 1})
+			}
+		case "distilled_log":
+			items := distillItems(root, session)
+			if len(items) > 0 {
+				if retainDays < 1 {
+					retainDays = 1
+				}
+				out = append(out, engine.ItemList{BlockID: b.ID, Items: items, Floor: retainDays, FloorFromHead: false, Weight: 1})
+			}
 		}
 	}
 	return out
+}
+
+// distillItems turns the diary into one evictable item per day, oldest first,
+// with EvictRank rising with recency, so the engine drops the oldest whole days
+// first and the list floor protects the newest retain_days.
+func distillItems(root, session string) []engine.Item {
+	days := distill.LogDays(root, session)
+	if len(days) == 0 {
+		return nil
+	}
+	items := make([]engine.Item, 0, len(days))
+	for i, d := range days {
+		items = append(items, engine.Item{Text: d.Text, EvictRank: float64(i)})
+	}
+	return items
 }
 
 // logTurn emits one structured line per generation so the Logs page shows
@@ -1917,6 +1997,10 @@ func logTurn(kind string, status int, model any, session string, res engine.Asse
 	}
 	obs.Log(lvl, "turn", fields)
 }
+
+// distillInputMaxMsgs bounds how many messages one extraction sees, so a
+// cursor reset can never send the whole history to the model in one shot.
+const distillInputMaxMsgs = 400
 
 var (
 	distillMu   sync.Mutex
@@ -1986,6 +2070,18 @@ func runDistill(ctx context.Context, st *store.Store, client *http.Client, root 
 	if retainDays <= 0 {
 		retainDays = 3
 	}
+	stateMaxDays := s.DistillStateMaxDays
+	if stateMaxDays <= 0 {
+		stateMaxDays = 30
+	}
+	maxLogPerDay := s.DistillMaxLogPerDay
+	if maxLogPerDay <= 0 {
+		maxLogPerDay = 40
+	}
+	maxEntryChars := s.DistillMaxEntryChars
+	if maxEntryChars <= 0 {
+		maxEntryChars = 300
+	}
 	all, err := st.LoadAll(session)
 	if err != nil {
 		return "", err
@@ -1995,8 +2091,13 @@ func runDistill(ctx context.Context, st *store.Store, client *http.Client, root 
 		meta.LastIndex = 0
 	}
 	fresh := all[meta.LastIndex:]
+	// Bound the extractor's input: after a cursor reset a full replay could be
+	// enormous, so never send more than the last distillInputMaxMsgs messages.
+	if len(fresh) > distillInputMaxMsgs {
+		fresh = fresh[len(fresh)-distillInputMaxMsgs:]
+	}
 	timeline := distill.FormatTimeline(session, s.UserName, fresh)
-	// A forced run re-distills the tail even when the cursor is already at the
+	// A forced run re-extracts the tail even when the cursor is already at the
 	// end (e.g. only distilled_memory rows are new), so "立即蒸馏" never no-ops.
 	if timeline == "" && force && len(all) > 0 {
 		start := len(all) - interval*2
@@ -2004,43 +2105,50 @@ func runDistill(ctx context.Context, st *store.Store, client *http.Client, root 
 			start = 0
 		}
 		fresh = all[start:]
+		if len(fresh) > distillInputMaxMsgs {
+			fresh = fresh[len(fresh)-distillInputMaxMsgs:]
+		}
 		timeline = distill.FormatTimeline(session, s.UserName, fresh)
 	}
 	if timeline == "" {
 		return "", fmt.Errorf("没有可蒸馏的新消息")
 	}
-	prev := distill.Load(root, session)
+	// The extractor sees only the current state (small) + the new messages; it
+	// never receives the whole diary, so its output cannot grow with history.
+	state := distill.LoadState(root, session, 0)
 	promptTpl := s.DistillPrompt
 	if promptTpl == "" {
 		promptTpl = distill.DefaultPrompt
 	}
 	prompt := applyMacros(promptTpl, time.Now(), firstNonEmpty(s.UserName, "user"))
-	prompt = strings.ReplaceAll(prompt, "{{maxchars}}", fmt.Sprint(maxChars))
-	prompt = strings.ReplaceAll(prompt, "{{retain_days}}", strconv.Itoa(retainDays))
-	prompt = strings.ReplaceAll(prompt, "{{words}}", fmt.Sprint(maxChars))
 	model := firstNonEmpty(s.DistillModel, "auto-gemini")
 	upBody, _ := json.Marshal(map[string]any{
 		"model":  model,
 		"stream": false,
 		"messages": []map[string]any{
 			{"role": "system", "content": prompt},
-			{"role": "user", "content": distill.BuildUser(prev, timeline)},
+			{"role": "user", "content": distill.BuildUser(state, timeline)},
 		},
 	})
 	status, respBody, _ := proxy.Forward(client, s.Upstream, s.APIKey, upBody, false, nil, nil)
 	if status >= 400 {
 		return "", fmt.Errorf("上游 HTTP %d: %s", status, excerpt(string(respBody), 200))
 	}
-	sheet := strings.TrimSpace(replyText(respBody))
-	if sheet == "" {
-		return "", fmt.Errorf("上游返回空事实表")
+	delta := strings.TrimSpace(replyText(respBody))
+	if delta == "" {
+		return "", fmt.Errorf("上游返回空增量")
 	}
-	if !distill.IsValid(sheet) {
-		return "", fmt.Errorf("蒸馏输出无法解析（保留旧事实表）")
+	if !distill.IsValid(delta) {
+		return "", fmt.Errorf("蒸馏输出无法解析（保留旧记录）")
 	}
-	// Code-side retention guard: restore anything the model dropped, then trim
-	// by whole oldest days but never below retainDays. The LLM never deletes.
-	final := distill.EnforceWindow(distill.Merge(prev, sheet), maxChars, retainDays)
+	if bad := distill.UnparsedDatedLines(delta); len(bad) > 0 {
+		obs.Warn("distill unparsed lines", map[string]any{"session": session, "n": len(bad), "sample": excerpt(bad[0], 120)})
+	}
+	// The LLM only extracted deltas. The app appends them and owns retention:
+	// restore anything it omitted, then trim by whole oldest days / per-day /
+	// per-entry caps, with the state and day floors. The LLM never deletes.
+	prev := distill.Load(root, session)
+	final := distill.Retain(distill.ApplyDelta(prev, delta), maxChars, retainDays, stateMaxDays, maxLogPerDay, maxEntryChars)
 	if err := distill.Save(root, session, final); err != nil {
 		return "", err
 	}
@@ -2050,14 +2158,14 @@ func runDistill(ctx context.Context, st *store.Store, client *http.Client, root 
 	meta.UserTurns = 0
 	meta.LastStatus = "ok"
 	_ = distill.SaveMeta(root, session, meta)
-	// Record the sheet itself in the chat JSONL as its own role so the
+	// Record the record itself in the chat JSONL as its own role so the
 	// injected memory is auditable alongside the conversation.
 	if msg, err := st.AppendChat(session, "distilled_memory", final); err == nil {
 		events.publish(session, msg)
 	}
 	obs.Info("distill ok", map[string]any{
 		"session": session, "chars": len(final), "days": distill.DayCount(final),
-		"retain_days": retainDays, "runs": meta.Runs, "model": model,
+		"added": distill.DayCount(delta), "retain_days": retainDays, "runs": meta.Runs, "model": model,
 	})
 	return final, nil
 }

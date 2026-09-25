@@ -38,8 +38,12 @@ type Settings struct {
 	DistillInterval   int    `json:"distill_interval,omitempty"`    // user turns between runs (default 8)
 	DistillMaxChars   int    `json:"distill_max_chars,omitempty"`   // fact-sheet character budget (default 4000)
 	DistillRetainDays int    `json:"distill_retain_days,omitempty"` // always keep at least N days (default 3)
-	DistillModel      string `json:"distill_model,omitempty"`       // empty = main model
-	DistillPrompt     string `json:"distill_prompt,omitempty"`      // empty = built-in default
+	// Code-side retention guards (the LLM never deletes; these enforce size).
+	DistillStateMaxDays  int    `json:"distill_state_max_days,omitempty"`  // max [USER STATE] days (default 30)
+	DistillMaxLogPerDay  int    `json:"distill_max_log_per_day,omitempty"` // max [LOG] entries per day (default 40)
+	DistillMaxEntryChars int    `json:"distill_max_entry_chars,omitempty"` // max chars per log entry (default 300)
+	DistillModel         string `json:"distill_model,omitempty"`           // empty = main model
+	DistillPrompt        string `json:"distill_prompt,omitempty"`          // empty = built-in default
 	// Login gate (server-side only: flags/env or direct file edit + restart;
 	// the WebUI can never change these). Empty AdminUser = auth disabled.
 	AdminUser           string `json:"admin_user,omitempty"`
@@ -51,24 +55,27 @@ type Settings struct {
 // Defaults for a fresh checkout talking to the home LAN.
 func Defaults() Settings {
 	return Settings{
-		Upstream:          "http://192.168.10.2:3000",
-		RerankURL:         "http://127.0.0.1:11437",
-		MCPURL:            "http://192.168.10.2:8199",
-		MCPCollection:     "",
-		MCPEnabled:        false,
-		MCPTopK:           10,
-		MCPTimeout:        120,
-		MCPThreshold:      -1,
-		MCPBudgetTokens:   2000,
-		MCPPerHitChars:    2000,
-		ContextWindow:     16384,
-		ReplyReserve:      4096,
-		HistoryMinTurns:   4,
-		CurrentChar:       "Leer乐儿",
-		UserName:          "RoyChong",
-		DistillInterval:   8,
-		DistillMaxChars:   4000,
-		DistillRetainDays: 3,
+		Upstream:             "http://192.168.10.2:3000",
+		RerankURL:            "http://127.0.0.1:11437",
+		MCPURL:               "http://192.168.10.2:8199",
+		MCPCollection:        "",
+		MCPEnabled:           false,
+		MCPTopK:              10,
+		MCPTimeout:           120,
+		MCPThreshold:         -1,
+		MCPBudgetTokens:      2000,
+		MCPPerHitChars:       2000,
+		ContextWindow:        16384,
+		ReplyReserve:         4096,
+		HistoryMinTurns:      4,
+		CurrentChar:          "Leer乐儿",
+		UserName:             "RoyChong",
+		DistillInterval:      8,
+		DistillMaxChars:      4000,
+		DistillRetainDays:    3,
+		DistillStateMaxDays:  30,
+		DistillMaxLogPerDay:  40,
+		DistillMaxEntryChars: 300,
 	}
 }
 
@@ -156,6 +163,15 @@ func Load(root string) Settings {
 	}
 	if f.DistillRetainDays > 0 {
 		s.DistillRetainDays = f.DistillRetainDays
+	}
+	if f.DistillStateMaxDays > 0 {
+		s.DistillStateMaxDays = f.DistillStateMaxDays
+	}
+	if f.DistillMaxLogPerDay > 0 {
+		s.DistillMaxLogPerDay = f.DistillMaxLogPerDay
+	}
+	if f.DistillMaxEntryChars > 0 {
+		s.DistillMaxEntryChars = f.DistillMaxEntryChars
 	}
 	if f.DistillModel != "" {
 		s.DistillModel = f.DistillModel

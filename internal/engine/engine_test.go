@@ -137,6 +137,72 @@ func TestTextScaleCalibration(t *testing.T) {
 	}
 }
 
+func intp(v int) *int { return &v }
+
+func TestResolvePriorityDefaults(t *testing.T) {
+	cases := []struct {
+		b    Block
+		want int
+	}{
+		{Block{Source: Source{Type: "chat"}}, 0},
+		{Block{Source: Source{Type: "mcp"}}, 1},
+		{Block{Source: Source{Type: "vectra"}}, 1},
+		{Block{Source: Source{Type: "distilled_log"}}, 2},
+		{Block{Source: Source{Type: "chat"}, EvictPriority: intp(2)}, 2},
+		{Block{Source: Source{Type: "mcp"}, EvictPriority: intp(0)}, 0},
+	}
+	for _, c := range cases {
+		if got := resolvePriority(c.b); got != c.want {
+			t.Fatalf("resolvePriority(%s) = %d, want %d", c.b.Source.Type, got, c.want)
+		}
+	}
+}
+
+func TestL2PriorityBeatsRank(t *testing.T) {
+	defer SetTextScale(1.0)
+	// Two equal-size L2 lists. lowpri has a HIGH rank (0.9) but priority 0;
+	// highpri has a LOW rank (0.1) but priority 1. Only one item can fit.
+	// The old scalar rule evicted highpri first (rank 0.1); priority must
+	// instead drain the whole lowpri tier first.
+	blocks := []Block{
+		{ID: "system", Role: "system", Order: 0, Enabled: true, Level: LevelLocked, Source: Source{Type: "static"}, Template: "sys"},
+		{ID: "lowpri", Role: "system", Order: 10, Enabled: true, Level: LevelTrim, Source: Source{Type: "mcp"}, Template: "<a>{{items}}</a>", EvictPriority: intp(0)},
+		{ID: "highpri", Role: "system", Order: 20, Enabled: true, Level: LevelTrim, Source: Source{Type: "mcp"}, Template: "<b>{{items}}</b>", EvictPriority: intp(1)},
+	}
+	lists := []ItemList{
+		{BlockID: "lowpri", Items: []Item{{Text: "LOWPRI" + strings.Repeat("字", 600), EvictRank: 0.9}}},
+		{BlockID: "highpri", Items: []Item{{Text: "HIGHPRI" + strings.Repeat("字", 600), EvictRank: 0.1}}},
+	}
+	res := Assemble(Input{Blocks: blocks, Cfg: ContextConfig{Window: 700, ReplyReserve: 0, HistoryMinTurns: 1}, Lists: lists})
+	if strings.Contains(res.PromptText, "LOWPRI") {
+		t.Fatal("lower-priority tier must be evicted first regardless of rank")
+	}
+	if !strings.Contains(res.PromptText, "HIGHPRI") {
+		t.Fatal("higher-priority tier must survive")
+	}
+}
+
+func TestDistilledLogEvictsOldestDay(t *testing.T) {
+	defer SetTextScale(1.0)
+	// The diary is a per-day list; the floor protects the newest day, so under
+	// pressure the engine drops the oldest whole day (never the newest).
+	blocks := []Block{
+		{ID: "system", Role: "system", Order: 0, Enabled: true, Level: LevelLocked, Source: Source{Type: "static"}, Template: "sys"},
+		{ID: "distilled_log", Role: "system", Order: 40, Enabled: true, Level: LevelTrim, Source: Source{Type: "distilled_log"}, Template: "<m>{{items}}</m>"},
+	}
+	lists := []ItemList{{BlockID: "distilled_log", Floor: 1, FloorFromHead: false, Weight: 1, Items: []Item{
+		{Text: "OLD" + strings.Repeat("字", 600), EvictRank: 0},
+		{Text: "NEW" + strings.Repeat("字", 600), EvictRank: 1},
+	}}}
+	res := Assemble(Input{Blocks: blocks, Cfg: ContextConfig{Window: 700, ReplyReserve: 0, HistoryMinTurns: 1}, Lists: lists})
+	if strings.Contains(res.PromptText, "OLD") {
+		t.Fatal("oldest day must be evicted first")
+	}
+	if !strings.Contains(res.PromptText, "NEW") {
+		t.Fatal("newest day must survive the floor")
+	}
+}
+
 func TestUnresolvedDropped(t *testing.T) {
 	blocks := []Block{{
 		ID: "distilled", Role: "system", Order: 40, Enabled: true, Level: LevelLocked,

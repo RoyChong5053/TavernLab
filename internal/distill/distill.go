@@ -1,11 +1,18 @@
 // Package distill implements the Distilled Memory feature (ported from the
 // SillyTavern "Distilled-Memory" extension): recent chat is periodically
-// distilled by the LLM into a compact, dated personal fact sheet that is
-// injected into the prompt as the `distilled` block.
+// distilled by the LLM into a compact, dated personal record that is injected
+// into the prompt as two blocks: `distilled_state` (L1, always present) and
+// `distilled_log` (L2, oldest whole days evicted by the engine under budget).
+//
+// Design (2026-09-26 v2 — read/write separation): the LLM is a pure *extractor*
+// of deltas. It never sees or rewrites the whole record, so it can neither
+// delete history nor make the output grow without bound. The application owns
+// the database: it appends the delta, then deterministically trims the oldest
+// whole days down to the retention floor.
 //
 // Storage is per-character and file-based so data/ stays rclone-friendly:
 //
-//	characters/<name>/distilled.md        the current fact sheet
+//	characters/<name>/distilled.md        [USER STATE] + [LOG] sections
 //	characters/<name>/distilled.meta.json last-run bookkeeping
 package distill
 
@@ -21,50 +28,32 @@ import (
 	"github.com/RoyChong5053/TavernLab/internal/store"
 )
 
-// DefaultPrompt is the Memory Custodian prompt. {{user}} / {{isodate}} /
-// {{weekday}} / {{time}} are filled at run time; {{maxchars}} is the output
-// character budget.
-const DefaultPrompt = `You are {{user}}'s automatic diary. Maintain a factual, dated record of what {{user}} explicitly states or does, in two sections: [USER STATE] (current snapshot by date) and [LOG] (timestamped event entries). This record is later used for long-term memory, so accuracy and date structure matter.
+// DefaultPrompt is the delta extractor. {{user}} / {{isodate}} / {{weekday}} /
+// {{time}} are filled at run time. It deliberately never mentions a size
+// limit: the app enforces retention in code, so the model is not tempted to
+// either delete everything or reproduce the whole record.
+const DefaultPrompt = `You are {{user}}'s fact extractor. The application owns the memory database; you only extract new facts. Never manage, prune, or rewrite the whole record.
 
 ## Input
-- [Previous Fact Sheet]: existing record. Treat it as the base state.
-- [New Messages]: recent conversation.
-- LIVE TIMESTAMP: {{isodate}} ({{weekday}}) {{time}} UTC+8 — current date/time.
+- [Current State]: {{user}}'s current one-line-per-day snapshot (context only).
+- [New Messages]: the conversation since your last extraction.
+- LIVE TIMESTAMP: {{isodate}} ({{weekday}}) {{time}} UTC+8.
 
-## Core principles
-- Incremental update: preserve valid existing entries unless explicitly corrected. Do not rebuild from scratch.
-- Only record facts explicitly stated by {{user}}. Ignore assistant/character guesses, roleplay, hypotheticals, filler, and weak confirmations.
-- Do not invent or infer anything: no causes, plans, preferences, emotions unless {{user}} stated them.
-- Distinguish certainty: "I don't use X anymore" = state changed; "I used to" = historical; "I might" = intention, not fact.
-- If a conflict arises: {{user}}'s explicit correction > newer explicit statement about the same fact > preserve old fact.
+## Rules
+- Record ONLY facts {{user}} explicitly states or does. Ignore the assistant's words, roleplay, hypotheticals, plans, and weak confirmations.
+- Output ONLY new information. Do NOT repeat anything already present in [Current State].
+- NEVER delete, trim, summarise away, or add commentary. The application handles size and retention.
+- Dates are ALWAYS DD-MM-YYYY. The message timestamps you see are ISO (YYYY-MM-DD) — convert them.
+- One event per line, in {{user}}'s own words. No bullets, no sub-lines.
 
-## [USER STATE]
-- Snapshot of current status (mood, location, active project, health, current activity) true for a given day.
-- Format: each line starts with [DD-MM-YYYY] and no time.
-- Update today's line in place; add a new line when a new day begins. NEVER remove a previous day's line.
-
-## [LOG]
-- Detailed chronological event log, the diary part.
-- Format: every entry starts with full date+time: [DD-MM-YYYY HH:MM] <event in your own words>.
-- Use the message timestamp when known; otherwise infer from LIVE TIMESTAMP.
-- Cumulative and append-only: add new entries, NEVER delete or rewrite an earlier entry. One line per distinct event. Do not invent causation.
-- Correct a past entry only if {{user}} explicitly corrects it.
-
-## Retention (read carefully)
-- Do NOT trim, summarise away, or delete any day on your own. Always reproduce every day you were given, plus the new events.
-- The application enforces the budget afterwards by dropping the oldest whole days in code; it always keeps at least {{retain_days}} days.
-- Your only job is to append the new information accurately and keep the exact date format. The {{maxchars}} character limit is handled by the app, not by you.
-
-## Output
-Output ONLY the updated fact sheet in this exact format:
-
-[USER STATE]
-[DD-MM-YYYY] <state...>
+## Output (exact format, nothing else)
+[STATE]
+[DD-MM-YYYY] <today's current snapshot, one line>
 
 [LOG]
-[DD-MM-YYYY HH:MM] <event...>
+[DD-MM-YYYY HH:MM] <event>
 
-Omit empty sections. No explanation, no commentary.`
+Omit [STATE] if it did not change. Omit [LOG] if there is no new event.`
 
 // Meta is distillation bookkeeping for one character.
 type Meta struct {
@@ -81,7 +70,7 @@ func dir(root, char string) string {
 func sheetPath(root, char string) string { return filepath.Join(dir(root, char), "distilled.md") }
 func metaPath(root, char string) string  { return filepath.Join(dir(root, char), "distilled.meta.json") }
 
-// Load returns the current fact sheet ("" when none yet).
+// Load returns the current record ("" when none yet).
 func Load(root, char string) string {
 	b, err := os.ReadFile(sheetPath(root, char))
 	if err != nil {
@@ -90,7 +79,7 @@ func Load(root, char string) string {
 	return strings.TrimSpace(string(b))
 }
 
-// Save writes the fact sheet.
+// Save writes the record.
 func Save(root, char, sheet string) error {
 	if err := os.MkdirAll(dir(root, char), 0o755); err != nil {
 		return err
@@ -118,8 +107,10 @@ func SaveMeta(root, char string, m Meta) error {
 	return os.WriteFile(metaPath(root, char), b, 0o644)
 }
 
-// FormatTimeline renders messages in the extension's raw shape:
-// `**Speaker** [YYYY-MM-DD HH:MM]: text`.
+// FormatTimeline renders messages in the extractor's input shape:
+// `**Speaker** [DD-MM-YYYY HH:MM]: text`. DD-MM-YYYY matches the output format
+// so models do not have to translate (they were silently emitting ISO dates,
+// which the old parser then dropped).
 func FormatTimeline(char, userName string, msgs []store.ChatMessage) string {
 	if userName == "" {
 		userName = "user"
@@ -135,7 +126,7 @@ func FormatTimeline(char, userName string, msgs []store.ChatMessage) string {
 		}
 		ts := m.Time
 		if t, err := time.Parse(time.RFC3339, m.Time); err == nil {
-			ts = t.Format("2006-01-02 15:04")
+			ts = t.Format("02-01-2006 15:04")
 		}
 		text := strings.TrimSpace(m.Text)
 		if text == "" {
@@ -146,18 +137,36 @@ func FormatTimeline(char, userName string, msgs []store.ChatMessage) string {
 	return strings.TrimSpace(sb.String())
 }
 
-// ---- retention guards -----------------------------------------------------
+// ---- parsing --------------------------------------------------------------
 //
-// The LLM is told to append-only, but models will still drop whole days
-// (especially [LOG] entries) when they feel the sheet is long. These guards
-// make retention deterministic in code: Merge restores anything the model
-// dropped, and EnforceWindow trims by whole oldest days but never below a
-// floor, so the character never gets "goldfish brain".
+// Dates are accepted in either DD-MM-YYYY (canonical) or YYYY-MM-DD (ISO, what
+// models sometimes echo from the raw message timestamps). Everything is
+// normalised to DD-MM-YYYY on parse, so a format slip can no longer silently
+// drop entries.
 
 var (
-	stateRe = regexp.MustCompile(`^\[(\d{2}-\d{2}-\d{4})\]\s*(.*)$`)
-	logRe   = regexp.MustCompile(`^\[(\d{2}-\d{2}-\d{4})\s+(\d{2}:\d{2})\]\s*(.*)$`)
+	entryRe   = regexp.MustCompile(`^\[(\d{2}-\d{2}-\d{4}|\d{4}-\d{2}-\d{2})(?: (\d{2}:\d{2}))?\]\s*(.*)$`)
+	dateishRe = regexp.MustCompile(`^\[\d{2,4}[-/]\d{1,2}[-/]\d{2,4}`)
 )
+
+// normalizeDate converts a DD-MM-YYYY or YYYY-MM-DD date to canonical
+// DD-MM-YYYY, reporting whether it was a valid date.
+func normalizeDate(d string) (string, bool) {
+	if len(d) != 10 {
+		return "", false
+	}
+	if d[2] == '-' && d[5] == '-' {
+		if _, err := time.Parse("02-01-2006", d); err == nil {
+			return d, true
+		}
+	}
+	if d[4] == '-' && d[7] == '-' {
+		if t, err := time.Parse("2006-01-02", d); err == nil {
+			return t.Format("02-01-2006"), true
+		}
+	}
+	return "", false
+}
 
 type dayBlock struct {
 	date  string
@@ -180,16 +189,30 @@ func parseSheet(s string) map[string]*dayBlock {
 		if t == "" || t == "[USER STATE]" || t == "[LOG]" || strings.HasPrefix(t, "[End of") {
 			continue
 		}
-		if m := logRe.FindStringSubmatch(t); m != nil {
-			b := get(m[1])
-			b.logs = append(b.logs, t)
+		m := entryRe.FindStringSubmatch(t)
+		if m == nil {
 			continue
 		}
-		if m := stateRe.FindStringSubmatch(t); m != nil {
-			get(m[1]).state = t
+		d, ok := normalizeDate(m[1])
+		if !ok {
+			continue
+		}
+		b := get(d)
+		if m[2] != "" {
+			b.logs = append(b.logs, "["+d+" "+m[2]+"]"+tail(m[3]))
+		} else {
+			b.state = "[" + d + "]" + tail(m[3])
 		}
 	}
 	return days
+}
+
+func tail(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	return " " + s
 }
 
 func dateOrder(d string) string {
@@ -200,13 +223,18 @@ func dateOrder(d string) string {
 }
 
 func logOrder(line string) string {
-	if m := logRe.FindStringSubmatch(line); m != nil {
-		if t, err := time.Parse("02-01-2006 15:04", m[1]+" "+m[2]); err == nil {
-			return t.Format("2006-01-02 15:04")
-		}
-		return m[1] + " " + m[2]
+	m := entryRe.FindStringSubmatch(line)
+	if m == nil || m[2] == "" {
+		return line
 	}
-	return line
+	d, ok := normalizeDate(m[1])
+	if !ok {
+		return line
+	}
+	if t, err := time.Parse("02-01-2006 15:04", d+" "+m[2]); err == nil {
+		return t.Format("2006-01-02 15:04")
+	}
+	return d + " " + m[2]
 }
 
 func sortedDates(days map[string]*dayBlock) []string {
@@ -256,10 +284,10 @@ func cloneBlock(b *dayBlock) *dayBlock {
 	return nb
 }
 
-// Merge unions the previous sheet with the freshly distilled one so a model
-// that drops whole days (or individual entries) cannot lose history. For the
-// same day a newer entry wins on an identical timestamp; otherwise both are
-// kept. The result is re-rendered in canonical chronological order.
+// Merge unions the previous record with an incoming one so a model that drops
+// whole days (or individual entries) cannot lose history. For the same day a
+// newer entry wins on an identical timestamp; otherwise both are kept. The
+// result is re-rendered in canonical chronological order.
 func Merge(prev, next string) string {
 	pd, nd := parseSheet(prev), parseSheet(next)
 	out := map[string]*dayBlock{}
@@ -296,51 +324,179 @@ func Merge(prev, next string) string {
 	return renderSheet(out, order)
 }
 
-// EnforceWindow deterministically trims to the character budget by dropping
-// whole oldest days, but never below retainDays days (the memory floor). It
-// also canonicalises the sheet layout.
-func EnforceWindow(sheet string, maxChars, retainDays int) string {
-	canon := Merge(sheet, "")
-	if maxChars <= 0 {
-		return canon
+// ApplyDelta merges an extracted delta into the canonical record. It is the
+// same union as Merge (new state replaces that day's state, new log lines are
+// appended and deduped by timestamp) — nothing already stored is ever lost.
+func ApplyDelta(prev, delta string) string { return Merge(prev, delta) }
+
+// Retain applies the deterministic code-side retention policy:
+//   - per-entry character cap (newest text kept, prefix preserved);
+//   - per-day log cap (keep the newest N entries of each day);
+//   - total character budget by dropping whole oldest days, but never below
+//     retainDays days;
+//   - state hard cap by dropping the oldest state lines, but never the logs.
+//
+// The LLM never deletes; this function is the only thing that does.
+func Retain(sheet string, maxChars, retainDays, stateMaxDays, maxLogPerDay, maxEntryChars int) string {
+	days := parseSheet(sheet)
+	if maxEntryChars > 0 {
+		for _, b := range days {
+			for i, l := range b.logs {
+				b.logs[i] = capEntry(l, maxEntryChars)
+			}
+		}
 	}
-	if retainDays < 1 {
-		retainDays = 1
+	if maxLogPerDay > 0 {
+		for _, b := range days {
+			if len(b.logs) > maxLogPerDay {
+				b.logs = b.logs[len(b.logs)-maxLogPerDay:]
+			}
+		}
 	}
-	days := parseSheet(canon)
 	order := sortedDates(days)
-	for len(order) > retainDays && len([]rune(canon)) > maxChars {
-		delete(days, order[0])
-		order = order[1:]
-		canon = renderSheet(days, order)
+	canon := renderSheet(days, order)
+	if maxChars > 0 {
+		if retainDays < 1 {
+			retainDays = 1
+		}
+		for len(order) > retainDays && len([]rune(canon)) > maxChars {
+			delete(days, order[0])
+			order = order[1:]
+			canon = renderSheet(days, order)
+		}
+	}
+	if stateMaxDays > 0 {
+		var withState []string
+		for _, d := range order {
+			if b := days[d]; b != nil && b.state != "" {
+				withState = append(withState, d)
+			}
+		}
+		if len(withState) > stateMaxDays {
+			for _, d := range withState[:len(withState)-stateMaxDays] {
+				days[d].state = ""
+			}
+			canon = renderSheet(days, order)
+		}
 	}
 	return canon
 }
 
+// capEntry truncates the free text of a dated line to max runes, preserving
+// its "[date time] " prefix.
+func capEntry(line string, max int) string {
+	if max <= 0 {
+		return line
+	}
+	m := entryRe.FindStringSubmatch(line)
+	if m == nil {
+		return line
+	}
+	rest := m[3]
+	r := []rune(rest)
+	if len(r) <= max {
+		return line
+	}
+	prefix := line[:len(line)-len(rest)]
+	return prefix + string(r[:max]) + "…"
+}
+
 // IsValid reports whether an LLM sheet is parseable (a section marker plus at
-// least one dated entry). Used to refuse overwriting a good sheet with prose.
+// least one dated entry). Used to refuse overwriting a good record with prose.
 func IsValid(sheet string) bool {
 	if strings.TrimSpace(sheet) == "" {
 		return false
 	}
-	if !strings.Contains(sheet, "[USER STATE]") && !strings.Contains(sheet, "[LOG]") {
+	if !strings.Contains(sheet, "[USER STATE]") && !strings.Contains(sheet, "[LOG]") &&
+		!strings.Contains(sheet, "[STATE]") {
 		return false
 	}
 	return len(parseSheet(sheet)) > 0
 }
 
-// DayCount returns how many distinct dated days a sheet holds (for audit/logs).
+// DayCount returns how many distinct dated days a record holds (for audit/logs).
 func DayCount(sheet string) int { return len(parseSheet(sheet)) }
 
-// BuildUser turns the prompt template + sheets into the messages sent upstream.
-// macros are already applied to prompt by the caller.
-func BuildUser(prev, timeline string) string {
+// UnparsedDatedLines returns lines that look like dated entries but were not
+// recognised by the tolerant parser (e.g. a model invented a third layout).
+// Used for observability so silent data loss becomes visible.
+func UnparsedDatedLines(sheet string) []string {
+	var out []string
+	for _, raw := range strings.Split(sheet, "\n") {
+		t := strings.TrimSpace(raw)
+		if t == "" || t == "[USER STATE]" || t == "[LOG]" || t == "[STATE]" {
+			continue
+		}
+		if entryRe.MatchString(t) {
+			continue
+		}
+		if dateishRe.MatchString(t) {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// LogDay is one day's diary block for the L2 evictable log list.
+type LogDay struct {
+	Date string // canonical DD-MM-YYYY
+	Text string // the day's "[DD-MM-YYYY HH:MM] ..." lines, newline-joined
+}
+
+// LoadState returns the current-state lines (canonical, oldest-first), capped
+// to the newest maxDays when maxDays > 0. This is the L1 constant.
+func LoadState(root, char string, maxDays int) string {
+	days := parseSheet(Load(root, char))
+	order := sortedDates(days)
+	var lines []string
+	for _, d := range order {
+		if b := days[d]; b != nil && b.state != "" {
+			lines = append(lines, b.state)
+		}
+	}
+	if maxDays > 0 && len(lines) > maxDays {
+		lines = lines[len(lines)-maxDays:]
+	}
+	return strings.Join(lines, "\n")
+}
+
+// LogDays returns one LogDay per day that has log entries, oldest-first.
+func LogDays(root, char string) []LogDay {
+	days := parseSheet(Load(root, char))
+	order := sortedDates(days)
+	var out []LogDay
+	for _, d := range order {
+		b := days[d]
+		if b == nil || len(b.logs) == 0 {
+			continue
+		}
+		out = append(out, LogDay{Date: d, Text: strings.Join(b.logs, "\n")})
+	}
+	return out
+}
+
+// Rebuild unions many historical sheets into one canonical record. Used by the
+// one-off backfill (no LLM involved): every distilled_memory row ever written
+// to chat.jsonl is replayed so previously dropped days are recovered.
+func Rebuild(sheets []string) string {
+	out := ""
+	for _, s := range sheets {
+		if strings.TrimSpace(s) == "" {
+			continue
+		}
+		out = Merge(out, s)
+	}
+	return out
+}
+
+// BuildUser turns the current state + new timeline into the extractor's input.
+func BuildUser(state, timeline string) string {
 	var sb strings.Builder
-	sb.WriteString("[Previous Fact Sheet]\n")
-	if strings.TrimSpace(prev) == "" {
-		sb.WriteString("(empty — this is the first distillation)\n")
+	sb.WriteString("[Current State]\n")
+	if strings.TrimSpace(state) == "" {
+		sb.WriteString("(none yet)\n")
 	} else {
-		sb.WriteString(prev + "\n")
+		sb.WriteString(state + "\n")
 	}
 	sb.WriteString("\n[New Messages]\n")
 	sb.WriteString(timeline)

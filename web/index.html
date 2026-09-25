@@ -94,8 +94,9 @@
         <button id="btn-reload-blocks">重载</button>
       </div>
       <p class="meta">拖动卡片排序。预算：<b>输入 = 上下文窗口 − 回复预留</b>。超预算时按级别淘汰：
-        <b>L1 锁定</b>（system/角色卡/distilled 记忆，永不裁剪）→ <b>L3 弹性</b>（实验块，整个先砍）→
-        <b>L2 可裁剪</b>（RAG 按 reranker 分数砍最低分，chat 从最旧轮淘汰、保底 4 轮）。</p>
+        <b>L1 锁定</b>（system/角色卡/distilled_state，永不裁剪）；<b>L3 弹性</b>（实验块，整个先砍）；
+        <b>L2 可裁剪</b>：先比 <b>priority</b>（数字小=先砍），同一 priority 再按 rank（RAG 砍最低分、chat 淘汰最旧、日记淘汰最旧整天），
+        每个 L2 块各自保住 floor（chat 保底轮数、日记至少 retain_days 天）。chat 固定为 L2，改 Level 无效，请用 priority 调。</p>
       <div id="blocks"></div>
       <div id="preview-modal" class="modal hidden">
         <div class="modal-box glass">
@@ -144,7 +145,7 @@
         <p class="meta">开关只决定“自动注不注入”；测试按钮随时手查。命中明细每轮记进 Audit → memory 字段。</p>
       </div>
       <div class="glass pad form">
-        <b>Distilled Memory <small class="meta">（移植自 ST Distilled-Memory：把最近对话蒸馏成带日期的事实表，注入 distilled block，并以 distilled_memory 记录进 chat.jsonl）</small></b>
+        <b>Distilled Memory <small class="meta">（LLM 只提取增量，代码拥有记录与保留策略：STATE 常驻 L1，LOG 按天在 L2 被系统淘汰，并以 distilled_memory 记进 chat.jsonl）</small></b>
         <div class="row">
           <label class="meta"><input type="checkbox" id="dmem-enabled"> 自动蒸馏</label>
           <label>每 <input id="dmem-interval" type="number" min="1" value="8" style="width:56px"> 个用户轮</label>
@@ -154,6 +155,12 @@
           <button id="btn-dmem-run" class="primary">立即蒸馏</button>
           <button id="btn-dmem-save">保存</button>
           <span id="dmem-meta" class="meta">—</span>
+        </div>
+        <div class="row">
+          <label>STATE 保留 <input id="dmem-state-days" type="number" min="1" value="30" style="width:64px"> 天</label>
+          <label>每天最多 <input id="dmem-perday" type="number" min="1" value="40" style="width:56px"> 条</label>
+          <label>单条最多 <input id="dmem-entry" type="number" min="20" value="300" style="width:64px"> 字</label>
+          <button id="btn-dmem-rebuild" title="从 chat.jsonl 里所有 distilled_memory 记录重建事实表（找回旧版被丢弃的天，不调用 LLM）">回填旧记录</button>
         </div>
         <textarea id="dmem-prompt" rows="6" placeholder="蒸馏提示词（留空用内置默认）"></textarea>
         <div class="row"><button id="btn-dmem-prompt-reset">恢复默认提示词</button><button id="btn-dmem-prompt-view">查看已保存事实表</button></div>

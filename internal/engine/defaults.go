@@ -28,9 +28,19 @@ func DefaultBlocks() []Block {
 			Template: "{{character_card}}",
 		},
 		{
-			ID: "distilled", Role: "system", Order: 40, Enabled: true, Level: LevelLocked,
-			Source:   Source{Type: "distilled", Collection: "default"},
-			Template: "<User State(Distilled Memory)>\n{{distilled}}\n</User State>",
+			// Current one-line-per-day snapshot. Small and code-capped, so it
+			// stays L1: the identity/state layer is always present.
+			ID: "distilled_state", Role: "system", Order: 40, Enabled: true, Level: LevelLocked,
+			Source:   Source{Type: "distilled_state", Collection: "default"},
+			Template: "<User State(Distilled Memory)>\n{{distilled_state}}\n</User State>",
+		},
+		{
+			// The diary. L2 with the highest evict priority: under budget
+			// pressure the oldest whole days are dropped by the engine (never
+			// by the LLM) after chat and RAG have given way.
+			ID: "distilled_log", Role: "system", Order: 41, Enabled: true, Level: LevelTrim,
+			Source:   Source{Type: "distilled_log", Collection: "default"},
+			Template: "<Memory Log>\n{{items}}\n</Memory Log>",
 		},
 		{
 			ID: "rag_mcp", Role: "system", Order: 55, Enabled: true, Level: LevelTrim,

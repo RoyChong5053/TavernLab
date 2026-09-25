@@ -16,9 +16,10 @@ Prompt IDE + 薄Chat UI，替代 SillyTavern 臃肿部分。Plan v2 定案。
 ## 核心抽象
 
 - `order` = 放哪里；`Level` = 超预算时谁先被淘汰
-  - L1 locked: time_anchor, system, character, distilled（永不裁剪）
-  - L2 trim: RAG 命中、chat（按 rerank 分数 / 轮龄淘汰，保底 4 轮）
+  - L1 locked: time_anchor, system, character, distilled_state（永不裁剪）
+  - L2 trim: RAG 命中、chat、distilled_log（先比 `evict_priority`：数字小=先砍；同层再按 rank；各自有 floor，chat 保底轮数、日记至少 retain_days 天）
   - L3 elastic: 实验性 block（空间不够整个先砍）
+  - chat 固定为 L2（改 Level 无效），用 `evict_priority` 调它与 RAG/日记的让位顺序
 - Context Budget = `context_window − reply_reserve`，默认 `16384 − 4096 = 12288`（reply_reserve 同时作为上游 max_tokens）
 - Audit 即核心：每次生成存 `data/audit/<id>.json`（各块tokens/Dropped/raw/reply/upstream usage），支持 Replay / Edit&Replay
 

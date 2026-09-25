@@ -43,6 +43,11 @@ type Block struct {
 	Budget   Budget `json:"budget"`
 	Source   Source `json:"source"`
 	Template string `json:"template"`
+	// EvictPriority orders L2 blocks against each other: lower is evicted
+	// first, and the whole tier is drained (down to its floor) before the
+	// next tier is touched. nil = infer from Source.Type so heterogeneous
+	// lists never share one 0..1 scale (the "average everyone" bug).
+	EvictPriority *int `json:"evict_priority,omitempty"`
 	// Content is resolved text for this turn (after source fetch +
 	// template render). Empty means "use Template as-is" or "filled from a
 	// list source at assemble time".
@@ -186,7 +191,27 @@ type l2List struct {
 	protected []bool
 	keep      []bool
 	weight    float64
+	priority  int
 	sumAll    int
+}
+
+// resolvePriority returns the L2 eviction tier for a block (lower = evicted
+// first). An explicit EvictPriority always wins; otherwise it is inferred from
+// the source so the default order is chat(0) -> RAG(1) -> distilled log(2):
+// recent chat is squeezed to its floor first, retrieval next, the diary last.
+func resolvePriority(b Block) int {
+	if b.EvictPriority != nil {
+		return *b.EvictPriority
+	}
+	switch b.Source.Type {
+	case "chat":
+		return 0
+	case "distilled_log":
+		return 2
+	case "mcp", "vectra":
+		return 1
+	}
+	return 1
 }
 
 // Assemble builds the final prompt.
@@ -241,12 +266,12 @@ func Assemble(in Input) AssembleResult {
 			for i, t := range in.Turns {
 				items[i] = Item{Role: t.Role, Text: t.Content, ImageTokens: t.ImageTokens}
 			}
-			l2byID[b.ID] = &l2List{id: b.ID, role: b.Role, order: b.Order, isChat: true, items: items, weight: 1}
+			l2byID[b.ID] = &l2List{id: b.ID, role: b.Role, order: b.Order, isChat: true, items: items, weight: 1, priority: resolvePriority(b)}
 			l2order = append(l2order, b.ID)
 			continue
 		}
 		if il, ok := listByID[b.ID]; ok {
-			l := &l2List{id: b.ID, role: b.Role, order: b.Order, tmpl: b.Template, items: il.Items, weight: il.Weight}
+			l := &l2List{id: b.ID, role: b.Role, order: b.Order, tmpl: b.Template, items: il.Items, weight: il.Weight, priority: resolvePriority(b)}
 			if l.weight <= 0 {
 				l.weight = 1
 			}
@@ -297,7 +322,7 @@ func Assemble(in Input) AssembleResult {
 			elasticTok[b.ID] = tk
 		case LevelTrim:
 			// A fixed L2 block is a one-item evictable list.
-			l2byID[b.ID] = &l2List{id: b.ID, role: b.Role, order: b.Order, items: []Item{{Text: text}}, weight: 0.5}
+			l2byID[b.ID] = &l2List{id: b.ID, role: b.Role, order: b.Order, items: []Item{{Text: text}}, weight: 0.5, priority: resolvePriority(b)}
 			l2order = append(l2order, b.ID)
 		default:
 			lockedText[b.ID] = text
@@ -381,12 +406,16 @@ func Assemble(in Input) AssembleResult {
 		target = 0
 	}
 
-	// Evict L2 items (lowest weighted rank first) until they fit the target.
+	// Evict L2 items until they fit the target. Eviction is lexicographic:
+	// lower EvictPriority first, then (within a tier) lowest weighted rank.
+	// This drains a tier down to its floor before touching the next, instead
+	// of averaging heterogeneous sources on one 0..1 scale.
 	cur := l2Total
 	for cur > target {
-		best := math.Inf(1)
 		var bi *l2List
 		bii := -1
+		bestP := 0
+		bestER := 0.0
 		for _, id := range l2order {
 			l := l2byID[id]
 			for i := range l.items {
@@ -394,10 +423,8 @@ func Assemble(in Input) AssembleResult {
 					continue
 				}
 				er := l.rank[i] * l.weight
-				if er < best {
-					best = er
-					bi = l
-					bii = i
+				if bi == nil || l.priority < bestP || (l.priority == bestP && er < bestER) {
+					bi, bii, bestP, bestER = l, i, l.priority, er
 				}
 			}
 		}

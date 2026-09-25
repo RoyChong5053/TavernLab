@@ -236,7 +236,7 @@ const LEVELS = [
   { v: 2, t: 'L2 可裁剪（保底后淘汰）' },
   { v: 3, t: 'L3 弹性（最先整个砍）' },
 ];
-const SOURCES = ['static', 'character', 'distilled', 'mcp', 'chat'];
+const SOURCES = ['static', 'character', 'distilled_state', 'distilled_log', 'distilled', 'mcp', 'chat'];
 function renderBlocks() {
   const el = $('#blocks');
   el.innerHTML = '';
@@ -261,6 +261,8 @@ function renderBlocks() {
       <div class="meta blk-meta">
         role <select data-id="${b.id}" data-k="role">${roleOpts}</select>
         source <select data-id="${b.id}" data-k="source">${srcOpts}</select>
+        <label title="L2 淘汰优先级：数字小=先被砍；留空=按来源默认(chat 0 / RAG 1 / 日记 2)">priority
+          <input type="number" data-id="${b.id}" data-k="evict_priority" value="${b.evict_priority ?? ''}" placeholder="auto" style="width:64px"></label>
         ${b.source && b.source.collection ? '<span>collection: ' + b.source.collection + '</span>' : ''}
       </div>
       <textarea rows="2" data-id="${b.id}" data-k="template" placeholder="模板；list 源用 {{rag}} / {{items}} 占位">${(b.template || '').replace(/</g, '&lt;')}</textarea>`;
@@ -274,7 +276,10 @@ function renderBlocks() {
       if (k === 'enabled') b.enabled = inp.checked;
       else if (k === 'level') b.level = +inp.value;
       else if (k === 'role') b.role = inp.value;
-      else if (k === 'source') b.source = Object.assign({}, b.source, { type: inp.value });
+      else if (k === 'evict_priority') {
+        const v = inp.value.trim();
+        if (v === '') delete b.evict_priority; else b.evict_priority = +v;
+      } else if (k === 'source') b.source = Object.assign({}, b.source, { type: inp.value });
       else b[k] = inp.value;
       scheduleBlockSave();
     };
@@ -995,13 +1000,17 @@ async function loadDistill() {
     $('#dmem-interval').value = j.interval || 8;
     $('#dmem-maxchars').value = j.max_chars || 4000;
     $('#dmem-retain').value = j.retain_days || 3;
+    $('#dmem-state-days').value = j.state_max_days || 30;
+    $('#dmem-perday').value = j.max_log_per_day || 40;
+    $('#dmem-entry').value = j.max_entry_chars || 300;
     $('#dmem-model').value = j.model || '';
     // Open editable prompt: always show the effective template, not a blank box.
     $('#dmem-prompt').value = j.prompt || distillDefaultPrompt;
     $('#dmem-prompt').placeholder = '蒸馏提示词（可直接编辑；点“恢复默认提示词”重置）';
     const m = j.meta || {};
-    $('#dmem-meta').textContent = m.runs ? `已运行 ${m.runs} 次 · 上次 ${(m.last_run || '').replace('T', ' ').replace(/\+.*$/, '')}` : '尚未蒸馏';
-    $('#dmem-out').textContent = (j.sheet && j.sheet.trim()) ? j.sheet : '（还没有事实表，攒够轮数或点“立即蒸馏”）';
+    const days = j.days || 0;
+    $('#dmem-meta').textContent = (m.runs ? `已运行 ${m.runs} 次 · 上次 ${(m.last_run || '').replace('T', ' ').replace(/\+.*$/, '')}` : '尚未蒸馏') + (days ? ` · ${days} 天日志` : '');
+    $('#dmem-out').textContent = (j.sheet && j.sheet.trim()) ? j.sheet : '（还没有记录，攒够轮数或点“立即蒸馏”）';
   } catch (e) { toast('蒸馏信息加载失败：' + e.message, 'err'); }
 }
 async function saveDistill(silent) {
@@ -1012,6 +1021,9 @@ async function saveDistill(silent) {
       distill_interval: +$('#dmem-interval').value || 8,
       distill_max_chars: +$('#dmem-maxchars').value || 4000,
       distill_retain_days: +$('#dmem-retain').value || 3,
+      distill_state_max_days: +$('#dmem-state-days').value || 30,
+      distill_max_log_per_day: +$('#dmem-perday').value || 40,
+      distill_max_entry_chars: +$('#dmem-entry').value || 300,
       distill_model: $('#dmem-model').value.trim(),
       distill_prompt: $('#dmem-prompt').value,
     }),
@@ -1019,7 +1031,7 @@ async function saveDistill(silent) {
   if (!silent) toast('蒸馏设置已保存');
 }
 $('#btn-dmem-save').onclick = () => asyncAction($('#btn-dmem-save'), () => saveDistill(false));
-['dmem-enabled', 'dmem-interval', 'dmem-maxchars', 'dmem-retain', 'dmem-model', 'dmem-prompt'].forEach((id) => {
+['dmem-enabled', 'dmem-interval', 'dmem-maxchars', 'dmem-retain', 'dmem-state-days', 'dmem-perday', 'dmem-entry', 'dmem-model', 'dmem-prompt'].forEach((id) => {
   const el = document.getElementById(id); if (el) el.addEventListener('change', () => saveDistill(true).catch((e) => toast('保存失败：' + e.message, 'err')));
 });
 $('#btn-dmem-run').onclick = () => asyncAction($('#btn-dmem-run'), async () => {
@@ -1036,6 +1048,14 @@ $('#btn-dmem-prompt-reset').onclick = () => {
   toast('已恢复内置默认提示词（点保存生效）');
 };
 $('#btn-dmem-prompt-view').onclick = () => loadDistill();
+$('#btn-dmem-rebuild').onclick = () => asyncAction($('#btn-dmem-rebuild'), async () => {
+  if (!confirm('从 chat.jsonl 的所有 distilled_memory 记录重建事实表？会先备份为 distilled.md.bak，不调用 LLM。')) return;
+  const r = await api('/api/distilled/rebuild', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ session: settings.char }) });
+  const j = await r.json();
+  if (!j.ok) throw new Error(j.error || ('HTTP ' + r.status));
+  toast(`回填完成：${j.sheets} 条记录 → ${j.days} 天`);
+  await loadDistill();
+});
 
 /* ---------- models ---------- */
 async function refreshModels() {
