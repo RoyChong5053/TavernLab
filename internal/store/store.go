@@ -34,25 +34,26 @@ type ChatMessage struct {
 
 // Audit records one generation: the "why did the model say that" answer.
 type Audit struct {
-	ID        string         `json:"id"`
-	Time      string         `json:"time"`
-	Model     string         `json:"model"`
-	Tier      int            `json:"tier,omitempty"`     // chosen budget window
-	Overflow  bool           `json:"overflow,omitempty"` // assembled prompt exceeded largest tier
-	Budget    int            `json:"budget_tokens"`
-	TotalTok  int            `json:"total_tokens"`
-	Estimate  int            `json:"estimate_tokens,omitempty"` // heuristic pre-call estimate
-	Actual    int            `json:"actual_tokens,omitempty"`   // upstream usage.prompt_tokens
-	Completion int           `json:"completion_tokens,omitempty"`
-	Finish    string         `json:"finish_reason,omitempty"` // stop | length | ...
-	MaxTokens int            `json:"max_tokens,omitempty"`
-	ImageCount int           `json:"image_count,omitempty"`
-	Blocks    []BlockRow     `json:"blocks"`
-	Dropped   []string       `json:"dropped"`
-	Raw       map[string]any `json:"raw_request"`
-	ReplyText string         `json:"reply_text,omitempty"`
-	Upstream  map[string]any `json:"upstream_usage,omitempty"`
-	Memory    map[string]any `json:"memory,omitempty"` // mcp recall: query/collection/hits/error
+	ID          string         `json:"id"`
+	Time        string         `json:"time"`
+	Model       string         `json:"model"`
+	Tier        int            `json:"tier,omitempty"`     // chosen budget window
+	Overflow    bool           `json:"overflow,omitempty"` // assembled prompt exceeded largest tier
+	Budget      int            `json:"budget_tokens"`
+	TotalTok    int            `json:"total_tokens"`
+	Estimate    int            `json:"estimate_tokens,omitempty"` // heuristic pre-call estimate
+	Actual      int            `json:"actual_tokens,omitempty"`   // upstream usage.prompt_tokens
+	Completion  int            `json:"completion_tokens,omitempty"`
+	Finish      string         `json:"finish_reason,omitempty"` // stop | length | error | ...
+	StreamError string         `json:"stream_error,omitempty"`  // non-empty when the upstream stream was cut
+	MaxTokens   int            `json:"max_tokens,omitempty"`
+	ImageCount  int            `json:"image_count,omitempty"`
+	Blocks      []BlockRow     `json:"blocks"`
+	Dropped     []string       `json:"dropped"`
+	Raw         map[string]any `json:"raw_request"`
+	ReplyText   string         `json:"reply_text,omitempty"`
+	Upstream    map[string]any `json:"upstream_usage,omitempty"`
+	Memory      map[string]any `json:"memory,omitempty"` // mcp recall: query/collection/hits/error
 }
 
 // BlockRow mirrors engine.BlockUsage for storage.

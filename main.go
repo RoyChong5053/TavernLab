@@ -1072,11 +1072,17 @@ func main() {
 				events.publish(session, msg)
 			}
 			maybeDistill(st, client, cfg.DataRoot, s, session)
+			doneReason := replyFinish(respBody)
+			if status >= 400 {
+				doneReason = "error"
+			} else if doneReason == "" {
+				doneReason = "stop"
+			}
 			w.WriteHeader(status)
 			writeJSON(w, map[string]any{
 				"model": model, "created_at": time.Now().Format(time.RFC3339),
 				"message":     map[string]any{"role": "assistant", "content": reply},
-				"done_reason": "stop", "done": true,
+				"done_reason": doneReason, "done": true,
 			})
 			return
 		}
@@ -1085,11 +1091,19 @@ func main() {
 			http.Error(w, "streaming unsupported", 500)
 			return
 		}
-		status, full, usage := forwardOllamaStream(client, s.Upstream, s.APIKey, upBody, model, w, flusher)
-		rebuilt, _ := json.Marshal(map[string]any{
-			"choices":        []map[string]any{{"message": map[string]any{"role": "assistant", "content": full}}},
+		status, full, usage, finish := forwardOllamaStream(client, s.Upstream, s.APIKey, upBody, model, w, flusher)
+		rebuiltBody := map[string]any{
+			"choices": []map[string]any{{
+				"index":         0,
+				"message":       map[string]any{"role": "assistant", "content": full},
+				"finish_reason": finish,
+			}},
 			"stream_rebuilt": true, "via": "ollama-shim",
-		})
+		}
+		if finish == "error" {
+			rebuiltBody["incomplete"] = true
+		}
+		rebuilt, _ := json.Marshal(rebuiltBody)
 		_ = st.SaveAudit(toAudit(auditID, model, res, upBody, rebuilt, usage, memInfo))
 		logTurn("app.stream", status, model, session, res, strings.TrimSpace(full), memInfo, usagePromptTokens(usage))
 		updateCalibration(cfg.DataRoot, res.TotalTok, usagePromptTokens(usage))
@@ -1209,6 +1223,7 @@ func toAudit(id string, model any, res engine.AssembleResult, upBody, respBody [
 	_ = json.Unmarshal(respBody, &resp)
 	reply := ""
 	finish := ""
+	streamErr := ""
 	if resp != nil {
 		if ch, ok := resp["choices"].([]any); ok && len(ch) > 0 {
 			if m, ok := ch[0].(map[string]any); ok {
@@ -1218,6 +1233,11 @@ func toAudit(id string, model any, res engine.AssembleResult, upBody, respBody [
 				finish, _ = m["finish_reason"].(string)
 			}
 		}
+		streamErr, _ = resp["stream_error"].(string)
+	}
+	// A cut stream must never be recorded as a clean stop.
+	if streamErr != "" || resp["incomplete"] == true {
+		finish = "error"
 	}
 	mName := "default"
 	if s, ok := model.(string); ok && s != "" {
@@ -1263,7 +1283,7 @@ func toAudit(id string, model any, res engine.AssembleResult, upBody, respBody [
 		ID: id, Time: time.Now().Format(time.RFC3339), Model: mName,
 		Tier: res.Tier, Overflow: res.Overflow,
 		Budget: res.BudgetTok, TotalTok: res.TotalTok, Estimate: res.TotalTok, Actual: actual,
-		Completion: completion, Finish: finish, MaxTokens: maxTok, ImageCount: imgCount,
+		Completion: completion, Finish: finish, StreamError: streamErr, MaxTokens: maxTok, ImageCount: imgCount,
 		Blocks:  rows,
 		Dropped: res.Dropped, Raw: raw, ReplyText: reply, Upstream: usage,
 		Memory: mem,
@@ -1589,48 +1609,60 @@ func streamUpBody(model any, msgs []map[string]any, stream bool, maxTokens int) 
 // NDJSON chunks ({"message":{"content":...},"done":false} … {"done":true}).
 // Returns upstream status, full assistant text (for audit/JSONL), and usage
 // when the provider reports it.
-func forwardOllamaStream(client *http.Client, upstream, apiKey string, upBody []byte, model string, w http.ResponseWriter, flusher http.Flusher) (int, string, map[string]any) {
+func forwardOllamaStream(client *http.Client, upstream, apiKey string, upBody []byte, model string, w http.ResponseWriter, flusher http.Flusher) (int, string, map[string]any, string) {
 	req, err := http.NewRequest("POST", strings.TrimRight(upstream, "/")+"/v1/chat/completions", bytes.NewReader(upBody))
 	if err != nil {
-		return 500, "", nil
+		return 500, "", nil, "error"
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/event-stream")
 	if apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return 502, "", nil
+		return 502, "", nil, "error"
 	}
 	defer resp.Body.Close()
 	w.Header().Set("Content-Type", "application/x-ndjson")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.WriteHeader(resp.StatusCode)
-	emit := func(content string, done bool) {
+
+	writeTerm := func(doneReason, errMsg string) {
+		term := map[string]any{
+			"model": model, "created_at": time.Now().Format(time.RFC3339),
+			"message":     map[string]any{"role": "assistant", "content": ""},
+			"done_reason": doneReason, "done": true,
+		}
+		if errMsg != "" {
+			term["error"] = errMsg
+		}
+		line, _ := json.Marshal(term)
+		_, _ = w.Write(append(line, '\n'))
+		flusher.Flush()
+	}
+
+	// Upstream rejected the request (auth/quota/bad model): report a terminal
+	// error instead of fabricating a successful empty completion.
+	if resp.StatusCode >= 400 {
+		b, _ := io.ReadAll(resp.Body)
+		obs.Warn("app upstream stream error", map[string]any{"status": resp.StatusCode, "body": excerpt(string(b), 300)})
+		writeTerm("error", excerpt(string(b), 500))
+		return resp.StatusCode, "", nil, "error"
+	}
+
+	emit := func(content string) {
 		line, _ := json.Marshal(map[string]any{
 			"model": model, "created_at": time.Now().Format(time.RFC3339),
-			"message":     map[string]any{"role": "assistant", "content": content},
-			"done_reason": map[string]any(nil), "done": done,
+			"message": map[string]any{"role": "assistant", "content": content},
+			"done":    false,
 		})
-		// Ollama omits done_reason until the end; keep key absent when streaming.
-		if !done {
-			line, _ = json.Marshal(map[string]any{
-				"model": model, "created_at": time.Now().Format(time.RFC3339),
-				"message": map[string]any{"role": "assistant", "content": content},
-				"done":    false,
-			})
-		} else {
-			line, _ = json.Marshal(map[string]any{
-				"model": model, "created_at": time.Now().Format(time.RFC3339),
-				"message":     map[string]any{"role": "assistant", "content": ""},
-				"done_reason": "stop", "done": true,
-			})
-		}
 		_, _ = w.Write(append(line, '\n'))
 		flusher.Flush()
 	}
 	var full strings.Builder
 	var usage map[string]any
+	finishReason := ""
 	sc := bufio.NewScanner(resp.Body)
 	sc.Buffer(make([]byte, 1024*1024), 1024*1024)
 	for sc.Scan() {
@@ -1639,14 +1671,18 @@ func forwardOllamaStream(client *http.Client, upstream, apiKey string, upBody []
 			continue
 		}
 		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		if payload == "" || payload == "[DONE]" {
+		if payload == "" {
 			continue
+		}
+		if payload == "[DONE]" {
+			break
 		}
 		var chunk struct {
 			Choices []struct {
 				Delta struct {
 					Content string `json:"content"`
 				} `json:"delta"`
+				FinishReason string `json:"finish_reason"`
 			} `json:"choices"`
 			Usage map[string]any `json:"usage"`
 		}
@@ -1656,15 +1692,28 @@ func forwardOllamaStream(client *http.Client, upstream, apiKey string, upBody []
 		for _, c := range chunk.Choices {
 			if c.Delta.Content != "" {
 				full.WriteString(c.Delta.Content)
-				emit(c.Delta.Content, false)
+				emit(c.Delta.Content)
+			}
+			if c.FinishReason != "" {
+				finishReason = c.FinishReason
 			}
 		}
 		if chunk.Usage != nil {
 			usage = chunk.Usage
 		}
 	}
-	emit("", true)
-	return resp.StatusCode, full.String(), usage
+	if err := sc.Err(); err != nil {
+		obs.Warn("app upstream stream interrupted", map[string]any{
+			"finish_reason": finishReason, "reply_len": full.Len(), "error": err.Error(),
+		})
+		writeTerm("error", "upstream stream interrupted: "+err.Error())
+		return resp.StatusCode, full.String(), usage, "error"
+	}
+	if finishReason == "" {
+		finishReason = "stop"
+	}
+	writeTerm(finishReason, "")
+	return resp.StatusCode, full.String(), usage, finishReason
 }
 
 // stubTitle falls back to the prompt head when the title LLM call fails.
@@ -1993,4 +2042,20 @@ func replyText(respBody []byte) string {
 // rebuiltText extracts assistant text from the stream-rebuilt audit body.
 func rebuiltText(rebuilt []byte) string {
 	return replyText(rebuilt)
+}
+
+// replyFinish extracts choices[0].finish_reason from an upstream body.
+func replyFinish(respBody []byte) string {
+	var resp map[string]any
+	_ = json.Unmarshal(respBody, &resp)
+	if resp == nil {
+		return ""
+	}
+	if ch, ok := resp["choices"].([]any); ok && len(ch) > 0 {
+		if m, ok := ch[0].(map[string]any); ok {
+			f, _ := m["finish_reason"].(string)
+			return f
+		}
+	}
+	return ""
 }

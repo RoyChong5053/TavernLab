@@ -75,6 +75,7 @@ func Forward(client *http.Client, upstream, apiKey string, body []byte, stream b
 	}
 	var full strings.Builder
 	var usage map[string]any
+	finishReason := ""
 	sc := bufio.NewScanner(resp.Body)
 	sc.Buffer(make([]byte, 1024*1024), 1024*1024)
 	for sc.Scan() {
@@ -88,20 +89,27 @@ func Forward(client *http.Client, upstream, apiKey string, body []byte, stream b
 		}
 		if strings.HasPrefix(line, "data:") {
 			payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-			if payload == "" || payload == "[DONE]" {
+			if payload == "" {
 				continue
+			}
+			if payload == "[DONE]" {
+				break
 			}
 			var chunk struct {
 				Choices []struct {
 					Delta struct {
 						Content string `json:"content"`
 					} `json:"delta"`
+					FinishReason string `json:"finish_reason"`
 				} `json:"choices"`
 				Usage map[string]any `json:"usage"`
 			}
 			if json.Unmarshal([]byte(payload), &chunk) == nil {
 				for _, c := range chunk.Choices {
 					full.WriteString(c.Delta.Content)
+					if c.FinishReason != "" {
+						finishReason = c.FinishReason
+					}
 				}
 				if chunk.Usage != nil {
 					usage = chunk.Usage
@@ -109,10 +117,58 @@ func Forward(client *http.Client, upstream, apiKey string, body []byte, stream b
 			}
 		}
 	}
-	rebuilt, _ := json.Marshal(map[string]any{
-		"choices":        []map[string]any{{"message": map[string]any{"role": "assistant", "content": full.String()}}},
+
+	// A scanner error means the upstream stream was cut mid-flight (network
+	// reset, one-api timeout, client abort). Never treat that as a clean stop:
+	// surface it to the client and mark the persisted reply as incomplete.
+	broken := ""
+	if err := sc.Err(); err != nil {
+		broken = err.Error()
+		obs.Warn("upstream stream interrupted", map[string]any{
+			"finish_reason": finishReason,
+			"reply_len":     full.Len(),
+			"error":         broken,
+		})
+	}
+	gotFinish := finishReason != ""
+	if !gotFinish {
+		finishReason = "stop"
+	}
+	if broken != "" {
+		// A cut stream is not a clean stop.
+		finishReason = "error"
+	}
+	if broken != "" {
+		payload, _ := json.Marshal(map[string]any{"error": map[string]any{
+			"message": "upstream stream interrupted: " + broken,
+			"type":    "stream_interrupted",
+		}})
+		_, _ = fmt.Fprintf(w, "data: %s\n\n", payload)
+		if flusher != nil {
+			flusher.Flush()
+		}
+	} else if !gotFinish {
+		// Ensure clients always get a terminal finish_reason even when the
+		// provider omitted it (OpenAI-compatible streams normally send [DONE]).
+		_, _ = fmt.Fprintf(w, "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"%s\"}]}\n\n", finishReason)
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
+
+	rebuiltBody := map[string]any{
+		"choices": []map[string]any{{
+			"index":         0,
+			"message":       map[string]any{"role": "assistant", "content": full.String()},
+			"finish_reason": finishReason,
+		}},
 		"stream_rebuilt": true, "time": time.Now().Format(time.RFC3339),
-	})
+	}
+	if broken != "" {
+		rebuiltBody["stream_error"] = broken
+		rebuiltBody["incomplete"] = true
+	}
+	rebuilt, _ := json.Marshal(rebuiltBody)
 	return resp.StatusCode, rebuilt, usage
 }
 

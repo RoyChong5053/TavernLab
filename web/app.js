@@ -537,7 +537,7 @@ async function send() {
       if (!r.ok || !r.body) throw new Error('HTTP ' + r.status + ' ' + (await r.text()).slice(0, 200));
       const reader = r.body.getReader();
       const dec = new TextDecoder();
-      let buf = '', full = '';
+      let buf = '', full = '', finishReason = '', streamError = '';
       const box = addMsg('assistant', '');
       pendingAssistant = box;
       const belly = box.querySelector('.body');
@@ -553,13 +553,23 @@ async function send() {
           if (!line.startsWith('data:')) continue;
           const payload = line.slice(5).trim();
           if (!payload || payload === '[DONE]') continue;
-          try { full += JSON.parse(payload).choices?.[0]?.delta?.content || ''; belly.textContent = full; } catch (err) { console.warn('sse parse', err, payload); }
+          try {
+            const j = JSON.parse(payload);
+            if (j.error) streamError = (j.error.message || 'stream error');
+            const fr = j.choices?.[0]?.finish_reason || '';
+            if (fr) finishReason = fr;
+            const delta = j.choices?.[0]?.delta?.content || '';
+            if (delta) { full += delta; belly.textContent = full; }
+          } catch (err) { console.warn('sse parse', err, payload); }
         }
       }
       belly.classList.remove('cursor');
       pendingAssistant = null;
       if (!full.trim()) { belly.textContent = '（空回复）'; }
       setPending(false);
+      if (streamError) toast('上游流中断，回复可能不完整：' + streamError, 'err', 6000);
+      else if (finishReason === 'length') toast('回复触到生成上限被截断（finish=length），可调大“生成上限”', 'err', 5000);
+      else if (finishReason === 'content_filter') toast('回复被安全策略截断（finish=content_filter）', 'err', 5000);
       if (full.trim()) classifyAndBadge(full);
       return;
     }
@@ -573,6 +583,7 @@ async function send() {
     const reply = j.choices?.[0]?.message?.content || '（无内容）';
     const finish = j.choices?.[0]?.finish_reason || '';
     if (finish === 'length') toast('回复被长度截断（finish=length），可调大“生成上限”', 'err', 4200);
+    else if (finish === 'content_filter') toast('回复被安全策略截断（finish=content_filter）', 'err', 4200);
     // SSE may have already rendered this reply (server publishes before our HTTP
     // response lands); only add the bubble if it isn't already the last one.
     const lastAi = [...document.querySelectorAll('#chat .msg.ai .body')].pop();
