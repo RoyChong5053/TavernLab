@@ -179,6 +179,16 @@ func normalizeBlocks(blocks []engine.Block) []engine.Block {
 		if b.Level < engine.LevelLocked || b.Level > engine.LevelElastic {
 			b.Level = defaultLevel(b)
 		}
+		// List-backed sources are always L2 (the engine builds them as
+		// evictable lists regardless of Level) and distilled_state is always
+		// L1; keep the editor's Level in sync with reality instead of showing
+		// a no-op value (chat in L3, RAG mislabelled L1, ...).
+		switch b.Source.Type {
+		case "chat", "mcp", "vectra", "distilled_log":
+			b.Level = engine.LevelTrim
+		case "distilled_state":
+			b.Level = engine.LevelLocked
+		}
 		b.Budget = engine.Budget{}
 		out = append(out, b)
 	}

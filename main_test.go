@@ -37,6 +37,25 @@ func TestNormalizeBlocksSplitsDistilled(t *testing.T) {
 	}
 }
 
+func TestNormalizeBlocksCoercesListLevels(t *testing.T) {
+	in := []engine.Block{
+		{ID: "rag_mcp", Role: "system", Order: 55, Enabled: true, Level: engine.LevelLocked, Source: engine.Source{Type: "mcp"}},
+		{ID: "chat", Role: "user", Order: 100, Enabled: true, Level: engine.LevelElastic, Source: engine.Source{Type: "chat"}},
+		{ID: "distilled_state", Role: "system", Order: 40, Enabled: true, Level: engine.LevelTrim, Source: engine.Source{Type: "distilled_state"}},
+	}
+	out := normalizeBlocks(in)
+	want := map[string]engine.Level{
+		"rag_mcp":         engine.LevelTrim,
+		"chat":            engine.LevelTrim,
+		"distilled_state": engine.LevelLocked,
+	}
+	for _, b := range out {
+		if w, ok := want[b.ID]; ok && b.Level != w {
+			t.Fatalf("%s level = %d, want %d", b.ID, b.Level, w)
+		}
+	}
+}
+
 func TestListInputsBuildsDistilledLog(t *testing.T) {
 	root := t.TempDir()
 	sheet := "[USER STATE]\n[25-09-2026] ok\n\n[LOG]\n[25-09-2026 10:00] a\n[26-09-2026 11:00] b"
