@@ -371,6 +371,13 @@ func main() {
 		}
 		defer resp.Body.Close()
 		b, _ := io.ReadAll(resp.Body)
+		// Never relay an upstream 401 as our own 401 — the frontend would read
+		// it as an expired session. Surface upstream failures as 502 instead.
+		if resp.StatusCode >= 400 {
+			obs.Warn("upstream models error", map[string]any{"status": resp.StatusCode, "body": excerpt(string(b), 200)})
+			http.Error(w, "upstream models error: "+excerpt(string(b), 200), 502)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(resp.StatusCode)
 		_, _ = w.Write(b)
@@ -1154,6 +1161,10 @@ func authGate(a *Auth, next http.Handler) http.Handler {
 		gated := strings.HasPrefix(p, "/api/") || strings.HasPrefix(p, "/v1/") || strings.HasPrefix(p, "/chars/")
 		if gated && !open[p] && !a.Check(r) {
 			w.Header().Set("Content-Type", "application/json")
+			// Marks a genuine gate rejection so the frontend can tell it apart
+			// from a proxied upstream 401 (e.g. /api/models) and only pop the
+			// login overlay for the former.
+			w.Header().Set("X-Auth-Required", "1")
 			w.WriteHeader(401)
 			_, _ = w.Write([]byte(`{"ok":false,"error":"unauthorized"}`))
 			return

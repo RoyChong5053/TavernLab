@@ -54,7 +54,12 @@ function authHeaders(h) {
 async function api(path, opts) {
   opts = opts || {};
   const r = await fetch(path, Object.assign({}, opts, { headers: authHeaders(opts.headers) }));
-  if (r.status === 401) { showLogin('登录已过期，请重新登录'); throw new Error('HTTP 401 未登录'); }
+  // Only OUR gate rejection pops the login overlay. A 401 proxied from the
+  // upstream (e.g. /api/models, /v1/chat/completions) must not log the user out.
+  if (r.status === 401 && r.headers.get('X-Auth-Required') === '1') {
+    showLogin('登录已过期，请重新登录');
+    throw new Error('HTTP 401 未登录');
+  }
   return r;
 }
 function withToken(url) {
