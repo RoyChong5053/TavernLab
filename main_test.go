@@ -113,6 +113,87 @@ func TestSaveImagesPersistsMedia(t *testing.T) {
 	}
 }
 
+func TestAppendChatIDDedupesRetriedTurn(t *testing.T) {
+	root := t.TempDir()
+	st := store.New(root)
+	const id = "turn-abc123"
+	first, err := st.AppendChatID("阿离", id, "user", "在吗")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.ID != id {
+		t.Fatalf("client id not honoured: %+v", first)
+	}
+	// The phone resends the same turn because it never saw the ack.
+	again, err := st.AppendChatID("阿离", id, "user", "在吗")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.ID != first.ID || again.Time != first.Time {
+		t.Fatalf("retry did not return the original row: %+v vs %+v", first, again)
+	}
+	msgs, _ := st.LoadAll("阿离")
+	if len(msgs) != 1 {
+		t.Fatalf("retry duplicated the row: %d rows", len(msgs))
+	}
+}
+
+func TestFindTurnReportsStoredReply(t *testing.T) {
+	root := t.TempDir()
+	st := store.New(root)
+	// Unknown id: nothing found, so a fresh turn must be generated.
+	if _, _, hasRow, _ := st.FindTurn("阿离", "nope"); hasRow {
+		t.Fatal("empty session reported a stored turn")
+	}
+	u, _ := st.AppendChatID("阿离", "turn-1", "user", "hi")
+	// User row stored but generation died: hasRow, no reply.
+	_, _, hasRow, hasReply := st.FindTurn("阿离", "turn-1")
+	if !hasRow || hasReply {
+		t.Fatalf("want row without reply, got row=%v reply=%v", hasRow, hasReply)
+	}
+	if _, err := st.AppendChat("阿离", "assistant", "hello back"); err != nil {
+		t.Fatal(err)
+	}
+	row, reply, hasRow, hasReply := st.FindTurn("阿离", "turn-1")
+	if !hasRow || !hasReply {
+		t.Fatalf("want row with reply, got row=%v reply=%v", hasRow, hasReply)
+	}
+	if row.ID != u.ID || reply.Text != "hello back" {
+		t.Fatalf("bad turn pair: %+v %+v", row, reply)
+	}
+	// A junk id must never match, and must not break the append path.
+	if _, err := st.AppendChatID("阿离", "bad id/with slash", "user", "x"); err != nil {
+		t.Fatal(err)
+	}
+	msgs, _ := st.LoadAll("阿离")
+	if len(msgs) != 3 {
+		t.Fatalf("junk id should append normally: %d rows", len(msgs))
+	}
+	if msgs[2].ID == "bad id/with slash" {
+		t.Fatal("unsanitised client id was stored verbatim")
+	}
+}
+
+func TestLoadMediaAsDataURLsRoundTrips(t *testing.T) {
+	root := t.TempDir()
+	const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+	paths, _, _ := saveImages(root, "阿离", []string{"data:image/png;base64," + png})
+	urls := loadMediaAsDataURLs(root, "阿离", paths)
+	if len(urls) != 1 {
+		t.Fatalf("want 1 rebuilt url, got %d", len(urls))
+	}
+	if !strings.HasPrefix(urls[0], "data:image/png;base64,") {
+		t.Fatalf("bad rebuilt url: %s", urls[0])
+	}
+	if !strings.HasSuffix(urls[0], png) {
+		t.Fatalf("rebuilt url lost the bytes: %s", urls[0])
+	}
+	// A missing file is skipped rather than poisoning the upstream request.
+	if got := loadMediaAsDataURLs(root, "阿离", []string{"media/gone.png"}); len(got) != 0 {
+		t.Fatalf("missing media should be skipped, got %v", got)
+	}
+}
+
 func TestStoreArchiveAndLoad(t *testing.T) {
 	root := t.TempDir()
 	st := store.New(root)

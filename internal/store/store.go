@@ -12,6 +12,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -129,6 +130,18 @@ func NewID() string {
 // so callers can broadcast it to SSE/ntfy subscribers. images are media
 // paths relative to the character package.
 func (s *Store) AppendChat(session, role, text string, images ...string) (ChatMessage, error) {
+	return s.AppendChatID(session, "", role, text, images...)
+}
+
+// AppendChatID is AppendChat with a caller-supplied id, which doubles as an
+// idempotency key. The phone client retries a turn it is not sure landed; if
+// the first attempt did land, this returns the original row instead of writing
+// a second copy. An empty id keeps the old random-id behaviour.
+//
+// Dedup scans only the tail of the file: a turn that is old enough to be out of
+// the tail window is also long since confirmed by the client's own poller, and
+// the scan stays cheap enough to run on every request.
+func (s *Store) AppendChatID(session, id, role, text string, images ...string) (ChatMessage, error) {
 	session = CleanSession(session)
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -136,8 +149,16 @@ func (s *Store) AppendChat(session, role, text string, images ...string) (ChatMe
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		return ChatMessage{}, err
 	}
+	if id = sanitizeMessageID(id); id != "" {
+		if existing, ok := s.tailHasID(session, id); ok {
+			return existing, nil
+		}
+	} else {
+		id = NewID()
+	}
+
 	msg := ChatMessage{
-		ID:     NewID(),
+		ID:     id,
 		Role:   role,
 		Text:   text,
 		Images: images,
@@ -153,6 +174,113 @@ func (s *Store) AppendChat(session, role, text string, images ...string) (ChatMe
 		return ChatMessage{}, err
 	}
 	return msg, nil
+}
+
+// chatTailWindow is how many trailing rows the idempotency scan considers.
+const chatTailWindow = 400
+// chatTailBytes caps how much of chat.jsonl the scan reads from the end. The
+// file is append-only, so the last slice is all a retry can possibly collide
+// with; reading it keeps a turn's cost constant instead of O(chat length).
+const chatTailBytes = 256 * 1024
+
+// sanitizeMessageID keeps client-supplied ids to a shape that is safe in a
+// JSONL field and in log lines. Anything else is discarded, which silently
+// turns the call back into a normal append rather than rejecting the turn.
+func sanitizeMessageID(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || len(raw) > 64 {
+		return ""
+	}
+	for _, r := range raw {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '-', r == '_', r == '.':
+		default:
+			return ""
+		}
+	}
+	return raw
+}
+
+// tailHasID reports whether the tail of the session already contains id.
+// Caller must hold s.mu.
+func (s *Store) tailHasID(session, id string) (ChatMessage, bool) {
+	found, _, hasRow, _ := s.findTurn(session, id)
+	return found, hasRow
+}
+
+// findTurn locates the row with id in the session tail and reports the
+// assistant row that immediately follows it. A retried user turn with no
+// following reply means the previous attempt died mid-generation; one with a
+// reply means the turn is fully done and the caller must not generate again.
+// Caller must hold s.mu.
+func (s *Store) findTurn(session, id string) (row ChatMessage, next ChatMessage, hasRow, hasNext bool) {
+	if id == "" {
+		return ChatMessage{}, ChatMessage{}, false, false
+	}
+	f, err := os.Open(s.chatPath(session))
+	if err != nil {
+		return ChatMessage{}, ChatMessage{}, false, false
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil || fi.Size() == 0 {
+		return ChatMessage{}, ChatMessage{}, false, false
+	}
+	start := int64(0)
+	if fi.Size() > chatTailBytes {
+		start = fi.Size() - chatTailBytes
+	}
+	if _, err := f.Seek(start, io.SeekStart); err != nil {
+		return ChatMessage{}, ChatMessage{}, false, false
+	}
+	buf := make([]byte, fi.Size()-start)
+	n, err := io.ReadFull(f, buf)
+	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
+		return ChatMessage{}, ChatMessage{}, false, false
+	}
+	lines := strings.Split(string(buf[:n]), "\n")
+	// The first line is partial whenever we started mid-file.
+	if start > 0 && len(lines) > 0 {
+		lines = lines[1:]
+	}
+	if len(lines) > chatTailWindow {
+		lines = lines[len(lines)-chatTailWindow:]
+	}
+	parsed := make([]ChatMessage, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var m ChatMessage
+		if err := json.Unmarshal([]byte(line), &m); err != nil {
+			continue
+		}
+		parsed = append(parsed, m)
+	}
+	for i := len(parsed) - 1; i >= 0; i-- {
+		if parsed[i].ID != id {
+			continue
+		}
+		if i+1 < len(parsed) && parsed[i+1].Role == "assistant" {
+			return parsed[i], parsed[i+1], true, true
+		}
+		return parsed[i], ChatMessage{}, true, false
+	}
+	return ChatMessage{}, ChatMessage{}, false, false
+}
+
+// FindTurn is the exported form of findTurn: it locates a user turn by its
+// client-supplied id and reports whether a reply to it already exists.
+func (s *Store) FindTurn(session, id string) (row ChatMessage, reply ChatMessage, hasRow, hasReply bool) {
+	session = CleanSession(session)
+	if sanitizeMessageID(id) == "" {
+		return ChatMessage{}, ChatMessage{}, false, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.findTurn(session, id)
 }
 
 // SaveMedia writes an image under the character package media/ dir and

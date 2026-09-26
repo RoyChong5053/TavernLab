@@ -1093,9 +1093,13 @@ func main() {
 		}
 		s := rt.get()
 		var in struct {
-			Model    string `json:"model"`
-			Stream   bool   `json:"stream"`
-			Messages []struct {
+			Model string `json:"model"`
+			Stream bool  `json:"stream"`
+			// ClientMsgID is the phone's idempotency key. The app retries a turn
+			// it is not sure landed, so the same id can arrive twice; the store
+			// returns the original row instead of writing a second copy.
+			ClientMsgID string `json:"client_msg_id"`
+			Messages    []struct {
 				Role    string   `json:"role"`
 				Content string   `json:"content"`
 				Images  []string `json:"images"`
@@ -1120,16 +1124,38 @@ func main() {
 			}
 		}
 		var upImages []string
-		if strings.TrimSpace(freshText) != "" || len(freshImages) > 0 {
-			paths, dataURLs, imgErr := saveImages(cfg.DataRoot, session, freshImages)
-			if len(freshImages) > 0 && len(paths) == 0 && len(dataURLs) == 0 {
-				obs.Warn("app image save failed", map[string]any{"session": session, "error": imgErrString(imgErr)})
-				http.Error(w, "图片保存失败："+imgErrString(imgErr), 400)
-				return
+		hasFresh := strings.TrimSpace(freshText) != "" || len(freshImages) > 0
+		// Idempotent retry: the phone resends a turn it never saw acknowledged.
+		// A stored row means the request did land; regenerating here would
+		// double-post the reply, so hand the existing one back instead.
+		priorRow, priorReply, hasPrior, hasPriorReply :=
+			st.FindTurn(session, in.ClientMsgID)
+		if hasFresh {
+			if hasPrior {
+				upImages = loadMediaAsDataURLs(cfg.DataRoot, session, priorRow.Images)
+				obs.Info("app turn retried", map[string]any{
+					"session": session, "client_msg_id": in.ClientMsgID,
+					"reply_exists": hasPriorReply,
+				})
+			} else {
+				paths, dataURLs, imgErr := saveImages(cfg.DataRoot, session, freshImages)
+				if len(freshImages) > 0 && len(paths) == 0 && len(dataURLs) == 0 {
+					obs.Warn("app image save failed", map[string]any{"session": session, "error": imgErrString(imgErr)})
+					http.Error(w, "图片保存失败："+imgErrString(imgErr), 400)
+					return
+				}
+				upImages = dataURLs
 			}
-			upImages = dataURLs
-			msg, _ := st.AppendChat(session, "user", strings.TrimSpace(freshText), paths...)
-			events.publish(session, msg)
+			if !hasPrior {
+				// A duplicate row would point at a second copy of the same photo,
+				// so only append when the turn is genuinely new.
+				msg, _ := st.AppendChatID(session, in.ClientMsgID, "user", strings.TrimSpace(freshText))
+				events.publish(session, msg)
+			}
+		}
+		if hasPrior && hasPriorReply {
+			writeOllamaReply(w, model, priorReply.Text, priorReply.ID, in.Stream)
+			return
 		}
 		all, _ := st.LoadAll(session)
 		turns := chatToTurns(cfg.DataRoot, session, all)
@@ -1530,6 +1556,63 @@ func buildUpMessages(msgs []engine.Message, imageDataURLs []string) []map[string
 		break
 	}
 	return out
+}
+
+// loadMediaAsDataURLs re-reads already-stored media and rebuilds the data URLs
+// the upstream wants. Used when a retried turn must be regenerated: the photos
+// are on disk from the first attempt, so there is no need to accept them again.
+func loadMediaAsDataURLs(root, session string, rel []string) []string {
+	if len(rel) == 0 {
+		return nil
+	}
+	base := filepath.Join(root, "characters", store.CleanSession(session))
+	out := make([]string, 0, len(rel))
+	for _, r := range rel {
+		if r == "" {
+			continue
+		}
+		b, err := os.ReadFile(filepath.Join(base, filepath.FromSlash(r)))
+		if err != nil || len(b) == 0 {
+			continue
+		}
+		mime := sniffImageMime(b)
+		out = append(out, "data:"+mime+";base64,"+base64.StdEncoding.EncodeToString(b))
+	}
+	return out
+}
+
+// writeOllamaReply answers a retried turn from stored truth. It emits the same
+// NDJSON shape as a real streaming reply (one content chunk plus the done
+// marker) so the client renders it through exactly one code path.
+func writeOllamaReply(w http.ResponseWriter, model, text, id string, stream bool) {
+	created := time.Now().Format(time.RFC3339)
+	if !stream {
+		writeJSON(w, map[string]any{
+			"model": model, "created_at": created, "message": map[string]any{
+				"role": "assistant", "content": text,
+			}, "done_reason": "stop", "done": true, "deduped": true,
+		})
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", 500)
+		return
+	}
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.WriteHeader(200)
+	enc := json.NewEncoder(w)
+	_ = enc.Encode(map[string]any{
+		"model": model, "created_at": created, "message": map[string]any{
+			"role": "assistant", "content": text,
+		}, "done": false,
+	})
+	_ = enc.Encode(map[string]any{
+		"model": model, "created_at": created, "message": map[string]any{
+			"role": "assistant", "content": "",
+		}, "done_reason": "stop", "done": true, "deduped": true,
+	})
+	flusher.Flush()
 }
 
 // saveImages persists base64/data-URL images under the character package and

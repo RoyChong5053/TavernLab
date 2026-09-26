@@ -16,6 +16,10 @@ import 'package:http/http.dart' as http;
 import 'screen_settings.dart';
 import 'screen_welcome.dart';
 import 'worker_setter.dart';
+import 'markdown_fix.dart';
+import 'markdown_math.dart';
+import 'markdown_widgets.dart';
+import 'outbox.dart';
 
 import 'package:shared_preferences/shared_preferences.dart';
 // ignore: depend_on_referenced_packages
@@ -25,7 +29,6 @@ import 'package:uuid/uuid.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:visibility_detector/visibility_detector.dart';
 // import 'package:http/http.dart' as http;
-import 'package:ollama_dart/ollama_dart.dart' as llama;
 import 'package:flutter_markdown/flutter_markdown.dart';
 // ignore: depend_on_referenced_packages
 import 'package:markdown/markdown.dart' as md;
@@ -67,6 +70,54 @@ String? model;
 String? host;
 
 bool multimodal = false;
+
+// Telegram-style pending attachment: picking an image does NOT send it; it
+// waits in the composer until the user sends it (optionally with a caption).
+// Global because the pick handler, the image cache pruner and the composer all
+// need it, and only one of those three has a State object.
+final List<String> pendingImages = [];
+
+/// Sentinel that makes an image-only turn reachable.
+///
+/// flutter_chat_ui's `Input._handleSendPressed` bails out when the trimmed text
+/// is empty, so tapping send with only a photo staged never called
+/// `onSendPressed` — a silent no-op even though the backend has always accepted
+/// a pure-image turn. The button is already forced visible by
+/// `sendButtonVisibilityMode`, so all that is missing is a non-empty field.
+/// U+200B is not Unicode whitespace, so Dart's `trim()` keeps it; it renders as
+/// nothing and is stripped again on the way out.
+const String kEmptyTurnSentinel = '\u200B';
+
+/// Composer text field. Owned here so the sentinel can be inserted and a
+/// rejected draft can be put back.
+final TextEditingController composer = TextEditingController();
+
+/// True when the composer holds nothing but the image-only sentinel.
+bool composerIsEffectivelyEmpty(String raw) =>
+    raw.replaceAll(kEmptyTurnSentinel, '').trim().isEmpty;
+
+/// Strip the sentinel out of a composer string.
+String stripSentinel(String raw) =>
+    raw.replaceAll(kEmptyTurnSentinel, '').trim();
+
+/// Keep the send path alive for an image-only turn.
+void armSentinelForImageOnly() {
+  if (composerIsEffectivelyEmpty(composer.text)) {
+    composer.value = TextEditingValue(
+      text: kEmptyTurnSentinel,
+      selection: const TextSelection.collapsed(offset: 1),
+    );
+  }
+}
+
+/// Put a draft back after a rejected send.
+void restoreDraft(String text) {
+  if (text.trim().isEmpty) return;
+  composer.value = TextEditingValue(
+    text: text,
+    selection: TextSelection.collapsed(offset: text.length),
+  );
+}
 
 List<types.Message> messages = [];
 String? chatUuid;
@@ -167,6 +218,7 @@ Future<Map<String, dynamic>> apiGet(String path, {int seconds = 15}) async {
   return jsonDecode(r.body) as Map<String, dynamic>;
 }
 
+
 /// Persist the chosen character server-side (single source of truth).
 Future<void> setCurrentChar(String name) async {
   currentChar = name;
@@ -213,6 +265,19 @@ Future<List<types.Message>> fetchServerMessages() async {
 
 // ---- image helpers (attachments) ----
 
+/// Longest edge, in pixels, of an attachment. Vision models crop into 768px
+/// tiles, so anything past ~1568px is upload cost with no extra signal.
+const int kAttachMaxEdge = 1600;
+
+/// JPEG quality for a downscaled attachment. 82 keeps text in a screenshot
+/// legible while cutting a 4MB phone photo to a few hundred KB.
+const int kAttachQuality = 82;
+
+/// Hard ceiling on one encoded attachment. A 4000x3000 JPEG base64s to ~5MB and
+/// becomes a single unresumable JSON POST, which is what made image sends fail
+/// outright on a weak link. Past this we say so instead of trying anyway.
+const int kAttachMaxBytes = 1500 * 1024;
+
 String mimeFromName(String name) {
   final n = name.toLowerCase();
   if (n.endsWith(".jpg") || n.endsWith(".jpeg")) return "image/jpeg";
@@ -225,25 +290,82 @@ String mimeFromName(String name) {
 
 /// Encode a picked file as a self-contained data URL so the preview and the
 /// outgoing request never depend on a cache path that may vanish.
+///
+/// Throws [AttachmentTooLarge] when the result is past [kAttachMaxBytes]; the
+/// caller surfaces that instead of queueing a request that cannot land.
 Future<String> encodeXFileToDataURL(XFile f) async {
   final bytes = await f.readAsBytes();
+  if (bytes.length > kAttachMaxBytes) {
+    throw AttachmentTooLarge(bytes.length);
+  }
   final mime = (f.mimeType != null && f.mimeType!.startsWith("image/"))
       ? f.mimeType!
       : mimeFromName(f.name);
   return "data:$mime;base64,${base64.encode(bytes)}";
 }
 
-/// Decoded data-URL bytes keyed by message id (or tray slot). Rebuilding the
-/// chat list must NOT re-run base64.decode + image codec on multi-MB photos
-/// every frame — that was the send-image flicker.
+class AttachmentTooLarge implements Exception {
+  AttachmentTooLarge(this.bytes);
+  final int bytes;
+  @override
+  String toString() => 'AttachmentTooLarge($bytes)';
+}
+
+/// Decode a picked file into the composer's pending tray, reporting the two
+/// failure modes the user actually hits: an oversized original, and a file the
+/// picker could not re-encode (a HEIC BitmapFactory cannot decode is returned
+/// untouched, so the "compressed" bytes are still the 5MB original).
+Future<void> stageAttachment(XFile f) async {
+  String dataUrl;
+  try {
+    dataUrl = await encodeXFileToDataURL(f);
+  } on AttachmentTooLarge catch (e) {
+    messengerKey.currentState?.showSnackBar(SnackBar(
+      content: Text('图片太大（${(e.bytes / 1024 / 1024).toStringAsFixed(1)}MB），'
+          '请先裁剪或改用相册截图'),
+      showCloseIcon: true,
+      duration: const Duration(seconds: 6),
+    ));
+    return;
+  } catch (_) {
+    messengerKey.currentState?.showSnackBar(SnackBar(
+      content: const Text('读取图片失败'),
+      showCloseIcon: true,
+    ));
+    return;
+  }
+  pendingImages
+    ..clear()
+    ..add(dataUrl);
+  HapticFeedback.selectionClick();
+  // Arm the send path: without this the library's Input would swallow the press
+  // because the caption is still empty.
+  armSentinelForImageOnly();
+  pokeUI();
+}
+
+/// Decoded data-URL bytes keyed by message id. Rebuilding the chat list must
+/// NOT re-run base64.decode + image codec on multi-MB photos every frame — that
+/// was the send-image flicker.
+///
+/// The key is always derived from the content, never from a slot name: a fixed
+/// "pending0" made the second attachment render the first one's bytes, because
+/// the cache was consulted before the uri and never invalidated.
 final Map<String, Uint8List> _imgBytesCache = {};
+
+/// Content-derived cache key. Two identical photos share an entry, a different
+/// photo can never read another's bytes.
+String imageCacheKey(String uri) =>
+    uri.startsWith("data:") ? "d:${uri.length}:${uri.hashCode}" : "u:$uri";
 
 void pruneImgCache() {
   final keep = <String>{};
   for (final m in messages) {
-    if (m is types.ImageMessage) keep.add(m.id);
+    if (m is types.ImageMessage) keep.add(imageCacheKey(m.uri));
   }
-  keep.add("pending0");
+  for (final p in pendingImages) {
+    keep.add(imageCacheKey(p));
+  }
   _imgBytesCache.removeWhere((k, _) => !keep.contains(k));
   // Bound memory: drop oldest entries beyond a sane cap.
   while (_imgBytesCache.length > 40) {
@@ -256,18 +378,22 @@ Widget buildImageWidget(String uri,
     {double? width,
     double? height,
     BoxFit fit = BoxFit.cover,
-    String? cacheKey}) {
+    bool gapless = true}) {
   if (uri.startsWith("data:")) {
     try {
-      Uint8List? bytes;
-      if (cacheKey != null) bytes = _imgBytesCache[cacheKey];
+      final key = imageCacheKey(uri);
+      Uint8List? bytes = _imgBytesCache[key];
       bytes ??= base64.decode(uri.substring(uri.indexOf(",") + 1));
-      if (cacheKey != null) _imgBytesCache[cacheKey] = bytes;
+      _imgBytesCache[key] = bytes;
       return Image.memory(bytes,
           width: width,
           height: height,
           fit: fit,
-          gaplessPlayback: true);
+          // gapless holds the previous frame while the new one decodes. For a
+          // bubble whose uri never changes that is what stops the flicker, but
+          // for the composer preview it would paint the previous photo on top
+          // of the new one, so the preview opts out.
+          gaplessPlayback: gapless);
     } catch (_) {
       return const Icon(Icons.broken_image);
     }
@@ -436,6 +562,309 @@ Future<void> announceReply(String text) async {
   }
 }
 
+// ---- outgoing turn: transport, streaming bubble, outbox glue ----
+
+/// Id of the assistant bubble currently being streamed, so the poller can tell
+/// a live local stream from a server echo.
+String? liveStreamMsgId;
+
+/// Bubble id for the live reply to turn [turnId]. Derived rather than random so
+/// the sync merge can recognise and drop it once the server has the real row.
+String liveMsgIdFor(String turnId) => 'live-$turnId';
+
+/// Bubble ids that belong to one queued turn.
+bool isTurnBubble(String msgId, String turnId) =>
+    msgId == turnId ||
+    msgId == '$turnId-img' ||
+    msgId == liveMsgIdFor(turnId);
+
+/// Epoch of the send that owns [liveStreamMsgId]. A sync bumps sendEpoch; the
+/// stream notices and stops patching a list that no longer exists.
+int liveStreamEpoch = 0;
+
+/// POST one turn to the shim and stream the reply into a fresh bubble.
+///
+/// Throws [OutboxHttpError] on any non-2xx so the queue can decide between
+/// retrying and giving up; a stream that dies mid-flight is also an error,
+/// because the turn's fate is then genuinely unknown and only the server's
+/// idempotency key can settle it.
+Future<void> sendTurn(OutboxItem item) async {
+  final h = host;
+  if (h == null) throw OutboxHttpError(cause: 'no host');
+
+  // Claim the UI *before* the request leaves. The server publishes the user row
+  // as soon as it stores it, which wakes the SSE listener, and that used to land
+  // a sync in the window between this call and the first streamed chunk: the
+  // merge then kept the live bubble *and* picked up the server's copy of the
+  // same turn, so the user's own message rendered twice until the stream ended.
+  chatAllowed = false;
+  var text = "";
+  var started = DateTime.now();
+  final myEpoch = sendEpoch;
+  final msgId = liveMsgIdFor(item.id);
+  var lastPush = DateTime.fromMillisecondsSinceEpoch(0);
+  var announced = false;
+
+  // One guard for the whole attempt: the claim on the UI happens before the
+  // request leaves, so every later failure (encoding the image, connecting, a
+  // non-2xx) has to release it or the input and the poller stay locked.
+  try {
+    final images = <String>[];
+    for (final p in item.images) {
+      images.add(await Outbox.instance.asDataUrl(p));
+    }
+
+    final req = http.Request("POST", Uri.parse("$h/api/chat"))
+      ..headers.addAll({
+        "Content-Type": "application/json",
+        "Accept": "application/x-ndjson",
+        ...serverHeaders(),
+      })
+      ..body = jsonEncode({
+        "model": model ?? "auto-gemini",
+        "stream": true,
+        "client_msg_id": item.id,
+        "messages": [
+          {
+            "role": "user",
+            "content": item.text,
+            if (images.isNotEmpty) "images": images,
+          }
+        ],
+      });
+
+    http.StreamedResponse resp;
+    try {
+      resp = await http.Client().send(req);
+    } catch (e) {
+      throw OutboxHttpError(cause: e);
+    }
+    if (resp.statusCode ~/ 100 != 2) {
+      final body = await resp.stream.bytesToString();
+      throw OutboxHttpError(status: resp.statusCode, body: body);
+    }
+
+    // The turn is on the server now; show its reply as it arrives.
+    liveStreamMsgId = msgId;
+    liveStreamEpoch = myEpoch;
+    started = DateTime.now();
+
+    await for (final line in resp.stream
+        .transform(utf8.decoder)
+        .transform(const LineSplitter())) {
+      if (myEpoch != sendEpoch) return; // history was replaced under us
+      final t = line.trim();
+      if (t.isNotEmpty) {
+        try {
+          final j = jsonDecode(t);
+          if (j is Map) {
+            if (j["error"] != null) {
+              throw OutboxHttpError(
+                  status: 502, body: j["error"].toString());
+            }
+            final m = j["message"];
+            if (m is Map && m["content"] != null) {
+              text += m["content"].toString();
+            }
+            if (j["done"] == true) break;
+          }
+        } on OutboxHttpError {
+          rethrow;
+        } catch (_) {
+          // A partial or non-JSON line: keep the text we have.
+        }
+      }
+      if (text.trim().isEmpty) continue;
+      // Upsert, not insert: a retried attempt reuses the same derived id, and a
+      // plain insert would either duplicate the bubble or leave it frozen at
+      // the previous attempt's text.
+      _upsertBubble(msgId, text);
+      if (!announced) {
+        announced = true;
+        HapticFeedback.lightImpact();
+      }
+      // ~8fps is plenty for reading and keeps a photo-heavy list from
+      // re-laying-out on every token.
+      final now = DateTime.now();
+      if (now.difference(lastPush).inMilliseconds > 120) {
+        lastPush = now;
+        pokeUI();
+      }
+    }
+    if (text.trim().isEmpty) {
+      throw OutboxHttpError(
+          status: 502,
+          body: "服务器没有返回内容（${DateTime.now().difference(started).inSeconds}s）");
+    }
+  } finally {
+    liveStreamMsgId = null;
+    chatAllowed = true;
+    if (myEpoch == sendEpoch) {
+      suppressChimeOnce = true;
+      setAwaitingReply(false);
+      pokeUI();
+    }
+  }
+}
+/// Put a queued turn on screen immediately, tagged with the queue id so its
+/// status can be rendered next to the bubble.
+void renderOutboxTurn(String id, String text, List<String> imgs) {
+  // Newest-first, so insert the caption first and the images after it. This has
+  // to match fetchServerMessages, which appends text then images per row and
+  // then reverses: reversing an [text, img] row yields [img, text]. Getting
+  // this backwards made the caption and the photo swap places the moment the
+  // server's own copy replaced the optimistic one.
+  if (text.isNotEmpty) {
+    messages.insert(0, types.TextMessage(author: user, id: id, text: text));
+  }
+  for (final u in imgs) {
+    messages.insert(0, types.ImageMessage(
+        author: user, id: "$id-img", name: "image", size: 0, uri: u));
+  }
+  pokeUI();
+}
+
+/// Replace the text of bubble [msgId] if it is already on screen, otherwise put
+/// it on top. Used by the streaming loop so a retry reuses its own bubble.
+void _upsertBubble(String msgId, String text) {
+  for (var i = 0; i < messages.length; i++) {
+    if (messages[i].id == msgId) {
+      messages[i] = types.TextMessage(author: assistant, id: msgId, text: text);
+      return;
+    }
+  }
+  messages.insert(0, types.TextMessage(author: assistant, id: msgId, text: text));
+}
+
+/// The 5s poller drives the queue, so a turn that failed while the screen was
+/// off goes out the moment connectivity is back.
+void startOutboxDriver() {
+  Outbox.instance.sender = sendTurn;
+  Outbox.instance.onSettled = (item, error, status) {
+    if (error == null) {
+      // Deliberately leave the optimistic bubbles on screen. The turn is on
+      // the server, but the local copy carries the client id and the server
+      // copy a generated one; removing it now would make the user's own
+      // message blink out for up to a poll interval. The next sync replaces it
+      // with the server row.
+      pokeUI();
+    } else {
+      final f = classifySendError(error, status: status);
+      final o = Outbox.instance.byId(item.id);
+      // Nothing left to wait for: stop the header spinner, otherwise a turn
+      // that ended in `failed` would show "努力回复中" for the rest of time.
+      if (!Outbox.instance.hasWork) setAwaitingReply(false);
+      if (o != null && o.state == OutboxState.failed) {
+        messengerKey.currentState?.showSnackBar(SnackBar(
+          content: Text("发送失败：${f.message}"),
+          showCloseIcon: true,
+          duration: const Duration(seconds: 6),
+          action: SnackBarAction(
+            label: '重试',
+            onPressed: () {
+              if (prefs != null) Outbox.instance.retry(prefs!, item.id);
+            },
+          ),
+        ));
+      }
+    }
+  };
+}
+
+/// Full-screen attachment view. `disableImageGallery: true` used to mean tapping
+/// a photo did nothing at all.
+void openImageViewer(BuildContext context, String uri) {
+  Navigator.of(context).push(PageRouteBuilder<void>(
+    opaque: false,
+    barrierColor: Colors.black,
+    pageBuilder: (_, __, ___) => _ImageViewer(uri: uri),
+  ));
+}
+
+class _ImageViewer extends StatelessWidget {
+  const _ImageViewer({required this.uri});
+  final String uri;
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      appBar: AppBar(
+        backgroundColor: Colors.transparent,
+        foregroundColor: Colors.white,
+        elevation: 0,
+        title: const Text('图片', style: TextStyle(fontSize: 16)),
+      ),
+      extendBodyBehindAppBar: true,
+      body: Center(
+        child: InteractiveViewer(
+          maxScale: 5,
+          child: buildImageWidget(uri, fit: BoxFit.contain),
+        ),
+      ),
+    );
+  }
+}
+
+/// Status line under a queued turn: pending / sending / failed + retry.
+/// Returns null for a message that is not in the queue, so ordinary history
+/// pays nothing for this.
+class OutboxStatusStrip extends StatelessWidget {
+  const OutboxStatusStrip({super.key, required this.item});
+  final OutboxItem item;
+
+  @override
+  Widget build(BuildContext context) {
+    final failed = item.state == OutboxState.failed;
+    final sending = item.state == OutboxState.sending;
+    final color = failed
+        ? Theme.of(context).colorScheme.error
+        : Theme.of(context).colorScheme.onSurface.withValues(alpha: 0.55);
+    final label = failed
+        ? (item.lastError ?? '发送失败')
+        : sending
+            ? '发送中…'
+            : item.dueInSeconds > 0
+                ? '等待网络 ${item.dueInSeconds}s 后重发'
+                : '排队中';
+    return Padding(
+      padding: const EdgeInsets.only(top: 4),
+      child: Row(mainAxisSize: MainAxisSize.min, children: [
+        if (sending)
+          SizedBox(
+            width: 10,
+            height: 10,
+            child: CircularProgressIndicator(strokeWidth: 1.6, color: color),
+          )
+        else
+          Icon(failed ? Icons.error_outline_rounded : Icons.schedule_rounded,
+              size: 12, color: color),
+        const SizedBox(width: 4),
+        Flexible(
+          child: Text(label,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(fontSize: 11, color: color)),
+        ),
+        if (failed)
+          TextButton(
+            style: TextButton.styleFrom(
+              visualDensity: VisualDensity.compact,
+              padding: const EdgeInsets.symmetric(horizontal: 8),
+              minimumSize: Size.zero,
+              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            ),
+            onPressed: () {
+              HapticFeedback.selectionClick();
+              if (prefs != null) Outbox.instance.retry(prefs!, item.id);
+            },
+            child: const Text('重试',
+                style: TextStyle(fontSize: 11, fontWeight: FontWeight.w700)),
+          ),
+      ]),
+    );
+  }
+}
+
 /// Mood panel backend: mirrors WebUI classifyAndBadge
 /// (POST /api/expression/classify with the last 500 chars).
 Future<void> classifyMood(String msgId, String text) async {
@@ -473,6 +902,11 @@ Future<void> refreshCharHead() async {
 Future<void> pollTick() async {
   if (pollInFlight) return;
   if (host == null) return;
+  // Drive the send queue first: a turn that failed while offline is due for
+  // its next backoff step, and nothing else in the app will retry it.
+  if (prefs != null && Outbox.instance.hasWork && chatAllowed) {
+    await Outbox.instance.flush(prefs!);
+  }
   if (!chatAllowed) return; // a local stream owns the UI right now
   pollInFlight = true;
   try {
@@ -505,123 +939,6 @@ Future<void> pollTick() async {
   }
 }
 
-/// Code-block frame: rounded box + header (language label + copy button) +
-/// horizontal scroll. Registered as builders['pre'] in every MarkdownBody.
-/// The default codeblockDecoration is left empty so this frame is the only
-/// chrome (flutter_markdown still wraps it in a bare Container).
-class PreBlockBuilder extends MarkdownElementBuilder {
-  PreBlockBuilder();
-
-  @override
-  Widget? visitElementAfterWithContext(BuildContext context, md.Element element,
-      TextStyle? preferredStyle, TextStyle? parentStyle) {
-    String lang = '';
-    final kids = element.children;
-    if (kids != null) {
-      for (final k in kids) {
-        if (k is md.Element && k.tag == 'code') {
-          final cls = k.attributes['class'] ?? '';
-          if (cls.startsWith('language-')) lang = cls.substring(9);
-          break;
-        }
-      }
-    }
-    return CodeBlockFrame(language: lang, code: element.textContent);
-  }
-}
-
-class CodeBlockFrame extends StatefulWidget {
-  final String language;
-  final String code;
-  const CodeBlockFrame(
-      {super.key, required this.language, required this.code});
-
-  @override
-  State<CodeBlockFrame> createState() => _CodeBlockFrameState();
-}
-
-class _CodeBlockFrameState extends State<CodeBlockFrame> {
-  bool copied = false;
-
-  @override
-  Widget build(BuildContext context) {
-    final bool light = Theme.of(context).brightness == Brightness.light;
-    final Color bg =
-        light ? const Color(0xFFF1F1F4) : const Color(0xFF1E1E24);
-    final Color fg = light ? Colors.black87 : const Color(0xFFE4E4E7);
-    final Color sub = light ? Colors.black54 : Colors.white54;
-    final display = widget.code.replaceAll(RegExp(r'\s+$'), '');
-    return Container(
-      margin: const EdgeInsets.symmetric(vertical: 6),
-      decoration: BoxDecoration(
-        color: bg,
-        borderRadius: BorderRadius.circular(10),
-        border: Border.all(
-            color: (light ? Colors.black : Colors.white)
-                .withValues(alpha: 0.08)),
-      ),
-      clipBehavior: Clip.hardEdge,
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Padding(
-            padding:
-                const EdgeInsets.only(left: 12, right: 4, top: 4, bottom: 0),
-            child: Row(children: [
-              Expanded(
-                child: Text(
-                    widget.language.isEmpty ? "code" : widget.language,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                        color: sub,
-                        fontSize: 11,
-                        fontWeight: FontWeight.w600)),
-              ),
-              InkWell(
-                borderRadius: BorderRadius.circular(8),
-                onTap: () {
-                  HapticFeedback.selectionClick();
-                  Clipboard.setData(ClipboardData(text: widget.code));
-                  setState(() {
-                    copied = true;
-                  });
-                  Future.delayed(const Duration(milliseconds: 1200), () {
-                    if (mounted) {
-                      setState(() {
-                        copied = false;
-                      });
-                    }
-                  });
-                },
-                child: Padding(
-                  padding: const EdgeInsets.all(8),
-                  child: Icon(
-                      copied ? Icons.check_rounded : Icons.copy_rounded,
-                      size: 15,
-                      color: copied ? Colors.green : sub),
-                ),
-              ),
-            ]),
-          ),
-          Scrollbar(
-            child: SingleChildScrollView(
-              scrollDirection: Axis.horizontal,
-              padding: const EdgeInsets.fromLTRB(12, 2, 12, 10),
-              child: Text(display,
-                  style: TextStyle(
-                      color: fg,
-                      fontSize: 13.5,
-                      height: 1.5,
-                      fontFamily: 'monospace',
-                      fontFamilyFallback: const ['monospace'])),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
 
 /// AppBar status line with its own 420ms ticker, so the "努力回复中" animation
 /// only rebuilds this tiny Text — never the whole Scaffold/Chat list (a full
@@ -698,7 +1015,34 @@ Future<void> syncFromServer({bool silent = false}) async {
         break;
       }
     }
-    messages = msgs;
+
+    // A local stream owns the list right now: merging server truth into it
+    // mid-flight is what produced a doubled bubble, because the server's row
+    // for the turn and the local optimistic copy are both "the same message"
+    // and only one of them is in the queue. The poller already waits for this,
+    // but SSE and a manual Sync do not, so refuse here too.
+    if (liveStreamMsgId != null) return;
+
+    // A queued turn is not on the server yet, so a wholesale replace would
+    // silently delete the user's unsent message from the screen. Keep those
+    // bubbles and re-pin them on top; each one disappears as soon as its id
+    // shows up in the server's history.
+    final confirmed = <String>{for (final m in msgs) m.id};
+    for (final item in List<OutboxItem>.from(Outbox.instance.items)) {
+      if (confirmed.contains(item.id)) {
+        // The turn landed after all: the queue entry is done, so every local
+        // bubble belonging to it goes away and the server row is the only one.
+        await Outbox.instance.confirm(prefs!, item.id);
+      }
+    }
+    // Only turns still queued have no server copy yet, so only those are kept.
+    final kept = <types.Message>[];
+    for (final item in Outbox.instance.items) {
+      for (final m in messages) {
+        if (isTurnBubble(m.id, item.id)) kept.add(m);
+      }
+    }
+    messages = <types.Message>[...kept, ...msgs];
     chatUuid = null;
     pruneImgCache();
     sendEpoch++; // invalidate any zombie stream still patching the old list
@@ -931,10 +1275,6 @@ class _MainAppState extends State<MainApp> with WidgetsBindingObserver {
 
   bool sendable = false;
 
-  // Telegram-style pending attachment: picking an image does NOT send it; it
-  // waits in the composer until the user sends it (optionally with a caption).
-  final List<String> pendingImages = [];
-
   List<Widget> sidebar(BuildContext context, Function setState) {
     Widget tile(IconData icon, String label, VoidCallback onTap) {
       return Padding(
@@ -1012,6 +1352,7 @@ class _MainAppState extends State<MainApp> with WidgetsBindingObserver {
       if (mounted) setState(fn);
     };
     unawaited(initNotif());
+    startOutboxDriver();
     startPolling();
 
     WidgetsBinding.instance.addPostFrameCallback(
@@ -1112,8 +1453,14 @@ class _MainAppState extends State<MainApp> with WidgetsBindingObserver {
               showCloseIcon: true));
         } else {
           currentChar = prefs!.getString("currentChar") ?? currentChar;
+          // Anything left in the queue from a previous run goes out now.
+          await Outbox.instance.load(prefs!);
+          pokeUI();
           syncFromServer();
           startEvents();
+          if (Outbox.instance.hasWork) {
+            unawaited(Outbox.instance.flush(prefs!));
+          }
         }
       },
     );
@@ -1139,6 +1486,10 @@ class _MainAppState extends State<MainApp> with WidgetsBindingObserver {
       syncFromServer(silent: true);
       startEvents();
       startPolling();
+      if (prefs != null && Outbox.instance.hasWork) {
+        setAwaitingReply(true);
+        unawaited(Outbox.instance.flush(prefs!));
+      }
     } else {
       stopPolling();
     }
@@ -1320,6 +1671,9 @@ class _MainAppState extends State<MainApp> with WidgetsBindingObserver {
                           final double safeR =
                               MediaQuery.of(innerCtx).padding.right;
                           final double r = th.messageBorderRadius;
+                          // A turn still in the send queue gets its state line.
+                          final OutboxItem? queued =
+                              isUser ? Outbox.instance.byId(message.id) : null;
                           if (isUser) {
                             final br = BorderRadius.only(
                               topLeft: Radius.circular(r),
@@ -1334,15 +1688,24 @@ class _MainAppState extends State<MainApp> with WidgetsBindingObserver {
                               child: ConstrainedBox(
                                 constraints: BoxConstraints(
                                     maxWidth: sw * 0.78),
-                                child: Container(
-                                  decoration: BoxDecoration(
-                                    borderRadius: br,
-                                    color: th.primaryColor,
-                                  ),
-                                  child: ClipRRect(
-                                    borderRadius: br,
-                                    child: child,
-                                  ),
+                                child: Column(
+                                  crossAxisAlignment:
+                                      CrossAxisAlignment.stretch,
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Container(
+                                      decoration: BoxDecoration(
+                                        borderRadius: br,
+                                        color: th.primaryColor,
+                                      ),
+                                      child: ClipRRect(
+                                        borderRadius: br,
+                                        child: child,
+                                      ),
+                                    ),
+                                    if (queued != null)
+                                      OutboxStatusStrip(item: queued),
+                                  ],
                                 ),
                               ),
                             );
@@ -1369,6 +1732,14 @@ class _MainAppState extends State<MainApp> with WidgetsBindingObserver {
                       textMessageBuilder: (p0,
                           {required messageWidth, required showName}) {
                         var white = const TextStyle(color: Colors.white);
+                        // A half-typed fence or `**bold` run makes CommonMark
+                        // render the partial chunk as literal text, so the bubble
+                        // reflows on every token. Close the open constructs while
+                        // the reply streams; once it lands we parse it verbatim.
+                        final streaming = p0.id == liveStreamMsgId;
+                        final data = streaming
+                            ? repairStreaming(p0.text)
+                            : p0.text;
                         return Padding(
                             padding: (p0.author == user)
                                 ? const EdgeInsets.only(
@@ -1376,8 +1747,22 @@ class _MainAppState extends State<MainApp> with WidgetsBindingObserver {
                                 : const EdgeInsets.symmetric(
                                     horizontal: 2, vertical: 4),
                             child: MarkdownBody(
-                                data: p0.text,
-                                builders: {'pre': PreBlockBuilder()},
+                                data: data,
+                                // Root cause of "code wider than the bubble and
+                                // not scrollable": MarkdownBody's internal
+                                // Column uses CrossAxisAlignment.start when
+                                // fitContent is true, handing every block loose
+                                // horizontal constraints. A code frame with no
+                                // width then shrink-wraps to its longest
+                                // unwrapped line, so its own horizontal scroll
+                                // view has zero overflow and the overhang is
+                                // clipped. Stretch makes the constraint tight.
+                                fitContent: false,
+                                builders: {
+                                  'pre': PreBlockBuilder(streaming: streaming),
+                                  'table': TableBlockBuilder(),
+                                  ...mathBuilders(),
+                                },
                                 onTapLink: (text, href, title) async {
                                   HapticFeedback.selectionClick();
                                   try {
@@ -1402,9 +1787,17 @@ class _MainAppState extends State<MainApp> with WidgetsBindingObserver {
                                   }
                                 },
                                 extensionSet: md.ExtensionSet(
-                                  md.ExtensionSet.gitHubFlavored.blockSyntaxes,
+                                  <md.BlockSyntax>[
+                                    ...mathBlockSyntaxes,
+                                    ...md.ExtensionSet.gitHubFlavored
+                                        .blockSyntaxes
+                                  ],
                                   <md.InlineSyntax>[
                                     md.EmojiSyntax(),
+                                    // LaTeX. Must come after $$ and before the
+                                    // GFM set so neither can claim the $ first;
+                                    // mathInlineSyntaxes is ordered internally.
+                                    ...mathInlineSyntaxes,
                                     ...md.ExtensionSet.gitHubFlavored
                                         .inlineSyntaxes
                                   ],
@@ -1576,14 +1969,18 @@ class _MainAppState extends State<MainApp> with WidgetsBindingObserver {
                                 MediaQuery.of(context).size.width >= 1000)
                             ? 360.0
                             : 160.0;
-                        return SizedBox(
-                            width: w,
-                            child: ClipRRect(
-                                borderRadius: BorderRadius.circular(8),
-                                child: buildImageWidget(p0.uri,
-                                    width: w,
-                                    fit: BoxFit.cover,
-                                    cacheKey: p0.id)));
+                        return GestureDetector(
+                          onTap: () {
+                            HapticFeedback.selectionClick();
+                            openImageViewer(context, p0.uri);
+                          },
+                          child: SizedBox(
+                              width: w,
+                              child: ClipRRect(
+                                  borderRadius: BorderRadius.circular(8),
+                                  child: buildImageWidget(p0.uri,
+                                      width: w, fit: BoxFit.cover))),
+                        );
                       },
                       listBottomWidget: pendingImages.isEmpty
                           ? null
@@ -1593,13 +1990,13 @@ class _MainAppState extends State<MainApp> with WidgetsBindingObserver {
                               alignment: Alignment.centerLeft,
                               child: Stack(children: [
                                  ClipRRect(
-                                   borderRadius: BorderRadius.circular(12),
-                                   child: buildImageWidget(pendingImages.first,
-                                       width: 96,
-                                       height: 96,
-                                       fit: BoxFit.cover,
-                                       cacheKey: "pending0"),
-                                ),
+                                    borderRadius: BorderRadius.circular(12),
+                                    child: buildImageWidget(pendingImages.first,
+                                        width: 96,
+                                        height: 96,
+                                        fit: BoxFit.cover,
+                                        gapless: false),
+                                 ),
                                 Positioned(
                                   right: 0,
                                   top: 0,
@@ -1608,6 +2005,13 @@ class _MainAppState extends State<MainApp> with WidgetsBindingObserver {
                                       HapticFeedback.selectionClick();
                                       setState(() {
                                         pendingImages.clear();
+                                        // The only reason the field held a
+                                        // sentinel was the image that just went
+                                        // away.
+                                        if (composerIsEffectivelyEmpty(
+                                            composer.text)) {
+                                          composer.clear();
+                                        }
                                       });
                                     },
                                     child: Container(
@@ -1647,200 +2051,57 @@ class _MainAppState extends State<MainApp> with WidgetsBindingObserver {
                                           fit: BoxFit.cover))))),
                       onSendPressed: (p0) async {
                         HapticFeedback.selectionClick();
-                        final String text = p0.text.trim();
+                        // The sentinel is an image-only marker, never content.
+                        final String text = stripSentinel(p0.text);
                         final List<String> imgs =
                             List<String>.from(pendingImages);
-                        if (text.isEmpty && imgs.isEmpty) return;
-                        setState(() {
-                          sendable = false;
-                        });
+                        if (text.isEmpty && imgs.isEmpty) {
+                          // Pure sentinel, nothing staged: a stray send press.
+                          return;
+                        }
 
+                        // The library clears the composer synchronously right
+                        // after this callback, so anything rejected from here on
+                        // has to be handed back to the user by hand.
                         if (host == null) {
-                          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                          restoreDraft(text);
+                          messengerKey.currentState?.showSnackBar(SnackBar(
                               content: Text(
                                   AppLocalizations.of(context)!.noHostSelected),
                               showCloseIcon: true));
                           return;
                         }
-
-                        if (!chatAllowed || model == null) {
-                          if (model == null) {
-                            ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-                                content: Text(AppLocalizations.of(context)!
-                                    .noModelSelected),
-                                showCloseIcon: true));
-                          }
-                          return;
-                        }
-
-                        // Preflight: fail fast while the composer still holds
-                        // the text (no optimistic insert, no timeout drama).
-                        try {
-                          await http
-                              .get(Uri.parse("$host/api/health"))
-                              .timeout(const Duration(seconds: 4));
-                        } catch (_) {
-                          if (!context.mounted) return;
-                          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-                              content:
-                                  Text("无法连接服务器（$host），稍后再试"),
+                        if (model == null) {
+                          restoreDraft(text);
+                          messengerKey.currentState?.showSnackBar(SnackBar(
+                              content: Text(
+                                  AppLocalizations.of(context)!.noModelSelected),
                               showCloseIcon: true));
-                          setState(() {
-                            sendable = true;
-                          });
                           return;
                         }
 
-                        // Thin client: send only the fresh user turn (caption
-                        // and/or image). The server owns the full context and
-                        // persists both sides.
-                        final List<llama.Message> history = [
-                          llama.Message(
-                              role: llama.MessageRole.user,
-                              content: text,
-                              images: imgs.isNotEmpty ? imgs : null),
-                        ];
-
-                        // Optimistically render the fresh turn, then clear the
-                        // pending tray. The tray lives outside `messages`, so a
-                        // Sync can no longer wipe an unsent image.
-                        if (text.isNotEmpty) {
-                          messages.insert(
-                              0,
-                              types.TextMessage(
-                                  author: user,
-                                  id: const Uuid().v4(),
-                                  text: text));
-                        }
-                        for (final u in imgs) {
-                          messages.insert(
-                              0,
-                              types.ImageMessage(
-                                  author: user,
-                                  id: const Uuid().v4(),
-                                  name: "image",
-                                  size: 0,
-                                  uri: u));
-                        }
+                        // No preflight gate. flutter_chat_ui clears the composer
+                        // synchronously right after this callback returns, so
+                        // refusing here would eat the draft. The queue owns the
+                        // failure instead: the turn stays visible, retries on a
+                        // backoff, and reports the real reason (401 / 400 /
+                        // network) from the actual response.
+                        final id = const Uuid().v4();
+                        await Outbox.instance.enqueue(
+                          prefs!,
+                          id: id,
+                          text: text,
+                          imageDataUrls: imgs,
+                        );
                         setState(() {
+                          sendable = false;
                           pendingImages.clear();
                         });
-                        chatAllowed = false;
+                        // Render the turn straight away; the queue owns its
+                        // lifecycle from here.
+                        renderOutboxTurn(id, text, imgs);
                         setAwaitingReply(true);
-                        suppressChimeOnce = false;
-                        final int myEpoch = sendEpoch;
-                        // Silent watchdog: never surfaces a timeout; it only
-                        // unblocks the input while polling keeps waiting.
-                        final watchdog =
-                            Timer(const Duration(minutes: 6), () {
-                          chatAllowed = true;
-                          pokeUI();
-                        });
-
-                        String newId = const Uuid().v4();
-                        llama.OllamaClient client = llama.OllamaClient(
-                            headers: (jsonDecode(
-                                        prefs!.getString("hostHeaders") ?? "{}")
-                                    as Map)
-                                .cast<String, String>(),
-                            baseUrl: "$host/api");
-
-                        try {
-                          if ((prefs!.getString("requestType") ?? "stream") ==
-                              "stream") {
-                            // No client-side timeout: if the connection dies
-                            // (screen lock etc.) the server still finishes the
-                            // turn, and the poller picks the reply up.
-                            final stream = client
-                                .generateChatCompletionStream(
-                                  request: llama.GenerateChatCompletionRequest(
-                                    model: model!,
-                                    messages: history,
-                                    keepAlive: 1,
-                                  ),
-                                );
-
-                            String text = "";
-                            var lastUiPush =
-                                DateTime.fromMillisecondsSinceEpoch(0);
-                            var announced = false;
-                            await for (final res in stream) {
-                              // A sync replaced history mid-flight: stop
-                              // patching the stale optimistic list.
-                              if (myEpoch != sendEpoch) break;
-                              text += (res.message?.content ?? "");
-                              for (var i = 0; i < messages.length; i++) {
-                                if (messages[i].id == newId) {
-                                  messages.removeAt(i);
-                                  break;
-                                }
-                              }
-                              if (chatAllowed) return;
-                              if (text.trim() == "") {
-                                throw Exception();
-                              }
-                              messages.insert(
-                                  0,
-                                  types.TextMessage(
-                                      author: assistant,
-                                      id: newId,
-                                      text: text));
-                              // Throttle UI pushes: per-chunk setState on a
-                              // photo-heavy list is what visibly flickered.
-                              // One haptic on first content, then <=8fps.
-                              if (!announced) {
-                                announced = true;
-                                HapticFeedback.lightImpact();
-                              }
-                              final now = DateTime.now();
-                              if (now
-                                      .difference(lastUiPush)
-                                      .inMilliseconds >
-                                  120) {
-                                lastUiPush = now;
-                                setState(() {});
-                              }
-                            }
-                            setState(() {}); // flush the throttled tail
-                          } else {
-                            llama.GenerateChatCompletionResponse request;
-                            request = await client
-                                .generateChatCompletion(
-                                  request: llama.GenerateChatCompletionRequest(
-                                    model: model!,
-                                    messages: history,
-                                    keepAlive: 1,
-                                  ),
-                                );
-                            if (chatAllowed) return;
-                            if (request.message!.content.trim() == "") {
-                              throw Exception();
-                            }
-                            messages.insert(
-                                0,
-                                types.TextMessage(
-                                    author: assistant,
-                                    id: newId,
-                                    text: request.message!.content));
-                            setState(() {});
-                            HapticFeedback.lightImpact();
-                          }
-                        } catch (e) {
-                          watchdog.cancel();
-                          // Silent by design: keep the optimistic turn and any
-                          // partial reply; the 5s poller reconciles with
-                          // server truth. No rollback, no timeout warning.
-                          chatAllowed = true;
-                          setState(() {});
-                          return;
-                        }
-                        watchdog.cancel();
-
-                        setState(() {});
-                        chatAllowed = true;
-                        // The server echo of our own reply must not chime.
-                        suppressChimeOnce = true;
-                        setAwaitingReply(false);
+                        unawaited(Outbox.instance.flush(prefs!));
                       },
                       onMessageDoubleTap: (context, p1) {
                         HapticFeedback.selectionClick();
@@ -1923,18 +2184,10 @@ class _MainAppState extends State<MainApp> with WidgetsBindingObserver {
                                     .pickFiles(type: FileType.image)
                                     .then((files) async {
                                   if (files.isEmpty) return;
-
-                                  final picked = files.first;
-                                  final bytes = await picked.readAsBytes();
-                                  final mime = mimeFromName(picked.name);
-                                  if (!mounted) return;
-                                  setState(() {
-                                    pendingImages
-                                      ..clear()
-                                      ..add("data:$mime;base64,"
-                                          "${base64.encode(bytes)}");
-                                  });
-                                  HapticFeedback.selectionClick();
+                                  // xFile rather than path: a non-file uri has a
+                                  // null path and the picker hands those back
+                                  // for some sources.
+                                  await stageAttachment(files.first.xFile);
                                 });
 
                                 return;
@@ -1963,21 +2216,20 @@ class _MainAppState extends State<MainApp> with WidgetsBindingObserver {
                                                                 .pickImage(
                                                           source: ImageSource
                                                               .camera,
+                                                          maxWidth:
+                                                              kAttachMaxEdge
+                                                                  .toDouble(),
+                                                          maxHeight:
+                                                              kAttachMaxEdge
+                                                                  .toDouble(),
+                                                          imageQuality:
+                                                              kAttachQuality,
                                                         );
                                                         if (result == null) {
                                                           return;
                                                         }
-                                                        final dataUrl =
-                                                            await encodeXFileToDataURL(
-                                                                result);
-                                                        if (!mounted) return;
-                                                        setState(() {
-                                                          pendingImages
-                                                            ..clear()
-                                                            ..add(dataUrl);
-                                                        });
-                                                        HapticFeedback
-                                                            .selectionClick();
+                                                        await stageAttachment(
+                                                            result);
                                                       },
                                                       icon: const Icon(Icons
                                                           .photo_camera_rounded),
@@ -2000,21 +2252,20 @@ class _MainAppState extends State<MainApp> with WidgetsBindingObserver {
                                                                 .pickImage(
                                                           source: ImageSource
                                                               .gallery,
+                                                          maxWidth:
+                                                              kAttachMaxEdge
+                                                                  .toDouble(),
+                                                          maxHeight:
+                                                              kAttachMaxEdge
+                                                                  .toDouble(),
+                                                          imageQuality:
+                                                              kAttachQuality,
                                                         );
                                                         if (result == null) {
                                                           return;
                                                         }
-                                                        final dataUrl =
-                                                            await encodeXFileToDataURL(
-                                                                result);
-                                                        if (!mounted) return;
-                                                        setState(() {
-                                                          pendingImages
-                                                            ..clear()
-                                                            ..add(dataUrl);
-                                                        });
-                                                        HapticFeedback
-                                                            .selectionClick();
+                                                        await stageAttachment(
+                                                            result);
                                                       },
                                                       icon: const Icon(
                                                           Icons.image_rounded),
@@ -2030,9 +2281,13 @@ class _MainAppState extends State<MainApp> with WidgetsBindingObserver {
                               .messageInputPlaceholder),
                       inputOptions: InputOptions(
                           keyboardType: TextInputType.multiline,
+                          // Owned here so an image-only turn can be armed and a
+                          // rejected draft can be restored; the library's Input
+                          // clears itself without telling anyone.
+                          textEditingController: composer,
                           onTextChanged: (p0) {
                             setState(() {
-                              sendable = p0.trim().isNotEmpty;
+                              sendable = !composerIsEffectivelyEmpty(p0);
                             });
                           },
                           sendButtonVisibilityMode: (Platform.isWindows ||

@@ -37,6 +37,10 @@ dependencies:
   flutter_displaymode: ^0.7.0
   audioplayers: ^6.4.0
   flutter_local_notifications: ^22.3.1
+  flutter_highlight: ^0.7.0
+  path_provider: ^2.1.6
+  highlight: ^0.7.0
+  flutter_math_fork: ^0.7.4
 
 dev_dependencies:
   flutter_test:
