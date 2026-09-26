@@ -1,0 +1,119 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# tlctl — tl-notify 的启停控制
+#
+#   tlctl start|stop|restart|status|logs|test
+#
+# 用 pidfile 而不是 pkill -f：pkill -f 的模式会匹配到「正在执行 pkill 的那个
+# shell 自己」，实测把自己也杀了，收尾时很误导。pidfile 精确。
+set -uo pipefail
+export PATH="$HOME/bin:$PREFIX/bin:$PATH"
+
+D="$PREFIX/var/lib/tl-notify"
+PIDF="$D/pid"
+LOG="$D/log"
+mkdir -p "$D"
+
+running() {
+  [ -f "$PIDF" ] || return 1
+  local p; p=$(cat "$PIDF" 2>/dev/null)
+  [ -n "$p" ] && kill -0 "$p" 2>/dev/null
+}
+
+# flock 是加在 tl-notify.sh 的 fd 9 上的，而 fd 会被 curl、pipeline 子 shell、
+# timeout 派生的 termux-* 客户端全部继承。主进程被杀掉后，这些子进程要过一会儿
+# 才被回收并释放 fd —— 锁的释放因此滞后于「主进程已死」。所以判据不能是主进程
+# 死没死，要直接探锁。
+lock_busy() {
+  flock -n "$D/lock" true 2>/dev/null && return 1 || return 0
+}
+
+wait_lock_free() {
+  local n=${1:-20}
+  for _ in $(seq 1 "$n"); do
+    lock_busy || return 0
+    sleep 0.5
+  done
+  return 1
+}
+
+start() {
+  if running; then echo "已在运行 pid=$(cat "$PIDF")"; return 0; fi
+  rm -f "$PIDF"
+  if lock_busy; then
+    echo "锁还被占用，多半是上次没停干净。先执行：tlctl stop"
+    return 1
+  fi
+  # setsid 脱离 ssh 会话，否则 ssh 一断脚本就被 SIGHUP 带走。
+  # pid 由守护进程自己写进 pidfile（见 tl-notify.sh），这里不猜 $!。
+  # 早期输出落盘而不是 /dev/null：失败时能直接看到原因（flock 冲突 / 缺依赖），
+  # 不用靠猜。
+  setsid "$HOME/bin/tl-notify.sh" >"$D/last-start.log" 2>&1 &
+  for _ in $(seq 1 24); do
+    sleep 0.5
+    running && { echo "已启动 pid=$(cat "$PIDF")"; return 0; }
+  done
+  echo "启动失败。守护进程早期输出："
+  sed 's/^/  /' "$D/last-start.log" 2>/dev/null | tail -5
+  [ -s "$D/last-start.log" ] || echo "  (无输出，进程可能被系统立刻杀掉，看 tlctl logs)"
+  return 1
+}
+
+stop() {
+  local p
+  p=$(cat "$PIDF" 2>/dev/null)
+  if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then
+    # 必须杀整个进程组，只杀 pid 是不够的：
+    # tl-notify.sh 用 `exec 9>"$D/lock"` + flock 防重入，而这个 fd 会被 curl、
+    # pipeline 子 shell 一并继承。主进程死了但孤儿还活着的话，锁不会释放，
+    # 下次 start 会被 flock 静默挡掉，表现为「启动失败」但日志里什么都没有。
+    # setsid 让守护进程成为进程组长，PGID == PID，所以用负号杀整组。
+    kill -TERM -- "-$p" 2>/dev/null || kill -TERM "$p" 2>/dev/null
+    for _ in $(seq 1 10); do kill -0 "$p" 2>/dev/null || break; sleep 0.5; done
+    kill -KILL -- "-$p" 2>/dev/null
+  fi
+  # 兜底：pidfile 丢了或已过期时，按脚本路径清残留（排除自己和子 shell）
+  local me=$$
+  for q in $(pgrep -f "home/bin/tl-notify.sh" 2>/dev/null); do
+    [ "$q" = "$me" ] || kill -KILL "$q" 2>/dev/null
+  done
+  rm -f "$PIDF"
+  termux-wake-unlock 2>/dev/null
+  if wait_lock_free 20; then
+    echo "已停止"
+  else
+    # 锁还在 = 有孤儿进程活着。用 bracket 技巧避免 pkill -f 匹配到自己。
+    echo "有进程仍持有 flock，正在强制清理…"
+    pkill -9 -f "[t]ermux-volume" 2>/dev/null
+    pkill -9 -f "[l]ibexec/termux-api" 2>/dev/null
+    pkill -9 -x curl 2>/dev/null
+    pkill -9 -x jq 2>/dev/null
+    wait_lock_free 20 && echo "已停止" || echo "警告：锁仍未释放，tlctl status 看残留进程"
+  fi
+}
+
+status() {
+  if running; then
+    echo "运行中 pid=$(cat "$PIDF")"
+  else
+    echo "未运行"
+  fi
+  echo "--- 最近日志 ---"
+  tail -6 "$LOG" 2>/dev/null || echo "(还没有日志)"
+}
+
+case "${1:-status}" in
+  start)   start ;;
+  stop)    stop ;;
+  restart) stop; sleep 1; start ;;
+  status)  status ;;
+  logs)    tail -f "$LOG" ;;
+  test)
+    # 不经服务端，本地直接验音效/通知链路
+    echo "发一条测试通知…"
+    "$HOME/bin/tl-notify.sh" --test-notify 2>/dev/null || \
+      $PREFIX/libexec/termux-api Notification \
+        --es id "tl-selftest" --es title "TavernLab" \
+        --es content "自检：通知+音效链路测试" --ez sound true --es priority high
+    ;;
+  *) echo "用法: tlctl start|stop|restart|status|logs|test"; exit 1 ;;
+esac
