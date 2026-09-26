@@ -8,18 +8,19 @@ TavernLab (m64)                        手机
 ┌──────────────────────┐              ┌───────────────────────────────┐
 │ 一次生成完成          │              │ Termux (前台服务)              │
 │  AppendChat          │  ── SSE ──►  │  tl-notify.sh                 │
-│   + events.publish   │  长连接       │   ├ 退避重连                   │
-│                      │              │   ├ role==assistant 过滤       │
-│  (脚本只读，不写)     │              │   └ 按 id 去重                 │
-└──────────────────────┘              │            │                  │
-                                      │            ▼                  │
-                                      │  termux-notification  → 可见   │
-                                      │  termux-media-player → 发声   │
-                                      │            │                  │
-                                      │            ▼                  │
-                                      │  --action: am start → 回 App  │
+│   + events.publish   │  长连接       │   ├ sse_loop  后台：低延迟     │
+│                      │              │   └ 主循环    每 5s：兜底      │
+│  GET /api/history    │  ◄── 轮询 ── │      ↑ 两者都走 deliver()      │
+│  ?limit=10           │              │        单调高水位 + flock 去重  │
+│  (脚本只读，不写)     │              │            │                  │
+└──────────────────────┘              │            ▼                  │
+                                      │  termux-notification  → 可见+响 │
+                                      │  --action: am start  → 回 App  │
                                       └───────────────────────────────┘
 ```
+
+**SSE 只负责低延迟，轮询负责「不漏」。** 两者都调 `deliver()`，用同一个
+`last_id` 高水位 + `flock` 去重，所以谁先到都只响一次。
 
 ## 为什么需要它
 
@@ -34,6 +35,10 @@ App 自己在锁屏时是收不到通知的，不是通知被拦，是**事件�
 Termux 则是真正的前台服务（`TermuxService.startForeground`），加上
 `termux-wake-lock` 拿到的 `PARTIAL_WAKE_LOCK` + `WIFI_MODE_FULL_HIGH_PERF`
 的 WifiLock，可以在熄屏下持续收流。
+
+**但光有 SSE 不够。** SSE 没有重放：断线窗口里 publish 的事件就永久丢失。
+所以主路径是每 5 秒 `GET /api/history?limit=10` 对齐服务端真相，SSE 只是把
+延迟从 ~5 秒压到 ~0.1 秒。这条是踩过坑才补上的，见下面「锁相」那条。
 
 ## 安装
 
@@ -83,7 +88,9 @@ install.sh 已经放了一个：
 | `TL_TTS` | `0` | `1` = 用 TTS 朗读回复全文 |
 | `TL_TAP` | `1` | `0` = 不设点击动作（没开「显示在其他应用上层」时用） |
 | `TL_TTS_STREAM` | `ALARM` | TTS 音频流 |
-| `TL_SSE_MAXTIME` | `120` | 长连接最长保持秒数，到点主动重连 |
+| `TL_POLL` | `5` | 兜底轮询间隔秒数，**这是「不漏」的实际保证** |
+| `TL_SSE_MAXTIME` | `900` | SSE 长连接最长保持秒数（服务端每 25s 发 `: ping` 保活） |
+| `TL_SESSION_TTL` | `60` | `current_char` 缓存秒数，免得每 5 秒问一次服务端 |
 | `TL_BACKOFF_MAX` | `30` | 退避上限（秒） |
 | `TL_CHANNEL` | `tavernlab-reply` | 通知渠道 id |
 | `TL_IMPORTANCE` | `high` | 渠道重要度 |
@@ -141,6 +148,58 @@ adb 的话：`adb shell appops set com.termux SYSTEM_ALERT_WINDOW allow`
 
 ## 踩过的坑（都已在脚本里处理）
 
+### 锁相：SSE 死窗口 + 同频聊天节奏 = 每条都漏
+
+最早只靠 SSE，`--max-time 120` 每 120 秒**主动掐断一条健康连接**，掐完还
+`sleep` 退避再翻倍，backoff 一路涨到 30s 上限。于是每 ~2.5 分钟有 30 秒死窗口
+（占 21%）。更蠢的是把 `rc=28`（自己的超时＝连接健康）当失败处理。
+
+然后它和聊天节奏**锁相**了。实测数据：
+
+```
+手机侧：连 120s ┄┄┄ 断 17s ┄┄ 连 120s ┄┄┄ 断 32s ┄┄ 连 …
+回复：  05:34:09 ✗   05:36:21 ✗   05:39:04 ✗        （三条全落窗口内）
+```
+
+聊天间隔 ~132s / ~163s，守护循环 152s，两个周期同频 → 每次都精准落进断线窗口。
+SSE 不重放，**永久丢失**。用户看到的现象是「重启后第一条响，之后全哑」。
+
+修法两条，缺一不可：
+1. 健康断开（`rc=28` / `rc=124`）立刻重连，**不涨退避**；只有真连不上才退避
+2. 加 `TL_POLL` 兜底轮询，让「漏掉」不再可能
+
+### 高水位：单个 last_id 表征不了「都通知过了」
+
+轮询最初写成「取**最新一条未通知过**的 assistant」，结果在有积压时乒乓循环：
+
+```
+通知 fa2aedd → last_id=fa2aedd → 下一轮 77a8c6 变「未通知」→ 通知
+→ last_id=77a8c6 → fa2aedd 又变「未通知」→ ……  每 6 秒两声，刷新不停止
+```
+
+正确做法是取**最新一条 assistant** 当高水位。聊天只追加，所以它单调前进、
+自然收敛。实测：积压 3 条 → 只响 1 次（最新那条）然后停。
+
+### 两条路径并发去重
+
+SSE 在后台子 shell、轮询在主循环，是两个进程，会同时到达。
+`deliver()` 的「检查 last_id → 写 last_id」必须用 `flock` 串行化，
+否则两边可能同时通过检查、各响一次。
+
+### 冷启动不能为旧消息响铃
+
+`last_id` 不存在时（全新安装/清过状态），先把当前最新一条**静默**记下来再开始，
+否则一开机就会为重启前的旧回复响一声。而 `last_id` 已存在时若发现有没通知过的
+（正是上面漏掉的），则**应该补发**——那是修复，不是误报。
+
+### timeout 包装不能套在长连接上
+
+统一给外部调用加 `timeout` 防挂死时，把 SSE 也包成了 `t 5 curl -sN --max-time 900`，
+结果每 5 秒自杀一次（`rc=124`），日志看着像「连不上」。
+外层 timeout 只是安全网，必须比内层预算大：`t $((SSE_MAXTIME + 30))`。
+
+### 其他
+
 - **`termux-notification-channel` 从不传 `priority`。** 它只发 `--es id` / `--es name`，
   API 侧 `priorityFromIntent()` 拿不到就 fallback 到 `IMPORTANCE_DEFAULT` —— 不弹头、
   也不保证响。必须直接调 `libexec/termux-api NotificationChannel --es priority high`。
@@ -150,11 +209,10 @@ adb 的话：`adb shell appops set com.termux SYSTEM_ALERT_WINDOW allow`
 - **`termux-notification-list` 是瞎的。** API 30+ `getActiveNotifications()` 只返回
   调用方自己的通知，而通知属于 `com.termux.api`、查询也来自它，理论可见，
   但实测返回空。**别拿它判断通知有没有发出去**，看 `$D/log` 的 `NOTIFY` 行。
-- **`pkill -f` 会自杀。** 模式会匹配到执行 pkill 的那个 shell 自己。改用 pidfile。
-- **flock 的 fd 会被子进程继承。** `exec 9>"$D/lock"` 的 fd 9 会传给 curl 和 pipeline
-  子 shell，只杀主进程的话锁不释放，下次 `tlctl start` 被静默挡掉，表现为
-  「启动失败」但日志里什么都没有。所以 `tlctl stop` 杀整个**进程组**
-  （`setsid` 让守护进程成为组长，`kill -- -PID`）。
+- **Termux:API 广播调用偶尔不返回**，而 `notify()` 是在主循环里同步调用的 ——
+  一次挂死就永久卡死，还会留下持有 `flock` fd 的孤儿。全部外部调用加 `timeout`。
+- **`pkill -f` 会自杀。** 模式会匹配到执行 pkill 的那个 shell 自己（实测自杀两次）。
+  改用 pidfile；必须用 `pkill -f` 时套 bracket 技巧 `pkill -f "[l]ibexec/..."`。
 - **改了 env 必须 restart。** env 是进程启动时 source 进来的，`tlctl start`
   在已在跑时会 early-return。`install.sh` 末尾因此走 `restart` 而不是 `start`。
 
