@@ -76,7 +76,7 @@ install.sh 已经放了一个：
 | `HOST` | 必填 | TavernLab 根地址，走 **WiFi IP** |
 | `TOKEN` | 必填 | `app_token`，App 用的同一个静态 token |
 | `TL_SESSION` | `auto` | `auto` = 跟随服务端 `current_char`（WebUI 换角色自动跟随）；填字面量则钉死 |
-| `TL_SOUND` | `both` | `both` 通知+chime（默认）/ `notification` 只靠通知渠道 / `chime` 只出声 / `none` 静默 |
+| `TL_SOUND` | `notification` | `notification` 只走通知渠道（默认）/ `chime` 只出声 / `both` 两者都发（**会响两声**）/ `none` 静默 |
 | `TL_CHIME_MS` | `1500` | chime 播放时长（毫秒），播完即停 |
 | `TL_CHIME` | `$PREFIX/share/tl-chime.wav` | 提示音路径 |
 | `TL_CHIME_BOOST` | `0` | `>0` 时把 music 流临时抬到该音量播完再恢复（见下） |
@@ -93,19 +93,22 @@ install.sh 已经放了一个：
 
 ## 这台设备上的已知问题
 
-**ROM 的「AI notification 过滤」会静音通知的音效。** 现象：通知正常显示在锁屏，
-但完全没声音。已排除的原因：通知/响铃/闹钟音量都是 13/15、渠道重要度已是
-`IMPORTANCE_HIGH`、渠道声音开关是开的、`termux-media-player` 与
-`termux-tts-speak -s ALARM` 在锁屏下都能正常发声。
+**ROM 的「AI notification 过滤」曾经会静音通知的音效。** 当时的症状：通知正常
+显示在锁屏，但完全没声音。已排除的原因：通知/响铃/闹钟音量都是 13/15、渠道
+声音开关是开的、渠道已是 `IMPORTANCE_HIGH`、且 `termux-media-player` 与
+`termux-tts-speak -s ALARM` 在锁屏下都能正常发声（说明是通知管线被拦，不是音频
+能力问题）。后来这个过滤不再拦了，`TL_SOUND=notification` 单路径就能出一声干净的。
 
-结论：**不要依赖通知渠道发声**。所以默认 `TL_SOUND=both` —— 通知负责「可见 +
-点进去跳 App」，声音走独立播放路径绕开通知管线。两条一起发。
+所以 `chime` 留作**备用**：ROM 更新后过滤若再次生效，改 `TL_SOUND=both` 或
+`chime` 就能顶回来，不用改代码。
+
+**别开 `both`。** 它会先响通知渠道、再播 chime，一句回复两声。
+
+想彻底修根因：确认 ROM 设置里 Termux:API 的 AI 通知过滤是关的。
 
 `termux-media-player` 走 `STREAM_MUSIC`，而本机 music 只有 5/15，锁屏偏轻。
-`TL_CHIME_BOOST=11` 会在播之前把 music 临时抬到 11、播完恢复原值。
-
-想彻底修根因：去 ROM 设置里关掉 Termux:API 的 AI 通知过滤，之后
-`TL_SOUND=notification` 也能响，就能只留一条路径。
+`TL_CHIME_BOOST=11` 会在播之前把 music 临时抬到 11、播完恢复原值 ——
+注意这是**会动你全局音乐音量**的，介意就设 0。
 
 ## 点通知跳 TavernLab：需要开一个权限
 
@@ -170,9 +173,10 @@ adb 的话：`adb shell appops set com.termux SYSTEM_ALERT_WINDOW allow`
    有 `NOTIFY` 但手机没反应 = 通知被 ROM 拦
 
 **有通知但没声**
-`TL_SOUND=both` 下 chime 走独立播放；若 music 音量低就设 `TL_CHIME_BOOST=11`。
-`termux-media-player` 报错时先确认 `$PREFIX/share/tl-chime.wav` 存在。
-日志里 `NOTIFY` 行会记 `head=`，用它确认脚本侧正常。
+先确认 `TL_SOUND=notification`（`chime`/`none` 模式下本来就不发通知）。
+渠道声音要在系统里是开的：`设置 → 应用 → Termux:API → 通知 → TavernLabReply`。
+若确认音量正常、渠道已开、仍不响，怀疑 ROM 的 AI 通知过滤又生效了，
+改 `TL_SOUND=both tlctl restart` 用 chime 顶上。日志里 `NOTIFY` 行会记 `head=`。
 
 **Doze 豁免**
 `termux-wake-lock` 只在**首次**且未豁免时弹窗请求忽略电池优化。本机已豁免，

@@ -49,11 +49,14 @@ TOKEN=$TOKEN
 # auto = 跟随服务端 current_char（WebUI 换角色自动跟随）；填字面量则钉死
 TL_SESSION=$SESSION
 
-# 声音：both=通知(可见+点击)+chime(发声，默认) | notification=只靠通知渠道
-#       chime=只出声不弹通知 | none=静默
-# both 是默认，因为本机 ROM 的 AI 通知过滤会静音通知音效，只走 notification 不会响
-TL_SOUND=both
-# media 播放走 STREAM_MUSIC。music 音量低时锁屏听不见，这里临时抬到多少再恢复（0=不动）
+# 声音：notification=只走通知渠道（默认，正确做法）
+#         chime=只出声不弹通知 | both=两者都发（会响两声）| none=静默
+# 通知渠道的声音走 STREAM_NOTIFICATION，跟着响铃/DND/通知音量，是 Android 的正道。
+# 本机 ROM 曾有个「AI notification 过滤」把通知音效静音了（见 README），那段日子
+# 靠 chime 顶着；过滤不拦之后 chime 就退回备用，别开 both，否则一声变两声。
+TL_SOUND=notification
+# 只有 TL_SOUND 含 chime 时才用得上：media 播放走 STREAM_MUSIC，本机 music 只有
+# 5/15 锁屏偏轻，所以临时抬到 11 播完再恢复。0 = 不动音量。
 TL_CHIME_BOOST=11
 # TTS 朗读回复全文（ALARM 流，锁屏可听）
 TL_TTS=0

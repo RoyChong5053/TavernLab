@@ -31,9 +31,11 @@ mkdir -p "$D"
 
 CH="${TL_CHANNEL:-tavernlab-reply}"
 SESSION="${TL_SESSION:-auto}"          # auto = 跟随服务端 current_char
-# both = 通知负责「可见 + 点进去」，chime 负责「发声」。这台 ROM 会静音通知音效，
-#        所以两条都要；等 ROM 的 AI 通知过滤关掉后可以改成 notification 走单路径。
-SOUND="${TL_SOUND:-both}"             # both | chime | notification | none
+# 默认只走通知渠道：渠道声走 STREAM_NOTIFICATION，跟着响铃/DND/通知音量走，
+# 是 Android 上正确的做法。chime 是备用——这台 ROM 曾有个「AI notification 过滤」
+# 会把通知音效静音（当时音量 13/15、渠道声音已开、IMPORTANCE_HIGH 都无效），
+# 那段日子靠 chime 顶着。现在过滤不拦了，但保着它，ROM 更新后再出现也不至于失声。
+SOUND="${TL_SOUND:-notification}"      # notification | chime | both | none
 CHIME="${TL_CHIME:-$PREFIX/share/tl-chime.wav}"
 CHIME_MS="${TL_CHIME_MS:-1500}"       # chime 时长，播完就停
 CHIME_BOOST="${TL_CHIME_BOOST:-0}"     # >0 时把 music 流临时抬到该音量再恢复
