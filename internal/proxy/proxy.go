@@ -76,6 +76,18 @@ func Forward(client *http.Client, upstream, apiKey string, body []byte, stream b
 	var full strings.Builder
 	var usage map[string]any
 	finishReason := ""
+	// Transport observability (P0): every data line is counted, so a future
+	// truncated reply can be attributed to a hop instead of guessed about.
+	chunksReceived := 0
+	chunksParsed := 0
+	sawUsage := false
+	// An explicit {"error":...} data payload from upstream (e.g. one-api's
+	// upstream_cut terminal event). Relayed live like any other line; the
+	// terminal state below turns it into finish=error instead of a clean stop.
+	sawUpstreamError := false
+	upstreamErrType := ""
+	upstreamErrMsg := ""
+	upstreamCut := false
 	sc := bufio.NewScanner(resp.Body)
 	sc.Buffer(make([]byte, 1024*1024), 1024*1024)
 	for sc.Scan() {
@@ -95,6 +107,7 @@ func Forward(client *http.Client, upstream, apiKey string, body []byte, stream b
 			if payload == "[DONE]" {
 				break
 			}
+			chunksReceived++
 			var chunk struct {
 				Choices []struct {
 					Delta struct {
@@ -103,8 +116,23 @@ func Forward(client *http.Client, upstream, apiKey string, body []byte, stream b
 					FinishReason string `json:"finish_reason"`
 				} `json:"choices"`
 				Usage map[string]any `json:"usage"`
+				Err   *struct {
+					Message string `json:"message"`
+					Type    string `json:"type"`
+				} `json:"error"`
 			}
 			if json.Unmarshal([]byte(payload), &chunk) == nil {
+				chunksParsed++
+				if chunk.Err != nil {
+					sawUpstreamError = true
+					upstreamErrType = chunk.Err.Type
+					if chunk.Err.Message != "" {
+						upstreamErrMsg = chunk.Err.Message
+					}
+					if chunk.Err.Type == "upstream_cut" {
+						upstreamCut = true
+					}
+				}
 				for _, c := range chunk.Choices {
 					full.WriteString(c.Delta.Content)
 					if c.FinishReason != "" {
@@ -112,6 +140,7 @@ func Forward(client *http.Client, upstream, apiKey string, body []byte, stream b
 					}
 				}
 				if chunk.Usage != nil {
+					sawUsage = true
 					usage = chunk.Usage
 				}
 			}
@@ -131,7 +160,11 @@ func Forward(client *http.Client, upstream, apiKey string, body []byte, stream b
 		})
 	}
 	gotFinish := finishReason != ""
-	if !gotFinish {
+	// An upstream error payload is never a clean stop, even when the provider
+	// also sent a finish_reason on another chunk.
+	if sawUpstreamError {
+		finishReason = "error"
+	} else if !gotFinish {
 		finishReason = "stop"
 	}
 	if broken != "" {
@@ -147,7 +180,7 @@ func Forward(client *http.Client, upstream, apiKey string, body []byte, stream b
 		if flusher != nil {
 			flusher.Flush()
 		}
-	} else if !gotFinish {
+	} else if !gotFinish && !sawUpstreamError {
 		// Ensure clients always get a terminal finish_reason even when the
 		// provider omitted it (OpenAI-compatible streams normally send [DONE]).
 		_, _ = fmt.Fprintf(w, "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"%s\"}]}\n\n", finishReason)
@@ -163,6 +196,29 @@ func Forward(client *http.Client, upstream, apiKey string, body []byte, stream b
 			"finish_reason": finishReason,
 		}},
 		"stream_rebuilt": true, "time": time.Now().Format(time.RFC3339),
+		"transport": map[string]any{
+			"chunks_received": chunksReceived,
+			"chunks_parsed":   chunksParsed,
+			"saw_usage":       sawUsage,
+		},
+	}
+	if upstreamCut {
+		rebuiltBody["upstream_cut"] = true
+	}
+	if sawUpstreamError {
+		rebuiltBody["upstream_error"] = map[string]any{"type": upstreamErrType, "message": upstreamErrMsg}
+		if broken == "" {
+			// Surface provider-sent errors the same way transport cuts are
+			// surfaced, so audits/logs treat both uniformly.
+			broken = upstreamErrMsg
+			if broken == "" {
+				broken = "upstream_error"
+				if upstreamErrType != "" {
+					broken += ":" + upstreamErrType
+				}
+			}
+			rebuiltBody["stream_error"] = broken
+		}
 	}
 	if broken != "" {
 		rebuiltBody["stream_error"] = broken

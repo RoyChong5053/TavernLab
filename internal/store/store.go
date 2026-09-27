@@ -47,6 +47,10 @@ type Audit struct {
 	Completion  int            `json:"completion_tokens,omitempty"`
 	Finish      string         `json:"finish_reason,omitempty"` // stop | length | error | ...
 	StreamError string         `json:"stream_error,omitempty"`  // non-empty when the upstream stream was cut
+	Cut         bool           `json:"cut_detected,omitempty"`  // heuristic/explicit upstream-cut signature fired
+	RetriedFrom string         `json:"retried_from,omitempty"`  // audit id of the cut attempt this one retries
+	Superseded  string         `json:"superseded_by,omitempty"` // audit id of the retry that replaced this attempt
+	Transport   map[string]any `json:"transport,omitempty"`     // per-hop stream counters (proxy.Forward)
 	MaxTokens   int            `json:"max_tokens,omitempty"`
 	ImageCount  int            `json:"image_count,omitempty"`
 	Blocks      []BlockRow     `json:"blocks"`
@@ -178,6 +182,7 @@ func (s *Store) AppendChatID(session, id, role, text string, images ...string) (
 
 // chatTailWindow is how many trailing rows the idempotency scan considers.
 const chatTailWindow = 400
+
 // chatTailBytes caps how much of chat.jsonl the scan reads from the end. The
 // file is append-only, so the last slice is all a retry can possibly collide
 // with; reading it keeps a turn's cost constant instead of O(chat length).

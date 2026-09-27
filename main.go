@@ -695,8 +695,41 @@ func main() {
 				return
 			}
 			status, rebuilt, usage := proxy.Forward(client, s.Upstream, s.APIKey, upBody, true, w, flusher)
-			_ = st.SaveAudit(toAudit(auditID, model, res, upBody, rebuilt, usage, memInfo))
 			reply := strings.TrimSpace(rebuiltText(rebuilt))
+			if rm := respMap(rebuilt); isUpstreamCut(status, replyFinish(rebuilt), len(reply), usage, rm) {
+				// One silent retry with the identical body: the same model
+				// re-enters one-api's channel pool, so the retry usually lands on
+				// a different channel. The first partial was already relayed live
+				// (cosmetic duplication in the live view); the persisted message
+				// below is the retry's. Silent to the client: no toast, but both
+				// attempts are audited and logged. A second failure is used as-is.
+				firstID, reply1, usage1, status1 := auditID, reply, usage, status
+				a1 := toAudit(firstID, model, res, upBody, rebuilt, usage, memInfo)
+				a1.Cut = true
+				obs.Warn("upstream cut, silent retry", map[string]any{
+					"kind": "chat.stream", "model": fmt.Sprint(model), "session": session,
+					"reply_len": len(reply1), "completion": usageCompletionTokens(usage1),
+				})
+				status, rebuilt, usage = proxy.Forward(client, s.Upstream, s.APIKey, upBody, true, w, flusher)
+				reply = strings.TrimSpace(rebuiltText(rebuilt))
+				auditID = time.Now().Format("20060102-150405.000")
+				a1.Superseded = auditID
+				_ = st.SaveAudit(a1)
+				logTurn("chat.stream.cut1", status1, model, session, res, reply1, memInfo, usagePromptTokens(usage1))
+				a2note := toAudit(auditID, model, res, upBody, rebuilt, usage, memInfo)
+				a2note.RetriedFrom = firstID
+				_ = st.SaveAudit(a2note)
+				logTurn("chat.stream", status, model, session, res, reply, memInfo, usagePromptTokens(usage))
+				updateCalibration(cfg.DataRoot, fmt.Sprint(model), res.TotalTok, usagePromptTokens(usage))
+				if reply != "" {
+					msg, _ := st.AppendChat(session, "assistant", reply)
+					events.publish(session, msg)
+					publishNtfy(s, msg)
+				}
+				maybeDistill(st, client, cfg.DataRoot, s, session)
+				return
+			}
+			_ = st.SaveAudit(toAudit(auditID, model, res, upBody, rebuilt, usage, memInfo))
 			logTurn("chat.stream", status, model, session, res, reply, memInfo, usagePromptTokens(usage))
 			updateCalibration(cfg.DataRoot, fmt.Sprint(model), res.TotalTok, usagePromptTokens(usage))
 			if reply != "" {
@@ -708,11 +741,44 @@ func main() {
 			return
 		}
 		status, respBody, usage := proxy.Forward(client, s.Upstream, s.APIKey, upBody, false, nil, nil)
+		reply := strings.TrimSpace(replyText(respBody))
+		if rm := respMap(respBody); isUpstreamCut(status, replyFinish(respBody), len(reply), usage, rm) {
+			// Same one-silent-retry contract as the stream path above; here
+			// nothing was sent to the client yet, so the retry is seamless.
+			firstID, reply1, usage1, status1 := auditID, reply, usage, status
+			a1 := toAudit(firstID, model, res, upBody, respBody, usage, memInfo)
+			a1.Cut = true
+			obs.Warn("upstream cut, silent retry", map[string]any{
+				"kind": "chat", "model": fmt.Sprint(model), "session": session,
+				"reply_len": len(reply1), "completion": usageCompletionTokens(usage1),
+			})
+			status, respBody, usage = proxy.Forward(client, s.Upstream, s.APIKey, upBody, false, nil, nil)
+			reply = strings.TrimSpace(replyText(respBody))
+			auditID = time.Now().Format("20060102-150405.000")
+			a1.Superseded = auditID
+			_ = st.SaveAudit(a1)
+			logTurn("chat.cut1", status1, model, session, res, reply1, memInfo, usagePromptTokens(usage1))
+			a2note := toAudit(auditID, model, res, upBody, respBody, usage, memInfo)
+			a2note.RetriedFrom = firstID
+			_ = st.SaveAudit(a2note)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(status)
+			_, _ = w.Write(respBody)
+			logTurn("chat", status, model, session, res, reply, memInfo, usagePromptTokens(usage))
+			updateCalibration(cfg.DataRoot, fmt.Sprint(model), res.TotalTok, usagePromptTokens(usage))
+			if reply != "" {
+				msg, _ := st.AppendChat(session, "assistant", reply)
+				events.publish(session, msg)
+				publishNtfy(s, msg)
+			}
+			maybeDistill(st, client, cfg.DataRoot, s, session)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
 		_, _ = w.Write(respBody)
 		_ = st.SaveAudit(toAudit(auditID, model, res, upBody, respBody, usage, memInfo))
-		reply := strings.TrimSpace(replyText(respBody))
+		reply = strings.TrimSpace(replyText(respBody))
 		logTurn("chat", status, model, session, res, reply, memInfo, usagePromptTokens(usage))
 		updateCalibration(cfg.DataRoot, fmt.Sprint(model), res.TotalTok, usagePromptTokens(usage))
 		if status >= 400 {
@@ -1093,8 +1159,8 @@ func main() {
 		}
 		s := rt.get()
 		var in struct {
-			Model string `json:"model"`
-			Stream bool  `json:"stream"`
+			Model  string `json:"model"`
+			Stream bool   `json:"stream"`
 			// ClientMsgID is the phone's idempotency key. The app retries a turn
 			// it is not sure landed, so the same id can arrive twice; the store
 			// returns the original row instead of writing a second copy.
@@ -1174,6 +1240,44 @@ func main() {
 		if !in.Stream {
 			status, respBody, usage := proxy.Forward(client, s.Upstream, s.APIKey, upBody, false, nil, nil)
 			reply := replyText(respBody)
+			if rm := respMap(respBody); isUpstreamCut(status, replyFinish(respBody), len(strings.TrimSpace(reply)), usage, rm) {
+				firstID, reply1, usage1, status1 := auditID, reply, usage, status
+				a1 := toAudit(firstID, model, res, upBody, respBody, usage, memInfo)
+				a1.Cut = true
+				obs.Warn("upstream cut, silent retry", map[string]any{
+					"kind": "app.request", "model": fmt.Sprint(model), "session": session,
+					"reply_len": len(strings.TrimSpace(reply1)), "completion": usageCompletionTokens(usage1),
+				})
+				status, respBody, usage = proxy.Forward(client, s.Upstream, s.APIKey, upBody, false, nil, nil)
+				reply = replyText(respBody)
+				auditID = time.Now().Format("20060102-150405.000")
+				a1.Superseded = auditID
+				_ = st.SaveAudit(a1)
+				logTurn("app.request.cut1", status1, model, session, res, strings.TrimSpace(reply1), memInfo, usagePromptTokens(usage1))
+				a2note := toAudit(auditID, model, res, upBody, respBody, usage, memInfo)
+				a2note.RetriedFrom = firstID
+				_ = st.SaveAudit(a2note)
+				logTurn("app.request", status, model, session, res, strings.TrimSpace(reply), memInfo, usagePromptTokens(usage))
+				updateCalibration(cfg.DataRoot, fmt.Sprint(model), res.TotalTok, usagePromptTokens(usage))
+				if strings.TrimSpace(reply) != "" {
+					msg, _ := st.AppendChat(session, "assistant", reply)
+					events.publish(session, msg)
+				}
+				maybeDistill(st, client, cfg.DataRoot, s, session)
+				doneReason := replyFinish(respBody)
+				if status >= 400 {
+					doneReason = "error"
+				} else if doneReason == "" {
+					doneReason = "stop"
+				}
+				w.WriteHeader(status)
+				writeJSON(w, map[string]any{
+					"model": model, "created_at": time.Now().Format(time.RFC3339),
+					"message":     map[string]any{"role": "assistant", "content": reply},
+					"done_reason": doneReason, "done": true,
+				})
+				return
+			}
 			_ = st.SaveAudit(toAudit(auditID, model, res, upBody, respBody, usage, memInfo))
 			logTurn("app.request", status, model, session, res, reply, memInfo, usagePromptTokens(usage))
 			updateCalibration(cfg.DataRoot, fmt.Sprint(model), res.TotalTok, usagePromptTokens(usage))
@@ -1204,7 +1308,7 @@ func main() {
 			http.Error(w, "streaming unsupported", 500)
 			return
 		}
-		status, full, usage, finish := forwardOllamaStream(client, s.Upstream, s.APIKey, upBody, model, w, flusher)
+		status, full, usage, finish, cut := forwardOllamaStream(client, s.Upstream, s.APIKey, upBody, model, w, flusher)
 		rebuiltBody := map[string]any{
 			"choices": []map[string]any{{
 				"index":         0,
@@ -1213,10 +1317,58 @@ func main() {
 			}},
 			"stream_rebuilt": true, "via": "ollama-shim",
 		}
+		if cut {
+			rebuiltBody["upstream_cut"] = true
+		}
 		if finish == "error" {
 			rebuiltBody["incomplete"] = true
 		}
 		rebuilt, _ := json.Marshal(rebuiltBody)
+		if cut || isUpstreamCut(status, finish, len(strings.TrimSpace(full)), usage, respMap(rebuilt)) {
+			// Same one-silent-retry contract as /v1/chat/completions above.
+			firstID, full1, usage1, status1 := auditID, full, usage, status
+			a1 := toAudit(firstID, model, res, upBody, rebuilt, usage, memInfo)
+			a1.Cut = true
+			obs.Warn("upstream cut, silent retry", map[string]any{
+				"kind": "app.stream", "model": fmt.Sprint(model), "session": session,
+				"reply_len": len(strings.TrimSpace(full1)), "completion": usageCompletionTokens(usage1),
+			})
+			var cut2 bool
+			status, full, usage, finish, cut2 = forwardOllamaStream(client, s.Upstream, s.APIKey, upBody, model, w, flusher)
+			rebuiltBody = map[string]any{
+				"choices": []map[string]any{{
+					"index":         0,
+					"message":       map[string]any{"role": "assistant", "content": full},
+					"finish_reason": finish,
+				}},
+				"stream_rebuilt": true, "via": "ollama-shim",
+			}
+			if cut2 {
+				rebuiltBody["upstream_cut"] = true
+			}
+			if finish == "error" {
+				rebuiltBody["incomplete"] = true
+			}
+			rebuilt, _ = json.Marshal(rebuiltBody)
+			auditID = time.Now().Format("20060102-150405.000")
+			a1.Superseded = auditID
+			_ = st.SaveAudit(a1)
+			logTurn("app.stream.cut1", status1, model, session, res, strings.TrimSpace(full1), memInfo, usagePromptTokens(usage1))
+			a2note := toAudit(auditID, model, res, upBody, rebuilt, usage, memInfo)
+			a2note.RetriedFrom = firstID
+			if cut2 {
+				a2note.Cut = true
+			}
+			_ = st.SaveAudit(a2note)
+			logTurn("app.stream", status, model, session, res, strings.TrimSpace(full), memInfo, usagePromptTokens(usage))
+			updateCalibration(cfg.DataRoot, fmt.Sprint(model), res.TotalTok, usagePromptTokens(usage))
+			if strings.TrimSpace(full) != "" {
+				msg, _ := st.AppendChat(session, "assistant", full)
+				events.publish(session, msg)
+			}
+			maybeDistill(st, client, cfg.DataRoot, s, session)
+			return
+		}
 		_ = st.SaveAudit(toAudit(auditID, model, res, upBody, rebuilt, usage, memInfo))
 		logTurn("app.stream", status, model, session, res, strings.TrimSpace(full), memInfo, usagePromptTokens(usage))
 		updateCalibration(cfg.DataRoot, fmt.Sprint(model), res.TotalTok, usagePromptTokens(usage))
@@ -1348,7 +1500,18 @@ func toAudit(id string, model any, res engine.AssembleResult, upBody, respBody [
 		}
 		streamErr, _ = resp["stream_error"].(string)
 	}
-	// A cut stream must never be recorded as a clean stop.
+	cut := false
+	if resp != nil {
+		if v, ok := resp["upstream_cut"].(bool); ok && v {
+			cut = true
+		}
+	}
+	var transport map[string]any
+	if resp != nil {
+		if tm, ok := resp["transport"].(map[string]any); ok {
+			transport = tm
+		}
+	} // A cut stream must never be recorded as a clean stop.
 	if streamErr != "" || resp["incomplete"] == true {
 		finish = "error"
 	}
@@ -1396,7 +1559,8 @@ func toAudit(id string, model any, res engine.AssembleResult, upBody, respBody [
 		ID: id, Time: time.Now().Format(time.RFC3339), Model: mName,
 		Window: res.Window, Overflow: res.Overflow,
 		Budget: res.BudgetTok, TotalTok: res.TotalTok, Estimate: res.TotalTok, Actual: actual,
-		Completion: completion, Finish: finish, StreamError: streamErr, MaxTokens: maxTok, ImageCount: imgCount,
+		Completion: completion, Finish: finish, StreamError: streamErr, Cut: cut, Transport: transport,
+		MaxTokens: maxTok, ImageCount: imgCount,
 		Blocks:  rows,
 		Dropped: res.Dropped, Raw: raw, ReplyText: reply, Upstream: usage,
 		Memory: mem,
@@ -1787,12 +1951,16 @@ func streamUpBody(model any, msgs []map[string]any, stream bool, maxTokens int) 
 
 // forwardOllamaStream POSTs an SSE chat body upstream and relays it as Ollama
 // NDJSON chunks ({"message":{"content":...},"done":false} … {"done":true}).
-// Returns upstream status, full assistant text (for audit/JSONL), and usage
-// when the provider reports it.
-func forwardOllamaStream(client *http.Client, upstream, apiKey string, upBody []byte, model string, w http.ResponseWriter, flusher http.Flusher) (int, string, map[string]any, string) {
+// Returns upstream status, full assistant text (for audit/JSONL), usage,
+// finish reason, and whether the provider cut the stream (explicit
+// upstream_cut error event seen). A cut is never reported as a clean stop.
+// NOTE: like proxy.Forward this relays attempt bytes live; callers that retry
+// on cut accept a cosmetic partial+full duplication in the live view while
+// the persisted message stays correct.
+func forwardOllamaStream(client *http.Client, upstream, apiKey string, upBody []byte, model string, w http.ResponseWriter, flusher http.Flusher) (int, string, map[string]any, string, bool) {
 	req, err := http.NewRequest("POST", strings.TrimRight(upstream, "/")+"/v1/chat/completions", bytes.NewReader(upBody))
 	if err != nil {
-		return 500, "", nil, "error"
+		return 500, "", nil, "error", false
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "text/event-stream")
@@ -1801,7 +1969,7 @@ func forwardOllamaStream(client *http.Client, upstream, apiKey string, upBody []
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return 502, "", nil, "error"
+		return 502, "", nil, "error", false
 	}
 	defer resp.Body.Close()
 	w.Header().Set("Content-Type", "application/x-ndjson")
@@ -1828,7 +1996,7 @@ func forwardOllamaStream(client *http.Client, upstream, apiKey string, upBody []
 		b, _ := io.ReadAll(resp.Body)
 		obs.Warn("app upstream stream error", map[string]any{"status": resp.StatusCode, "body": excerpt(string(b), 300)})
 		writeTerm("error", excerpt(string(b), 500))
-		return resp.StatusCode, "", nil, "error"
+		return resp.StatusCode, "", nil, "error", false
 	}
 
 	emit := func(content string) {
@@ -1843,6 +2011,7 @@ func forwardOllamaStream(client *http.Client, upstream, apiKey string, upBody []
 	var full strings.Builder
 	var usage map[string]any
 	finishReason := ""
+	upstreamCut := false
 	sc := bufio.NewScanner(resp.Body)
 	sc.Buffer(make([]byte, 1024*1024), 1024*1024)
 	for sc.Scan() {
@@ -1865,9 +2034,16 @@ func forwardOllamaStream(client *http.Client, upstream, apiKey string, upBody []
 				FinishReason string `json:"finish_reason"`
 			} `json:"choices"`
 			Usage map[string]any `json:"usage"`
+			Err   *struct {
+				Type string `json:"type"`
+			} `json:"error"`
 		}
 		if json.Unmarshal([]byte(payload), &chunk) != nil {
 			continue
+		}
+		if chunk.Err != nil && chunk.Err.Type == "upstream_cut" {
+			upstreamCut = true
+			finishReason = "error"
 		}
 		for _, c := range chunk.Choices {
 			if c.Delta.Content != "" {
@@ -1887,13 +2063,19 @@ func forwardOllamaStream(client *http.Client, upstream, apiKey string, upBody []
 			"finish_reason": finishReason, "reply_len": full.Len(), "error": err.Error(),
 		})
 		writeTerm("error", "upstream stream interrupted: "+err.Error())
-		return resp.StatusCode, full.String(), usage, "error"
+		return resp.StatusCode, full.String(), usage, "error", upstreamCut
+	}
+	if upstreamCut {
+		// Explicit provider-cut signal: never a clean stop. The terminal
+		// error lets the caller decide on a silent retry.
+		writeTerm("error", "upstream cut (no usage metadata)")
+		return resp.StatusCode, full.String(), usage, "error", true
 	}
 	if finishReason == "" {
 		finishReason = "stop"
 	}
 	writeTerm(finishReason, "")
-	return resp.StatusCode, full.String(), usage, finishReason
+	return resp.StatusCode, full.String(), usage, finishReason, false
 }
 
 // stubTitle falls back to the prompt head when the title LLM call fails.
@@ -2298,4 +2480,67 @@ func replyFinish(respBody []byte) string {
 		}
 	}
 	return ""
+}
+
+// respMap unmarshals an upstream/rebuilt body for flag inspection. Nil when
+// the body is not a JSON object (judgement callers treat nil as "no signal").
+func respMap(b []byte) map[string]any {
+	var m map[string]any
+	if json.Unmarshal(b, &m) != nil || m == nil {
+		return nil
+	}
+	return m
+}
+
+// usageCompletionTokens pulls usage.completion_tokens out of an upstream usage map.
+func usageCompletionTokens(usage map[string]any) int {
+	if usage == nil {
+		return 0
+	}
+	if v, ok := usage["completion_tokens"].(float64); ok {
+		return int(v)
+	}
+	return 0
+}
+
+// cutRetryHeuristicCaps bounds the heuristic fallback below: without an
+// explicit upstream_cut signal we only retry when (almost) nothing came back,
+// so a weird-but-complete response can never trigger a retry loop.
+const (
+	cutMaxCompletion = 128 // usage.completion_tokens at or below this
+	cutMaxReplyChars = 512 // reply characters at or below this
+)
+
+// isUpstreamCut reports whether a finished attempt carries the provider-cut
+// signature and deserves one silent retry. Reply LENGTH is deliberately not a
+// criterion: legitimate short replies always arrive WITH usageMetadata, so the
+// discriminator is usage presence, not size.
+//
+// An explicit one-api upstream_cut terminal event always wins. The heuristic
+// fallback covers older one-api builds whose stream chunks never carry usage:
+// HTTP 200 + stop-ish finish + usage without prompt_tokens + tiny completion.
+// Any finish of length/content_filter/tool_calls, any error status, or any
+// usage WITH prompt_tokens is a real provider verdict and never retried.
+func isUpstreamCut(status int, finish string, replyLen int, usage map[string]any, resp map[string]any) bool {
+	if status != 200 || resp == nil {
+		return false
+	}
+	if v, ok := resp["upstream_cut"].(bool); ok && v {
+		return true
+	}
+	if se, _ := resp["stream_error"].(string); se != "" && strings.Contains(se, "upstream_cut") {
+		return true
+	}
+	switch finish {
+	case "stop", "":
+	default:
+		return false
+	}
+	if usagePromptTokens(usage) > 0 {
+		return false
+	}
+	if usageCompletionTokens(usage) > cutMaxCompletion || replyLen > cutMaxReplyChars {
+		return false
+	}
+	return true
 }

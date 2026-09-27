@@ -264,3 +264,49 @@ func TestResolveMCPTimeoutCancelsRequest(t *testing.T) {
 		t.Fatal("test server handler did not finish")
 	}
 }
+
+// TestIsUpstreamCut verifies the cut predicate: explicit upstream_cut wins,
+// the 030632-shaped heuristic (stop + no prompt usage + tiny completion)
+// fires, and real verdicts never retry.
+func TestIsUpstreamCut(t *testing.T) {
+	usage := func(prompt, comp float64) map[string]any {
+		m := map[string]any{}
+		if prompt >= 0 {
+			m["prompt_tokens"] = prompt
+		}
+		if comp >= 0 {
+			m["completion_tokens"] = comp
+		}
+		return m
+	}
+	cases := []struct {
+		name   string
+		status int
+		finish string
+		reply  int
+		usage  map[string]any
+		resp   map[string]any
+		want   bool
+	}{
+		{"explicit flag wins", 200, "error", 10, usage(0, 5),
+			map[string]any{"upstream_cut": true}, true},
+		{"030632 shape retries", 200, "stop", 46, usage(-1, 12),
+			map[string]any{}, true},
+		{"legit short reply with usage never retries", 200, "stop", 3, usage(12950, 2),
+			map[string]any{}, false},
+		{"length verdict never retries", 200, "length", 4000, usage(12950, 4096),
+			map[string]any{}, false},
+		{"content filter never retries", 200, "content_filter", 0, usage(12950, 0),
+			map[string]any{}, false},
+		{"non-200 never retries", 503, "stop", 10, usage(-1, 5),
+			map[string]any{}, false},
+		{"nil body never retries", 200, "stop", 10, usage(-1, 5), nil, false},
+		{"huge reply without usage never retries", 200, "stop", 100000, usage(-1, 12),
+			map[string]any{}, false},
+	}
+	for _, tc := range cases {
+		if got := isUpstreamCut(tc.status, tc.finish, tc.reply, tc.usage, tc.resp); got != tc.want {
+			t.Errorf("%s: isUpstreamCut = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
