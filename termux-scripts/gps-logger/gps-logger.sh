@@ -45,13 +45,17 @@ trap cleanup EXIT INT TERM
 auth=(-H "Authorization: Bearer $TOKEN")
 
 get_location() {
+  # 三级降级: gps 单次定位 -> network 单次 -> passive 最后已知位置 (瞬时)。
+  # 实测 Termux:API 间歇性超时 (gps/network 双双 rc=124), passive/last
+  # 几乎必中, 保证每轮都有点 (精度差但郊区级 Paikka 够用)。
   local loc
   loc=$(timeout 25 termux-location -p gps 2>/dev/null)
-  if echo "$loc" | grep -q '"latitude"'; then
-    echo "$loc"
-    return 0
+  if ! echo "$loc" | grep -q '"latitude"'; then
+    loc=$(timeout 20 termux-location -p network 2>/dev/null)
   fi
-  loc=$(timeout 20 termux-location -p network 2>/dev/null)
+  if ! echo "$loc" | grep -q '"latitude"'; then
+    loc=$(timeout 10 termux-location -p passive -r last 2>/dev/null)
+  fi
   echo "$loc"
 }
 
