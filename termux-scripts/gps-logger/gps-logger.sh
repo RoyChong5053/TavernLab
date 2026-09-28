@@ -32,9 +32,16 @@ command -v curl >/dev/null || { echo "缺 curl" >&2; exit 1; }
 command -v jq >/dev/null || { echo "缺 jq" >&2; exit 1; }
 command -v timeout >/dev/null || { echo "缺 timeout" >&2; exit 1; }
 
-exec 9>"$D/lock"
-flock -n 9 || { echo "gps-logger: 已有实例在跑，退出"; exit 0; }
-echo $$ >"$D/pid"
+# ---- 单实例: 只用 pidfile, 不用 flock 常驻 ----
+# 教训: exec 9>lock + flock  held 会被 termux-location 等 Termux:API
+# 子进程继承, 实测导致定位调用全部超时 (rc=124, g0/n0/p0), 去掉 flock
+# 后同命令秒回。双实例只会造成重复 POST (v0 可接受), gps-ctl 负责启停。
+PIDF="$D/pid"
+if [ -f "$PIDF" ] && kill -0 "$(cat "$PIDF" 2>/dev/null)" 2>/dev/null; then
+  echo "gps-logger: 已有实例在跑 pid=$(cat "$PIDF"), 退出"
+  exit 0
+fi
+echo $$ >"$PIDF"
 
 if [ "${GL_WAKELOCK:-1}" = 1 ]; then
   timeout 8 termux-wake-lock 2>/dev/null || log "warn: termux-wake-lock 失败"
