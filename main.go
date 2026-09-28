@@ -633,6 +633,10 @@ func main() {
 			Context   engine.ContextConfig `json:"context"`
 			Chat      []map[string]string  `json:"chat"` // legacy: explicit turns (assemble/preview compat)
 			MaxTokens int                  `json:"max_tokens"`
+			// Regenerate drops the trailing assistant reply server-side and
+			// re-runs the last user turn (no new user row is written). The
+			// `/regenerate` command in the web UI drives this.
+			Regenerate bool `json:"regenerate"`
 		}
 		_ = json.Unmarshal(body, &in)
 		blocks := in.Blocks
@@ -651,7 +655,29 @@ func main() {
 		var upImages []string
 		userText := strings.TrimSpace(in.Text)
 		persisted := false
-		if userText != "" || len(in.Images) > 0 {
+		if in.Regenerate {
+			// Manual last-resort: drop the trailing assistant reply so it leaves
+			// the context, then regenerate from the last user row (its stored
+			// media is reloaded; no new user row is appended).
+			lastUser, removedRows, hasUser, derr := st.DropTrailingAssistant(session)
+			if derr != nil {
+				obs.Warn("chat regenerate drop failed", map[string]any{"session": session, "error": derr.Error()})
+				http.Error(w, "无法回退上一条回复："+derr.Error(), 500)
+				return
+			}
+			if !hasUser {
+				http.Error(w, "没有可重新生成的用户消息", 400)
+				return
+			}
+			upImages = loadMediaAsDataURLs(cfg.DataRoot, session, lastUser.Images)
+			userText = lastUser.Text
+			all, _ := st.LoadAll(session)
+			turns = chatToTurns(cfg.DataRoot, session, all)
+			persisted = true
+			obs.Info("chat regenerate", map[string]any{
+				"session": session, "user_id": lastUser.ID, "dropped": len(removedRows),
+			})
+		} else if userText != "" || len(in.Images) > 0 {
 			// New path: the frontend sends only the fresh message. Images may
 			// arrive with or without a caption (image-only is allowed).
 			// P0: never silently drop images — surface decode failures loudly.
@@ -1222,6 +1248,12 @@ func main() {
 		var in struct {
 			Model  string `json:"model"`
 			Stream bool   `json:"stream"`
+			// Regenerate re-runs the last user turn: the trailing assistant reply
+			// is dropped server-side first (so the partial leaves the context),
+			// then the turn is generated again. This is the manual last-resort
+			// fallback when the automatic cut detection still lets a bad reply
+			// through. No new user row is written.
+			Regenerate bool `json:"regenerate"`
 			// ClientMsgID is the phone's idempotency key. The app retries a turn
 			// it is not sure landed, so the same id can arrive twice; the store
 			// returns the original row instead of writing a second copy.
@@ -1238,51 +1270,71 @@ func main() {
 		session := store.CleanSession(firstNonEmpty(s.CurrentChar, "tavernlab"))
 		// The app mirrors the server: only the newest user message matters;
 		// full context is slid server-side out of the character's JSONL.
-		var freshText string
-		var freshImages []string
-		for i := len(in.Messages) - 1; i >= 0; i-- {
-			// A fresh turn may carry text, images, or both (image-only sends
-			// are valid: the user may just want the model to look at a picture).
-			if in.Messages[i].Role == "user" &&
-				(strings.TrimSpace(in.Messages[i].Content) != "" || len(in.Messages[i].Images) > 0) {
-				freshText = in.Messages[i].Content
-				freshImages = in.Messages[i].Images
-				break
-			}
-		}
 		var upImages []string
-		hasFresh := strings.TrimSpace(freshText) != "" || len(freshImages) > 0
-		// Idempotent retry: the phone resends a turn it never saw acknowledged.
-		// A stored row means the request did land; regenerating here would
-		// double-post the reply, so hand the existing one back instead.
-		priorRow, priorReply, hasPrior, hasPriorReply :=
-			st.FindTurn(session, in.ClientMsgID)
-		if hasFresh {
-			if hasPrior {
-				upImages = loadMediaAsDataURLs(cfg.DataRoot, session, priorRow.Images)
-				obs.Info("app turn retried", map[string]any{
-					"session": session, "client_msg_id": in.ClientMsgID,
-					"reply_exists": hasPriorReply,
-				})
-			} else {
-				paths, dataURLs, imgErr := saveImages(cfg.DataRoot, session, freshImages)
-				if len(freshImages) > 0 && len(paths) == 0 && len(dataURLs) == 0 {
-					obs.Warn("app image save failed", map[string]any{"session": session, "error": imgErrString(imgErr)})
-					http.Error(w, "图片保存失败："+imgErrString(imgErr), 400)
-					return
+		if in.Regenerate {
+			// Manual last-resort: drop the trailing assistant reply so it leaves
+			// the context, then regenerate from the last user row (its stored
+			// media is reloaded; no new user row is appended).
+			lastUser, removedRows, hasUser, derr := st.DropTrailingAssistant(session)
+			if derr != nil {
+				obs.Warn("app regenerate drop failed", map[string]any{"session": session, "error": derr.Error()})
+				http.Error(w, "无法回退上一条回复："+derr.Error(), 500)
+				return
+			}
+			if !hasUser {
+				http.Error(w, "没有可重新生成的用户消息", 400)
+				return
+			}
+			upImages = loadMediaAsDataURLs(cfg.DataRoot, session, lastUser.Images)
+			obs.Info("app regenerate", map[string]any{
+				"session": session, "user_id": lastUser.ID, "dropped": len(removedRows),
+			})
+		} else {
+			var freshText string
+			var freshImages []string
+			for i := len(in.Messages) - 1; i >= 0; i-- {
+				// A fresh turn may carry text, images, or both (image-only sends
+				// are valid: the user may just want the model to look at a picture).
+				if in.Messages[i].Role == "user" &&
+					(strings.TrimSpace(in.Messages[i].Content) != "" || len(in.Messages[i].Images) > 0) {
+					freshText = in.Messages[i].Content
+					freshImages = in.Messages[i].Images
+					break
 				}
-				upImages = dataURLs
 			}
-			if !hasPrior {
-				// A duplicate row would point at a second copy of the same photo,
-				// so only append when the turn is genuinely new.
-				msg, _ := st.AppendChatID(session, in.ClientMsgID, "user", strings.TrimSpace(freshText))
-				events.publish(session, msg)
+			hasFresh := strings.TrimSpace(freshText) != "" || len(freshImages) > 0
+			// Idempotent retry: the phone resends a turn it never saw acknowledged.
+			// A stored row means the request did land; regenerating here would
+			// double-post the reply, so hand the existing one back instead.
+			priorRow, priorReply, hasPrior, hasPriorReply :=
+				st.FindTurn(session, in.ClientMsgID)
+			if hasFresh {
+				if hasPrior {
+					upImages = loadMediaAsDataURLs(cfg.DataRoot, session, priorRow.Images)
+					obs.Info("app turn retried", map[string]any{
+						"session": session, "client_msg_id": in.ClientMsgID,
+						"reply_exists": hasPriorReply,
+					})
+				} else {
+					paths, dataURLs, imgErr := saveImages(cfg.DataRoot, session, freshImages)
+					if len(freshImages) > 0 && len(paths) == 0 && len(dataURLs) == 0 {
+						obs.Warn("app image save failed", map[string]any{"session": session, "error": imgErrString(imgErr)})
+						http.Error(w, "图片保存失败："+imgErrString(imgErr), 400)
+						return
+					}
+					upImages = dataURLs
+				}
+				if !hasPrior {
+					// A duplicate row would point at a second copy of the same photo,
+					// so only append when the turn is genuinely new.
+					msg, _ := st.AppendChatID(session, in.ClientMsgID, "user", strings.TrimSpace(freshText))
+					events.publish(session, msg)
+				}
 			}
-		}
-		if hasPrior && hasPriorReply {
-			writeOllamaReply(w, model, priorReply.Text, priorReply.ID, in.Stream)
-			return
+			if hasPrior && hasPriorReply {
+				writeOllamaReply(w, model, priorReply.Text, priorReply.ID, in.Stream)
+				return
+			}
 		}
 		all, _ := st.LoadAll(session)
 		turns := chatToTurns(cfg.DataRoot, session, all)

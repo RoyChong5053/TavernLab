@@ -559,15 +559,29 @@ $('#img-file').onchange = async (e) => {
   e.target.value = '';
 };
 
-async function send() {
+// Slash-commands understood by the composer. Only exact matches are commands:
+// any other text beginning with "/" is sent to the model as a normal message.
+const REGEN_COMMANDS = new Set(['/regenerate', '/regen', '/重发', '/重新生成', '/重新回复']);
+function isRegenCommand(t) { return REGEN_COMMANDS.has((t || '').trim().toLowerCase()); }
+
+async function send(regen = false) {
   const ta = $('#input');
   const text = ta.value.trim();
-  const imgs = pendingImages.slice();
-  if (!text && !imgs.length) return;
-  addMsg('user', text || '(图片)', null, imgs);
+  // /regenerate: re-run the last user turn. The server drops the trailing
+  // assistant reply first, so the partial leaves the context and a fresh
+  // reply is generated. No new user bubble is added.
+  if (!regen && isRegenCommand(text)) { await send(true); return; }
+  const imgs = regen ? [] : pendingImages.slice();
+  if (!regen && !text && !imgs.length) return;
+  if (regen) {
+    const ais = [...document.querySelectorAll('#chat .msg.ai')];
+    const last = ais.pop();
+    if (last) last.remove(); // replaced by the streamed reply
+  } else {
+    addMsg('user', text || '(图片)', null, imgs);
+  }
   ta.value = '';
-  pendingImages = [];
-  renderImgPreview();
+  if (!regen) { pendingImages = []; renderImgPreview(); }
   setPending(true);
   userPinned = true;
   const cbox = chatBox();
@@ -575,7 +589,9 @@ async function send() {
   const stream = !!settings.stream;
   const seqAtStart = assistantSseSeq;
   const maxTokens = Math.min(65536, Math.max(256, +settings.reply_reserve || 4096));
-  const body = { model: settings.model || undefined, session: settings.char, text, images: imgs, stream, blocks, context: ctxCfg(), max_tokens: maxTokens };
+  const body = regen
+    ? { model: settings.model || undefined, session: settings.char, regenerate: true, stream, blocks, context: ctxCfg(), max_tokens: maxTokens }
+    : { model: settings.model || undefined, session: settings.char, text, images: imgs, stream, blocks, context: ctxCfg(), max_tokens: maxTokens };
   try {
     if (stream) {
       const r = await api('/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });

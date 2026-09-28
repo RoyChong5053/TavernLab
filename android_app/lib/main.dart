@@ -582,6 +582,64 @@ bool isTurnBubble(String msgId, String turnId) =>
 /// stream notices and stops patching a list that no longer exists.
 int liveStreamEpoch = 0;
 
+/// Slash-commands understood by the composer. Only exact matches are commands:
+/// any other text beginning with "/" is sent to the model as a normal message.
+const _regenCommands = {'/regenerate', '/regen', '/重发', '/重新生成', '/重新回复'};
+bool isRegenCommand(String t) => _regenCommands.contains(t.trim().toLowerCase());
+
+/// Read an NDJSON chat stream and paint the assistant text into bubble
+/// [msgId]. Returns the accumulated text. [myEpoch] lets the loop bail when a
+/// sync replaces the message list under it. Throws [OutboxHttpError] on a
+/// terminal error event (the server's cut signal).
+Future<String> _pumpChatStream(
+    http.StreamedResponse resp, String msgId, int myEpoch) async {
+  var text = "";
+  var lastPush = DateTime.fromMillisecondsSinceEpoch(0);
+  var announced = false;
+  await for (final line in resp.stream
+      .transform(utf8.decoder)
+      .transform(const LineSplitter())) {
+    if (myEpoch != sendEpoch) return text; // history was replaced under us
+    final t = line.trim();
+    if (t.isNotEmpty) {
+      try {
+        final j = jsonDecode(t);
+        if (j is Map) {
+          if (j["error"] != null) {
+            throw OutboxHttpError(status: 502, body: j["error"].toString());
+          }
+          final m = j["message"];
+          if (m is Map && m["content"] != null) {
+            text += m["content"].toString();
+          }
+          if (j["done"] == true) break;
+        }
+      } on OutboxHttpError {
+        rethrow;
+      } catch (_) {
+        // A partial or non-JSON line: keep the text we have.
+      }
+    }
+    if (text.trim().isEmpty) continue;
+    // Upsert, not insert: a retried attempt reuses the same derived id, and a
+    // plain insert would either duplicate the bubble or leave it frozen at
+    // the previous attempt's text.
+    _upsertBubble(msgId, text);
+    if (!announced) {
+      announced = true;
+      HapticFeedback.lightImpact();
+    }
+    // ~8fps is plenty for reading and keeps a photo-heavy list from
+    // re-laying-out on every token.
+    final now = DateTime.now();
+    if (now.difference(lastPush).inMilliseconds > 120) {
+      lastPush = now;
+      pokeUI();
+    }
+  }
+  return text;
+}
+
 /// POST one turn to the shim and stream the reply into a fresh bubble.
 ///
 /// Throws [OutboxHttpError] on any non-2xx so the queue can decide between
@@ -602,8 +660,6 @@ Future<void> sendTurn(OutboxItem item) async {
   var started = DateTime.now();
   final myEpoch = sendEpoch;
   final msgId = liveMsgIdFor(item.id);
-  var lastPush = DateTime.fromMillisecondsSinceEpoch(0);
-  var announced = false;
 
   // One guard for the whole attempt: the claim on the UI happens before the
   // request leaves, so every later failure (encoding the image, connecting, a
@@ -649,48 +705,7 @@ Future<void> sendTurn(OutboxItem item) async {
     liveStreamEpoch = myEpoch;
     started = DateTime.now();
 
-    await for (final line in resp.stream
-        .transform(utf8.decoder)
-        .transform(const LineSplitter())) {
-      if (myEpoch != sendEpoch) return; // history was replaced under us
-      final t = line.trim();
-      if (t.isNotEmpty) {
-        try {
-          final j = jsonDecode(t);
-          if (j is Map) {
-            if (j["error"] != null) {
-              throw OutboxHttpError(
-                  status: 502, body: j["error"].toString());
-            }
-            final m = j["message"];
-            if (m is Map && m["content"] != null) {
-              text += m["content"].toString();
-            }
-            if (j["done"] == true) break;
-          }
-        } on OutboxHttpError {
-          rethrow;
-        } catch (_) {
-          // A partial or non-JSON line: keep the text we have.
-        }
-      }
-      if (text.trim().isEmpty) continue;
-      // Upsert, not insert: a retried attempt reuses the same derived id, and a
-      // plain insert would either duplicate the bubble or leave it frozen at
-      // the previous attempt's text.
-      _upsertBubble(msgId, text);
-      if (!announced) {
-        announced = true;
-        HapticFeedback.lightImpact();
-      }
-      // ~8fps is plenty for reading and keeps a photo-heavy list from
-      // re-laying-out on every token.
-      final now = DateTime.now();
-      if (now.difference(lastPush).inMilliseconds > 120) {
-        lastPush = now;
-        pokeUI();
-      }
-    }
+    text = await _pumpChatStream(resp, msgId, myEpoch);
     if (text.trim().isEmpty) {
       throw OutboxHttpError(
           status: 502,
@@ -706,6 +721,67 @@ Future<void> sendTurn(OutboxItem item) async {
     }
   }
 }
+/// `/regenerate`: ask the server to drop the trailing assistant reply and
+/// re-run the last user turn. Deliberately NOT part of the outbox: there is no
+/// user bubble to acknowledge, and a failure just restores the server's
+/// history. This is the manual last-resort fallback when the automatic cut
+/// detection still lets a bad reply through.
+Future<void> regenerateTurn() async {
+  final h = host;
+  if (h == null) return;
+  chatAllowed = false;
+  final myEpoch = sendEpoch;
+  final msgId = 'regen-${DateTime.now().microsecondsSinceEpoch}';
+  // The server drops the trailing assistant row: mirror that locally so the
+  // bad bubble doesn't linger while the new reply streams in.
+  final idx = messages.indexWhere((m) => m.author.id == assistant.id);
+  if (idx >= 0) messages.removeAt(idx);
+  liveStreamMsgId = msgId;
+  liveStreamEpoch = myEpoch;
+  setAwaitingReply(true);
+  pokeUI();
+  try {
+    final req = http.Request("POST", Uri.parse("$h/api/chat"))
+      ..headers.addAll({
+        "Content-Type": "application/json",
+        "Accept": "application/x-ndjson",
+        ...serverHeaders(),
+      })
+      ..body = jsonEncode({
+        "model": model ?? "auto-gemini",
+        "stream": true,
+        "regenerate": true,
+        "messages": <Map<String, dynamic>>[],
+      });
+    final resp = await http.Client().send(req);
+    if (resp.statusCode ~/ 100 != 2) {
+      final body = await resp.stream.bytesToString();
+      throw OutboxHttpError(status: resp.statusCode, body: body);
+    }
+    final text = await _pumpChatStream(resp, msgId, myEpoch);
+    if (text.trim().isEmpty) {
+      throw OutboxHttpError(status: 502, body: "服务器没有返回内容");
+    }
+  } catch (e) {
+    final f =
+        classifySendError(e, status: e is OutboxHttpError ? e.status : null);
+    messengerKey.currentState?.showSnackBar(SnackBar(
+      content: Text("重新生成失败：${f.message}"),
+      showCloseIcon: true,
+    ));
+    // The row may already be dropped server-side; pull the truth back.
+    await syncFromServer(silent: true);
+  } finally {
+    liveStreamMsgId = null;
+    chatAllowed = true;
+    if (myEpoch == sendEpoch) {
+      suppressChimeOnce = true;
+      setAwaitingReply(false);
+      pokeUI();
+    }
+  }
+}
+
 /// Put a queued turn on screen immediately, tagged with the queue id so its
 /// status can be rendered next to the bubble.
 void renderOutboxTurn(String id, String text, List<String> imgs) {
@@ -2057,6 +2133,26 @@ class _MainAppState extends State<MainApp> with WidgetsBindingObserver {
                             List<String>.from(pendingImages);
                         if (text.isEmpty && imgs.isEmpty) {
                           // Pure sentinel, nothing staged: a stray send press.
+                          return;
+                        }
+                        if (isRegenCommand(text)) {
+                          // /regenerate: re-run the last user turn. No user
+                          // bubble; the server drops the trailing reply first.
+                          if (host == null) {
+                            messengerKey.currentState?.showSnackBar(SnackBar(
+                                content: Text(AppLocalizations.of(context)!
+                                    .noHostSelected),
+                                showCloseIcon: true));
+                            return;
+                          }
+                          if (model == null) {
+                            messengerKey.currentState?.showSnackBar(SnackBar(
+                                content: Text(AppLocalizations.of(context)!
+                                    .noModelSelected),
+                                showCloseIcon: true));
+                            return;
+                          }
+                          await regenerateTurn();
                           return;
                         }
 

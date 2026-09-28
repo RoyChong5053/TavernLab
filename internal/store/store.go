@@ -288,6 +288,70 @@ func (s *Store) FindTurn(session, id string) (row ChatMessage, reply ChatMessage
 	return s.findTurn(session, id)
 }
 
+// DropTrailingAssistant removes trailing assistant rows (including empty
+// replies) from the session and atomically rewrites chat.jsonl, so a regenerate
+// re-runs the last user turn instead of continuing the partial reply. The
+// rewrite is temp+rename so a crash can never leave a half-written file.
+//
+// Returns the last remaining user row, the rows that were removed, and whether
+// there is a user turn to regenerate from. When nothing needs dropping (the
+// last row is already a user row) the file is left untouched.
+func (s *Store) DropTrailingAssistant(session string) (lastUser ChatMessage, removed []ChatMessage, hasUser bool, err error) {
+	session = CleanSession(session)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p := s.chatPath(session)
+	all, err := loadJSONL(p)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return ChatMessage{}, nil, false, nil
+		}
+		return ChatMessage{}, nil, false, err
+	}
+	cut := len(all)
+	for cut > 0 && all[cut-1].Role == "assistant" {
+		cut--
+	}
+	removed = append(removed, all[cut:]...)
+	kept := all[:cut]
+	if len(kept) > 0 && kept[len(kept)-1].Role == "user" {
+		lastUser = kept[len(kept)-1]
+		hasUser = true
+	}
+	if len(removed) == 0 {
+		return lastUser, nil, hasUser, nil
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(p), ".chat-*.tmp")
+	if err != nil {
+		return ChatMessage{}, nil, false, err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	w := bufio.NewWriter(tmp)
+	for i := range kept {
+		b, _ := json.Marshal(kept[i])
+		if _, werr := w.Write(append(b, '\n')); werr != nil {
+			_ = tmp.Close()
+			return ChatMessage{}, nil, false, werr
+		}
+	}
+	if ferr := w.Flush(); ferr != nil {
+		_ = tmp.Close()
+		return ChatMessage{}, nil, false, ferr
+	}
+	if serr := tmp.Sync(); serr != nil {
+		_ = tmp.Close()
+		return ChatMessage{}, nil, false, serr
+	}
+	if cerr := tmp.Close(); cerr != nil {
+		return ChatMessage{}, nil, false, cerr
+	}
+	if rerr := os.Rename(tmpName, p); rerr != nil {
+		return ChatMessage{}, nil, false, rerr
+	}
+	return lastUser, removed, hasUser, nil
+}
+
 // SaveMedia writes an image under the character package media/ dir and
 // returns its package-relative path ("media/<id>.<ext>").
 func (s *Store) SaveMedia(session, ext string, data []byte) (string, error) {
