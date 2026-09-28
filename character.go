@@ -105,6 +105,11 @@ func renderBlocks(root, session, userName string, blocks []engine.Block) []engin
 	for i := range out {
 		rendered := applyMacros(out[i].Template, now, userName)
 		rendered = strings.ReplaceAll(rendered, "{{location}}", locText)
+		// 旧 preset 存的是不带 {{location}} 的模板: 只要 time_anchor 且有位置
+		// 就追加, 不依赖用户点"重置模板"。
+		if out[i].ID == "time_anchor" && locText != "" && !strings.Contains(rendered, "[LOC") {
+			rendered += " " + locText
+		}
 		switch out[i].Source.Type {
 		case "character":
 			if strings.Contains(rendered, "{{character_card}}") {
