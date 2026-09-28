@@ -114,7 +114,17 @@ func loadLocationGeocode(root string) (LocationGeocode, bool) {
 	return g, true
 }
 
-// gridKey rounds to 4 decimals (~11m) so stationary points reuse the cache.
+// locationPlace picks a readable name: POI display_name first, finest
+// hierarchy unit next (Paikka often returns place="" with only hierarchy).
+func locationPlace(g LocationGeocode) string {
+	if g.Place != "" {
+		return g.Place
+	}
+	if len(g.Hierarchy) > 0 {
+		return g.Hierarchy[len(g.Hierarchy)-1]
+	}
+	return "未知地点"
+}
 func gridKey(lat, lon float64) string {
 	return strconv.FormatFloat(math.Round(lat*1e4)/1e4, 'f', 4, 64) + "," +
 		strconv.FormatFloat(math.Round(lon*1e4)/1e4, 'f', 4, 64)
@@ -183,7 +193,7 @@ func reversePaikka(client *http.Client, base string, lat, lon float64) (Location
 // ensureGeocode returns cached geocode or refreshes it synchronously (short
 // timeout) so /api/logs captures both ingest and reverse lines.
 func ensureGeocode(root string, s settings.Settings, client *http.Client, p LocationPoint) LocationGeocode {
-	if g, ok := loadLocationGeocode(root); ok && gridKey(g.Lat, g.Lon) == gridKey(p.Lat, p.Lon) && g.Place != "" {
+	if g, ok := loadLocationGeocode(root); ok && gridKey(g.Lat, g.Lon) == gridKey(p.Lat, p.Lon) && locationPlace(g) != "未知地点" {
 		return g
 	}
 	g, err := reversePaikka(client, s.PaikkaURL, p.Lat, p.Lon)
@@ -239,15 +249,12 @@ func renderLocationText(root string, s settings.Settings, client *http.Client, n
 	}
 	stale := age > int64(staleMin*60)
 	g, _ := loadLocationGeocode(root)
-	if gridKey(g.Lat, g.Lon) != gridKey(p.Lat, p.Lon) || g.Place == "" {
+	if gridKey(g.Lat, g.Lon) != gridKey(p.Lat, p.Lon) || locationPlace(g) == "未知地点" {
 		// Lazy refresh on read path (chat/assemble); ingest path already
 		// refreshed via ensureGeocode, so this is usually a cache hit.
 		g = ensureGeocode(root, s, client, p)
 	}
-	place := g.Place
-	if place == "" {
-		place = "未知地点"
-	}
+	place := locationPlace(g)
 	hier := ""
 	if len(g.Hierarchy) > 0 {
 		hi := g.Hierarchy

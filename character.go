@@ -275,7 +275,7 @@ func loadLocationMacro(root string, now time.Time) string {
 	if gb, err := os.ReadFile(filepath.Join(root, "location_geocode.json")); err == nil {
 		var g LocationGeocode
 		if json.Unmarshal(gb, &g) == nil {
-			place = g.Place
+			place = locationPlace(g)
 			if len(g.Hierarchy) > 0 {
 				hi := g.Hierarchy
 				if len(hi) > 3 {
