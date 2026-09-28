@@ -2129,11 +2129,17 @@ func forwardOllamaStream(client *http.Client, upstream, apiKey string, upBody []
 	if upstreamCut {
 		// Explicit provider-cut signal: never a clean stop. The terminal
 		// error lets the caller decide on a silent retry.
-		writeTerm("error", "upstream cut (no usage metadata)")
+		writeTerm("error", "upstream cut (provider stopped without a finish_reason)")
 		return resp.StatusCode, full.String(), usage, "error", true
 	}
 	if finishReason == "" {
-		finishReason = "stop"
+		// The stream reached EOF without a terminal finish_reason. one-api emits
+		// one for every clean stop, so its absence means the provider cut the
+		// turn. Defaulting to "stop" here is exactly how a 4-character partial
+		// was persisted as a complete reply — surface it as a cut so the caller's
+		// one silent retry fires and the reply is marked incomplete.
+		writeTerm("error", "upstream stream ended without finish_reason")
+		return resp.StatusCode, full.String(), usage, "error", true
 	}
 	writeTerm(finishReason, "")
 	return resp.StatusCode, full.String(), usage, finishReason, false

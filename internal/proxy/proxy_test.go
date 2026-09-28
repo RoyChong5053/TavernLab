@@ -144,6 +144,56 @@ func TestForward_UpstreamCutEvent(t *testing.T) {
 	}
 }
 
+// TestForward_UsageWithoutFinishIsCut is the regression test for the
+// 2026-09-28 4-character truncation. Gemini attaches usage to (nearly) every
+// streamed chunk, so a stream that reaches a clean [DONE] after only the first
+// content chunk still carries usage. That must NOT look like a clean stop: no
+// terminal finish_reason means the provider cut the turn. Before the fix this
+// rebuilt as finish_reason=stop and the partial was persisted as complete.
+func TestForward_UsageWithoutFinishIsCut(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		f, _ := w.(http.Flusher)
+		for _, s := range []string{
+			`data: {"choices":[{"delta":{"content":"（*听到"}}],"usage":{"prompt_tokens":13379,"completion_tokens":1248,"total_tokens":14627}}`,
+			"data: [DONE]",
+		} {
+			_, _ = w.Write([]byte(s + "\n\n"))
+			if f != nil {
+				f.Flush()
+			}
+		}
+	}))
+	defer srv.Close()
+
+	rec := httptest.NewRecorder()
+	_, rebuilt, usage := Forward(&http.Client{}, srv.URL, "", []byte(`{"stream":true}`), true, rec, rec)
+	ch := firstChoice(t, rebuilt)
+	if got := ch["finish_reason"]; got != "error" {
+		t.Fatalf("finish_reason = %v, want error (%s)", got, rebuilt)
+	}
+	var body map[string]any
+	_ = json.Unmarshal(rebuilt, &body)
+	if body["upstream_cut"] != true {
+		t.Fatalf("missing upstream_cut flag for usage-without-finish: %s", rebuilt)
+	}
+	if body["incomplete"] != true {
+		t.Fatalf("missing incomplete flag: %s", rebuilt)
+	}
+	tr, _ := body["transport"].(map[string]any)
+	if tr == nil || tr["saw_finish"] != false || tr["saw_usage"] != true {
+		t.Fatalf("transport must record saw_usage=true saw_finish=false: %s", rebuilt)
+	}
+	if usage == nil {
+		t.Fatalf("usage lost: %s", rebuilt)
+	}
+	msg, _ := ch["message"].(map[string]any)
+	if msg["content"] != "（*听到" {
+		t.Fatalf("partial text lost: content = %v", msg["content"])
+	}
+}
+
 // TestForward_TransportCounters verifies clean streams carry transport
 // counters and no cut flags.
 func TestForward_TransportCounters(t *testing.T) {

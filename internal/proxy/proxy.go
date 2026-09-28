@@ -171,6 +171,16 @@ func Forward(client *http.Client, upstream, apiKey string, body []byte, stream b
 		// A cut stream is not a clean stop.
 		finishReason = "error"
 	}
+	// A stream that reaches EOF without ever carrying a terminal finish_reason
+	// was cut mid-flight. one-api emits finish_reason for every clean stop, and
+	// usage is NOT a valid signal (Gemini attaches usageMetadata to nearly every
+	// chunk, so a cut after chunk 1 still "saw usage"). Defaulting this to a
+	// clean stop is exactly how a 4-character partial got persisted as complete.
+	noFinishCut := !gotFinish && !sawUpstreamError
+	if noFinishCut {
+		finishReason = "error"
+		upstreamCut = true
+	}
 	if broken != "" {
 		payload, _ := json.Marshal(map[string]any{"error": map[string]any{
 			"message": "upstream stream interrupted: " + broken,
@@ -200,7 +210,11 @@ func Forward(client *http.Client, upstream, apiKey string, body []byte, stream b
 			"chunks_received": chunksReceived,
 			"chunks_parsed":   chunksParsed,
 			"saw_usage":       sawUsage,
+			"saw_finish":      gotFinish,
 		},
+	}
+	if noFinishCut {
+		rebuiltBody["incomplete"] = true
 	}
 	if upstreamCut {
 		rebuiltBody["upstream_cut"] = true
