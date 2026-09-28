@@ -376,7 +376,7 @@ func main() {
 				"context_window": s.ContextWindow, "reply_reserve": s.ReplyReserve, "history_min_turns": s.HistoryMinTurns,
 				"current_char": s.CurrentChar, "user_name": s.UserName,
 				"ntfy_url": s.NtfyURL, "ntfy_topic": s.NtfyTopic,
-			"paikka_url": s.PaikkaURL, "location_stale_min": s.LocationStaleMin, "location_enabled": s.LocationEnabled,
+				"paikka_url": s.PaikkaURL, "location_stale_min": s.LocationStaleMin, "location_enabled": s.LocationEnabled,
 				"distill_enabled": s.DistillEnabled, "distill_interval": s.DistillInterval,
 				"distill_max_chars": s.DistillMaxChars, "distill_retain_days": s.DistillRetainDays,
 				"distill_state_max_days":  s.DistillStateMaxDays,
@@ -2386,6 +2386,13 @@ func logTurn(kind string, status int, model any, session string, res engine.Asse
 // cursor reset can never send the whole history to the model in one shot.
 const distillInputMaxMsgs = 400
 
+// distillMaxTokens is the output budget for one extraction. The extractor is a
+// thinking Gemini model: completion_tokens includes reasoning, so the channel
+// default (one-api DEFAULT_MAX_TOKEN=2048) can be fully consumed by thoughts,
+// yielding finish_reason=length and a tiny/empty body that IsValid rejects
+// ("蒸馏输出无法解析"). Send an explicit budget instead.
+const distillMaxTokens = 8192
+
 var (
 	distillMu   sync.Mutex
 	distillBusy = map[string]bool{}
@@ -2507,23 +2514,39 @@ func runDistill(ctx context.Context, st *store.Store, client *http.Client, root 
 	prompt := applyMacros(promptTpl, time.Now(), firstNonEmpty(s.UserName, "user"))
 	model := firstNonEmpty(s.DistillModel, "auto-gemini")
 	upBody, _ := json.Marshal(map[string]any{
-		"model":  model,
-		"stream": false,
+		"model":      model,
+		"stream":     false,
+		"max_tokens": distillMaxTokens,
 		"messages": []map[string]any{
 			{"role": "system", "content": prompt},
 			{"role": "user", "content": distill.BuildUser(state, timeline)},
 		},
 	})
-	status, respBody, _ := proxy.Forward(client, s.Upstream, s.APIKey, upBody, false, nil, nil)
-	if status >= 400 {
-		return "", fmt.Errorf("上游 HTTP %d: %s", status, excerpt(string(respBody), 200))
-	}
-	delta := strings.TrimSpace(replyText(respBody))
-	if delta == "" {
-		return "", fmt.Errorf("上游返回空增量")
-	}
-	if !distill.IsValid(delta) {
-		return "", fmt.Errorf("蒸馏输出无法解析（保留旧记录）")
+	// Even with an explicit budget a weak/free channel can still cut the turn
+	// (finish_reason=length) or drop the [STATE]/[LOG] envelope, so retry once
+	// and log finish_reason/usage/excerpt instead of failing opaque.
+	var delta, finish string
+	for attempt := 1; attempt <= 2; attempt++ {
+		status, respBody, usage := proxy.Forward(client, s.Upstream, s.APIKey, upBody, false, nil, nil)
+		if status >= 400 {
+			return "", fmt.Errorf("上游 HTTP %d: %s", status, excerpt(string(respBody), 200))
+		}
+		finish = replyFinish(respBody)
+		delta = strings.TrimSpace(replyText(respBody))
+		if delta != "" && finish != "length" && distill.IsValid(delta) {
+			break
+		}
+		obs.Warn("distill attempt rejected", map[string]any{
+			"session": session, "model": model, "attempt": attempt,
+			"finish_reason": finish, "completion": usageCompletionTokens(usage),
+			"delta_len": len(delta), "excerpt": excerpt(delta, 200),
+		})
+		if attempt == 2 {
+			if delta == "" {
+				return "", fmt.Errorf("上游返回空增量")
+			}
+			return "", fmt.Errorf("蒸馏输出无法解析（保留旧记录）")
+		}
 	}
 	if bad := distill.UnparsedDatedLines(delta); len(bad) > 0 {
 		obs.Warn("distill unparsed lines", map[string]any{"session": session, "n": len(bad), "sample": excerpt(bad[0], 120)})
