@@ -158,6 +158,10 @@ func renderBlocks(root, session, userName string, blocks []engine.Block) []engin
 func normalizeBlocks(blocks []engine.Block) []engine.Block {
 	out := make([]engine.Block, 0, len(blocks)+1)
 	for _, b := range blocks {
+		// Migrate old time_anchor templates saved before {{location}} existed.
+		if b.ID == "time_anchor" && !strings.Contains(b.Template, "{{location}}") && !strings.Contains(b.Template, "[LOC") {
+			b.Template += " {{location}}"
+		}
 		if b.Source.Type == "vectra" {
 			continue // retired: RAG is fully MCP
 		}
