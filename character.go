@@ -2,6 +2,8 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -11,6 +13,7 @@ import (
 
 	"github.com/RoyChong5053/TavernLab/internal/distill"
 	"github.com/RoyChong5053/TavernLab/internal/engine"
+	"github.com/RoyChong5053/TavernLab/internal/settings"
 )
 
 // CharCard is the character description ("角色卡"). No SillyTavern macro
@@ -98,8 +101,10 @@ func renderBlocks(root, session, userName string, blocks []engine.Block) []engin
 	if session != "" {
 		desc = loadCharCard(charBase(root, session)).Description
 	}
+	locText := loadLocationMacro(root, now)
 	for i := range out {
 		rendered := applyMacros(out[i].Template, now, userName)
+		rendered = strings.ReplaceAll(rendered, "{{location}}", locText)
 		switch out[i].Source.Type {
 		case "character":
 			if strings.Contains(rendered, "{{character_card}}") {
@@ -212,7 +217,6 @@ func defaultLevel(b engine.Block) engine.Level {
 	}
 	return engine.LevelElastic
 }
-
 func applyMacros(s string, now time.Time, userName string) string {
 	if s == "" {
 		return s
@@ -231,4 +235,64 @@ func applyMacros(s string, now time.Time, userName string) string {
 		s = strings.ReplaceAll(s, k, v)
 	}
 	return s
+}
+
+// loadLocationMacro renders {{location}} from data/location_latest.json +
+// data/location_geocode.json. Read-only (no Paikka call): the ingest path
+// (/api/location -> ensureGeocode) refreshes the geocode cache on write.
+func loadLocationMacro(root string, now time.Time) string {
+	s := settings.Load(root)
+	if !s.LocationEnabled {
+		// Absent key in old files means enabled (see settings.Load).
+	}
+	staleMin := s.LocationStaleMin
+	if staleMin <= 0 {
+		staleMin = 30
+	}
+	b, err := os.ReadFile(filepath.Join(root, "location_latest.json"))
+	if err != nil {
+		return ""
+	}
+	var p LocationPoint
+	if err := json.Unmarshal([]byte(strings.TrimSpace(string(b))), &p); err != nil {
+		return ""
+	}
+	tst := p.Tst
+	if tst > 1_000_000_000_000 {
+		tst /= 1000
+	}
+	age := now.Unix() - tst
+	if age < 0 {
+		age = 0
+	}
+	place := ""
+	hier := ""
+	if gb, err := os.ReadFile(filepath.Join(root, "location_geocode.json")); err == nil {
+		var g LocationGeocode
+		if json.Unmarshal(gb, &g) == nil {
+			place = g.Place
+			if len(g.Hierarchy) > 0 {
+				hi := g.Hierarchy
+				if len(hi) > 3 {
+					hi = hi[len(hi)-3:]
+				}
+				hier = ", " + strings.Join(hi, ">")
+			}
+		}
+	}
+	if place == "" {
+		place = "未知地点"
+	}
+	acc := ""
+	if p.Acc > 0 {
+		acc = fmt.Sprintf(" (acc %dm", int(math.Round(p.Acc)))
+	} else {
+		acc = " ("
+	}
+	ageTxt := formatAge(time.Duration(age) * time.Second)
+	ts := time.Unix(tst, 0).Format("15:04")
+	if age > int64(staleMin*60) {
+		return fmt.Sprintf("[LOC %s %s%s%s, stale请勿假设用户仍在该处)]", ts, place, hier, acc+", "+ageTxt)
+	}
+	return fmt.Sprintf("[LOC %s %s%s%s)]", ts, place, hier, acc+", "+ageTxt)
 }

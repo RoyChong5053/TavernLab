@@ -1,0 +1,52 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# gps-ctl — gps-logger 启停控制 (对标 tlctl, pidfile 精确定位)
+set -uo pipefail
+export PATH="$HOME/bin:$PREFIX/bin:$PATH"
+
+D="$PREFIX/var/lib/gps-logger"
+PIDF="$D/pid"
+LOG="$D/log"
+mkdir -p "$D"
+
+running() { [ -f "$PIDF" ] && kill -0 "$(cat "$PIDF" 2>/dev/null)" 2>/dev/null; }
+lock_busy() { flock -n "$D/lock" true 2>/dev/null && return 1 || return 0; }
+
+start() {
+  if running; then echo "已在运行 pid=$(cat "$PIDF")"; return 0; fi
+  rm -f "$PIDF"
+  if lock_busy; then echo "锁被占用，先 gps-ctl stop"; return 1; fi
+  setsid "$HOME/bin/gps-logger.sh" >"$D/last-start.log" 2>&1 &
+  for _ in $(seq 1 24); do
+    sleep 0.5
+    running && { echo "已启动 pid=$(cat "$PIDF")"; return 0; }
+  done
+  echo "启动失败："; tail -5 "$D/last-start.log" 2>/dev/null
+  return 1
+}
+
+stop() {
+  p=$(cat "$PIDF" 2>/dev/null)
+  if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then
+    kill -TERM -- "-$p" 2>/dev/null || kill -TERM "$p" 2>/dev/null
+    for _ in $(seq 1 10); do kill -0 "$p" 2>/dev/null || break; sleep 0.5; done
+    kill -KILL -- "-$p" 2>/dev/null
+  fi
+  rm -f "$PIDF"
+  termux-wake-unlock 2>/dev/null
+  echo "已停止"
+}
+
+status() {
+  running && echo "运行中 pid=$(cat "$PIDF")" || echo "未运行"
+  echo "--- 最近日志 ---"
+  tail -6 "$LOG" 2>/dev/null || echo "(还没有日志)"
+}
+
+case "${1:-status}" in
+  start) start ;;
+  stop) stop ;;
+  restart) stop; sleep 1; start ;;
+  status) status ;;
+  logs) tail -f "$LOG" ;;
+  *) echo "用法: gps-ctl start|stop|restart|status|logs"; exit 1 ;;
+esac

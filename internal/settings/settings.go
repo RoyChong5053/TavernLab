@@ -34,6 +34,9 @@ type Settings struct {
 	UserName          string `json:"user_name,omitempty"`         // export attribution / {{user}}
 	NtfyURL           string `json:"ntfy_url,omitempty"`          // self-hosted ntfy base, empty = disabled
 	NtfyTopic         string `json:"ntfy_topic,omitempty"`
+	PaikkaURL         string `json:"paikka_url,omitempty"`          // self-hosted paikka base, empty = disabled
+	LocationStaleMin  int    `json:"location_stale_min,omitempty"`  // minutes before location counts as stale (default 30)
+	LocationEnabled   bool   `json:"location_enabled"`              // inject {{location}} into time_anchor (default true)
 	DistillEnabled    bool   `json:"distill_enabled"`               // auto-distill every N user turns
 	DistillInterval   int    `json:"distill_interval,omitempty"`    // user turns between runs (default 8)
 	DistillMaxChars   int    `json:"distill_max_chars,omitempty"`   // fact-sheet character budget (default 4000)
@@ -70,6 +73,9 @@ func Defaults() Settings {
 		HistoryMinTurns:      4,
 		CurrentChar:          "Leer乐儿",
 		UserName:             "RoyChong",
+		PaikkaURL:            "http://192.168.100.38:8081",
+		LocationStaleMin:     30,
+		LocationEnabled:      true,
 		DistillInterval:      8,
 		DistillMaxChars:      4000,
 		DistillRetainDays:    3,
@@ -153,6 +159,23 @@ func Load(root string) Settings {
 	}
 	if f.NtfyTopic != "" {
 		s.NtfyTopic = f.NtfyTopic
+	}
+	if f.PaikkaURL != "" || explicitEmpty(b, "paikka_url") {
+		s.PaikkaURL = f.PaikkaURL
+	}
+	if f.LocationStaleMin > 0 {
+		s.LocationStaleMin = f.LocationStaleMin
+	}
+	// LocationEnabled defaults true: only an explicit false disables it.
+	// Load starts from Defaults (true), so honour explicit false here and
+	// treat absent key as true for old settings files.
+	if explicitEmpty(b, "location_enabled") {
+		s.LocationEnabled = f.LocationEnabled
+	} else {
+		s.LocationEnabled = true
+	}
+	if s.LocationStaleMin <= 0 {
+		s.LocationStaleMin = 30
 	}
 	s.DistillEnabled = f.DistillEnabled
 	if f.DistillInterval > 0 {

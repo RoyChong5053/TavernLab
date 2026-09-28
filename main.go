@@ -168,6 +168,17 @@ func (r *runtimeSettings) update(root string, patch map[string]any) settings.Set
 			r.cur.NtfyTopic = s
 		}
 	}
+	if v, ok := patch["paikka_url"]; ok {
+		if s, ok := v.(string); ok {
+			r.cur.PaikkaURL = strings.TrimSpace(s)
+		}
+	}
+	if v, ok := patch["location_stale_min"].(float64); ok && v > 0 {
+		r.cur.LocationStaleMin = int(v)
+	}
+	if v, ok := patch["location_enabled"].(bool); ok {
+		r.cur.LocationEnabled = v
+	}
 	if v, ok := patch["distill_enabled"].(bool); ok {
 		r.cur.DistillEnabled = v
 	}
@@ -365,6 +376,7 @@ func main() {
 				"context_window": s.ContextWindow, "reply_reserve": s.ReplyReserve, "history_min_turns": s.HistoryMinTurns,
 				"current_char": s.CurrentChar, "user_name": s.UserName,
 				"ntfy_url": s.NtfyURL, "ntfy_topic": s.NtfyTopic,
+			"paikka_url": s.PaikkaURL, "location_stale_min": s.LocationStaleMin, "location_enabled": s.LocationEnabled,
 				"distill_enabled": s.DistillEnabled, "distill_interval": s.DistillInterval,
 				"distill_max_chars": s.DistillMaxChars, "distill_retain_days": s.DistillRetainDays,
 				"distill_state_max_days":  s.DistillStateMaxDays,
@@ -1037,6 +1049,55 @@ func main() {
 			return
 		}
 		writeJSON(w, map[string]any{"session": session, "total": total, "messages": msgs, "has_more": total-before-limit > 0})
+	})
+
+	// Phone GPS ingest (v0): POST /api/location {lat,lon,acc,provider,tst,batt}.
+	// JSON in = JSONL stored under data/locations/ + data/location_latest.json.
+	// Paikka reverse runs server-side so /api/logs captures ingest + geocode.
+	// GET returns latest + cached geocode (debug).
+	mux.HandleFunc("/api/location", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case "POST":
+			var in LocationPoint
+			b, _ := io.ReadAll(r.Body)
+			if err := json.Unmarshal(b, &in); err != nil {
+				http.Error(w, "bad location json", 400)
+				return
+			}
+			if !validLatLon(in.Lat, in.Lon) {
+				http.Error(w, "invalid lat/lon", 400)
+				return
+			}
+			in.Tst = normTst(in.Tst)
+			if in.Tst <= 0 {
+				in.Tst = time.Now().Unix()
+			}
+			if in.Provider == "" {
+				in.Provider = "unknown"
+			}
+			in.Received = time.Now().Format(time.RFC3339)
+			if err := saveLocationPoint(cfg.DataRoot, in); err != nil {
+				obs.Warn("location save failed", map[string]any{"error": err.Error()})
+				http.Error(w, "save failed", 500)
+				return
+			}
+			obs.Info("location ingest", map[string]any{
+				"lat": in.Lat, "lon": in.Lon, "acc": in.Acc,
+				"provider": in.Provider, "tst": in.Tst,
+			})
+			g := ensureGeocode(cfg.DataRoot, rt.get(), client, in)
+			writeJSON(w, map[string]any{"ok": true, "place": g.Place, "hierarchy": g.Hierarchy})
+		case "GET":
+			p, ok := loadLocationLatest(cfg.DataRoot)
+			if !ok {
+				writeJSON(w, map[string]any{"ok": false})
+				return
+			}
+			g, _ := loadLocationGeocode(cfg.DataRoot)
+			writeJSON(w, map[string]any{"ok": true, "latest": p, "geocode": g})
+		default:
+			http.Error(w, "method not allowed", 405)
+		}
 	})
 
 	// Live events: GET /api/events?session=<char> (SSE). Foreground clients
