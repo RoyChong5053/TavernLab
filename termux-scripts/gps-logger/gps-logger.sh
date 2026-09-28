@@ -52,9 +52,10 @@ trap cleanup EXIT INT TERM
 auth=(-H "Authorization: Bearer $TOKEN")
 
 get_location() {
-  # 顺序 network -> passive/last -> gps: 实测 gps 在室内无 fix 时会占住
-  # Termux:API 队列, 后续调用排队超时 (g0/n0/p0)。先拿必中的, gps 垫底。
-  local loc dbg
+  # 顺序 network -> passive/last -> gps(节流): 实测 gps 在室内无 fix 时会占住
+  # Termux:API 队列, 后续调用排队超时, 且每次无果的 gps 请求都可能刷一条
+  # Termux:API 错误弹窗 + 耗电。先拿必中的, gps 最多每 30min 试一次。
+  local loc dbg now last
   dbg=""
   loc=$(timeout 15 termux-location -p network 2>/dev/null)
   dbg="n${#loc}"
@@ -63,8 +64,15 @@ get_location() {
     dbg="$dbg/p${#loc}"
   fi
   if ! echo "$loc" | grep -q '"latitude"'; then
-    loc=$(timeout 20 termux-location -p gps 2>/dev/null)
-    dbg="$dbg/g${#loc}"
+    now=$(date +%s)
+    last=$(cat "$D/last_gps_try" 2>/dev/null || echo 0)
+    if [ $((now - last)) -ge 1800 ]; then
+      echo "$now" >"$D/last_gps_try"
+      loc=$(timeout 20 termux-location -p gps 2>"$D/gps.err")
+      dbg="$dbg/g${#loc}"
+    else
+      dbg="$dbg/g-skip"
+    fi
   fi
   echo "$dbg $loc"
 }
@@ -114,10 +122,17 @@ while :; do
   [ "$batt" = "" ] && batt=0
   if [ -n "$lat" ] && [ -n "$lon" ]; then
     post_point "$lat" "$lon" "$acc" "$prov" "$tst" "$batt" || true
+    echo 0 >"$D/fails"
     sleep "$INTERVAL"
   else
-    # 取失败早退避早重试: stall 窗口通常几分钟, 不等满 10 分钟
-    log "SKIP 取不到定位 [$dbg]"
-    sleep 120
+    # 取失败退避重试: stall 窗口通常几分钟, 首次 120s, 之后翻倍到 480s 封顶,
+    # 避免在 API 卡死时高频刷请求 (错误弹窗+耗电)。
+    fails=$(cat "$D/fails" 2>/dev/null || echo 0)
+    wait=$((120 * (1 << fails)))
+    [ "$wait" -gt 480 ] && wait=480
+    echo $((fails + 1)) >"$D/fails"
+    gerr=$(head -c 120 "$D/gps.err" 2>/dev/null | tr '\n' ' ')
+    log "SKIP 取不到定位 [$dbg] ${wait}s后重试${gerr:+ gps_err=$gerr}"
+    sleep "$wait"
   fi
 done
