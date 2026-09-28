@@ -20,7 +20,7 @@ func DefaultBlocks() []Block {
 		{
 			ID: "time_anchor", Role: "system", Order: 5, Enabled: true, Level: LevelLocked,
 			Source:   Source{Type: "static"},
-			Template: "[LIVE {{isodate}} {{weekday}} {{time}}] Current time context. Today is {{isodate}}. {{location}}",
+			Template: "[LIVE] {{isodate}} {{weekday_zh}} {{time}} {{daypart}} · {{location}}",
 		},
 		{
 			ID: "character", Role: "system", Order: 10, Enabled: true, Level: LevelLocked,

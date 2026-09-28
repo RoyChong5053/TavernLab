@@ -2,8 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"fmt"
-	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -107,7 +105,7 @@ func renderBlocks(root, session, userName string, blocks []engine.Block) []engin
 		rendered = strings.ReplaceAll(rendered, "{{location}}", locText)
 		// 旧 preset 存的是不带 {{location}} 的模板: 只要 time_anchor 且有位置
 		// 就追加, 不依赖用户点"重置模板"。
-		if out[i].ID == "time_anchor" && locText != "" && !strings.Contains(rendered, "[LOC") {
+		if out[i].ID == "time_anchor" && locText != "" && !strings.Contains(rendered, locText) {
 			rendered += " " + locText
 		}
 		switch out[i].Source.Type {
@@ -231,14 +229,16 @@ func applyMacros(s string, now time.Time, userName string) string {
 		return s
 	}
 	repl := map[string]string{
-		"{{isodate}}":   now.Format("2006-01-02"),
-		"{{date}}":      now.Format("2006-01-02"),
-		"{{time}}":      now.Format("15:04"),
-		"{{weekday}}":   now.Weekday().String(),
-		"{{datetime}}":  now.Format("2006-01-02 15:04:05"),
-		"{{timestamp}}": strconv.FormatInt(now.Unix(), 10),
-		"{{timezone}}":  now.Format("MST"),
-		"{{user}}":      userName,
+		"{{isodate}}":    now.Format("2006-01-02"),
+		"{{date}}":       now.Format("2006-01-02"),
+		"{{time}}":       now.Format("15:04"),
+		"{{weekday}}":    now.Weekday().String(),
+		"{{weekday_zh}}": weekdayZh(now.Weekday()),
+		"{{daypart}}":    daypart(now.Hour()),
+		"{{datetime}}":   now.Format("2006-01-02 15:04:05"),
+		"{{timestamp}}":  strconv.FormatInt(now.Unix(), 10),
+		"{{timezone}}":   now.Format("MST"),
+		"{{user}}":       userName,
 	}
 	for k, v := range repl {
 		s = strings.ReplaceAll(s, k, v)
@@ -246,62 +246,32 @@ func applyMacros(s string, now time.Time, userName string) string {
 	return s
 }
 
-// loadLocationMacro renders {{location}} from data/location_latest.json +
-// data/location_geocode.json. Read-only (no Paikka call): the ingest path
-// (/api/location -> ensureGeocode) refreshes the geocode cache on write.
+func weekdayZh(w time.Weekday) string {
+	return []string{"周日", "周一", "周二", "周三", "周四", "周五", "周六"}[w]
+}
+
+// daypart buckets the hour for Chinese day-part words.
+func daypart(h int) string {
+	switch {
+	case h < 5:
+		return "凌晨"
+	case h < 8:
+		return "清晨"
+	case h < 12:
+		return "上午"
+	case h < 14:
+		return "中午"
+	case h < 18:
+		return "下午"
+	case h < 23:
+		return "晚上"
+	default:
+		return "夜里"
+	}
+}
+
+// loadLocationMacro renders {{location}} via the shared renderer in
+// location.go (bare facts + dwell; behaviour rules live in system block).
 func loadLocationMacro(root string, now time.Time) string {
-	s := settings.Load(root)
-	if !s.LocationEnabled {
-		// Absent key in old files means enabled (see settings.Load).
-	}
-	staleMin := s.LocationStaleMin
-	if staleMin <= 0 {
-		staleMin = 30
-	}
-	b, err := os.ReadFile(filepath.Join(root, "location_latest.json"))
-	if err != nil {
-		return ""
-	}
-	var p LocationPoint
-	if err := json.Unmarshal([]byte(strings.TrimSpace(string(b))), &p); err != nil {
-		return ""
-	}
-	tst := p.Tst
-	if tst > 1_000_000_000_000 {
-		tst /= 1000
-	}
-	age := now.Unix() - tst
-	if age < 0 {
-		age = 0
-	}
-	place := ""
-	hier := ""
-	if gb, err := os.ReadFile(filepath.Join(root, "location_geocode.json")); err == nil {
-		var g LocationGeocode
-		if json.Unmarshal(gb, &g) == nil {
-			place = locationPlace(g)
-			if len(g.Hierarchy) > 0 {
-				hi := g.Hierarchy
-				if len(hi) > 3 {
-					hi = hi[len(hi)-3:]
-				}
-				hier = ", " + strings.Join(hi, ">")
-			}
-		}
-	}
-	if place == "" {
-		place = "未知地点"
-	}
-	acc := ""
-	if p.Acc > 0 {
-		acc = fmt.Sprintf(" (acc %dm", int(math.Round(p.Acc)))
-	} else {
-		acc = " ("
-	}
-	ageTxt := formatAge(time.Duration(age) * time.Second)
-	ts := time.Unix(tst, 0).Format("15:04")
-	if age > int64(staleMin*60) {
-		return fmt.Sprintf("[LOC %s %s%s%s, stale请勿假设用户仍在该处)]", ts, place, hier, acc+", "+ageTxt)
-	}
-	return fmt.Sprintf("[LOC %s %s%s%s)]", ts, place, hier, acc+", "+ageTxt)
+	return renderLocationText(root, settings.Load(root), locationHTTP, now)
 }

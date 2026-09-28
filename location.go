@@ -114,6 +114,10 @@ func loadLocationGeocode(root string) (LocationGeocode, bool) {
 	return g, true
 }
 
+// locationHTTP is the short-timeout client for read-path Paikka refreshes
+// (chat assemble hits this on geocode cache miss).
+var locationHTTP = &http.Client{Timeout: 8 * time.Second}
+
 // locationPlace picks a readable name: POI display_name first, finest
 // hierarchy unit next (Paikka often returns place="" with only hierarchy).
 func locationPlace(g LocationGeocode) string {
@@ -230,7 +234,106 @@ func formatAge(d time.Duration) string {
 	return fmt.Sprintf("%d天前", h/24)
 }
 
+// locationShort renders "PJU 8, Petaling Jaya": place + nearest parent
+// with a different name (skips the duplicated tail of the hierarchy).
+func locationShort(g LocationGeocode) string {
+	place := locationPlace(g)
+	parent := ""
+	for i := len(g.Hierarchy) - 1; i >= 0; i-- {
+		if g.Hierarchy[i] != "" && g.Hierarchy[i] != place {
+			parent = g.Hierarchy[i]
+			break
+		}
+	}
+	if parent != "" {
+		return place + ", " + parent
+	}
+	return place
+}
+
+func haversineKm(lat1, lon1, lat2, lon2 float64) float64 {
+	const r = 6371.0
+	dLat := (lat2 - lat1) * math.Pi / 180
+	dLon := (lon2 - lon1) * math.Pi / 180
+	a := math.Sin(dLat/2)*math.Sin(dLat/2) +
+		math.Cos(lat1*math.Pi/180)*math.Cos(lat2*math.Pi/180)*math.Sin(dLon/2)*math.Sin(dLon/2)
+	return 2 * r * math.Asin(math.Sqrt(a))
+}
+
+// loadRecentPoints reads yesterday + today jsonl (newest last, capped).
+func loadRecentPoints(root string, cap int) []LocationPoint {
+	var out []LocationPoint
+	now := time.Now()
+	for _, day := range []string{now.AddDate(0, 0, -1).Format("2006-01-02"), now.Format("2006-01-02")} {
+		b, err := os.ReadFile(filepath.Join(root, "locations", day+".jsonl"))
+		if err != nil {
+			continue
+		}
+		for _, ln := range strings.Split(string(b), "\n") {
+			ln = strings.TrimSpace(ln)
+			if ln == "" {
+				continue
+			}
+			var p LocationPoint
+			if json.Unmarshal([]byte(ln), &p) != nil {
+				continue
+			}
+			p.Tst = normTst(p.Tst)
+			out = append(out, p)
+		}
+	}
+	if len(out) > cap {
+		out = out[len(out)-cap:]
+	}
+	return out
+}
+
+// locationDwell infers 移动中 / 静止停留约N分钟 from recent history.
+// Returns "" when there is not enough history to say anything.
+func locationDwell(root string, p LocationPoint) string {
+	pts := loadRecentPoints(root, 200)
+	if len(pts) < 2 {
+		return ""
+	}
+	prev := pts[len(pts)-2]
+	gap := p.Tst - prev.Tst
+	if gap < 0 {
+		gap = 0
+	}
+	if haversineKm(prev.Lat, prev.Lon, p.Lat, p.Lon) > 0.25 && gap < 40*60 {
+		return "移动中"
+	}
+	// Walk back while inside 150m and consecutive gaps stay under 40min.
+	first := p.Tst
+	for i := len(pts) - 1; i > 0; i-- {
+		if haversineKm(pts[i-1].Lat, pts[i-1].Lon, p.Lat, p.Lon) > 0.15 {
+			break
+		}
+		if pts[i].Tst-pts[i-1].Tst > 40*60 {
+			break
+		}
+		first = pts[i-1].Tst
+	}
+	d := p.Tst - first
+	if d < 0 {
+		d = 0
+	}
+	if d < 3*60 {
+		return "短暂停留"
+	}
+	if d < 3600 {
+		return fmt.Sprintf("静止停留约%d分钟", int(d/60))
+	}
+	h, m := int(d/3600), int(d%3600/60)
+	if m >= 5 {
+		return fmt.Sprintf("静止停留约%d小时%d分", h, m)
+	}
+	return fmt.Sprintf("静止停留约%d小时", h)
+}
+
 // renderLocationText builds the {{location}} macro value for time_anchor.
+// Bare facts only (no behaviour instructions — those belong in the system
+// block): "PJU 8, Petaling Jaya · 静止停留约12分钟".
 func renderLocationText(root string, s settings.Settings, client *http.Client, now time.Time) string {
 	if !s.LocationEnabled {
 		return ""
@@ -254,24 +357,16 @@ func renderLocationText(root string, s settings.Settings, client *http.Client, n
 		// refreshed via ensureGeocode, so this is usually a cache hit.
 		g = ensureGeocode(root, s, client, p)
 	}
-	place := locationPlace(g)
-	hier := ""
-	if len(g.Hierarchy) > 0 {
-		hi := g.Hierarchy
-		if len(hi) > 3 {
-			hi = hi[len(hi)-3:]
-		}
-		hier = ", " + strings.Join(hi, ">")
+	short := locationShort(g)
+	coarse := ""
+	if p.Acc > 500 {
+		coarse = "，粗精度"
 	}
-	acc := ""
-	if p.Acc > 0 {
-		acc = fmt.Sprintf(" (acc %dm", int(math.Round(p.Acc)))
-	} else {
-		acc = " ("
-	}
-	ts := time.Unix(p.Tst, 0).Format("15:04")
 	if stale {
-		return fmt.Sprintf("[LOC %s %s%s, %s, stale请勿假设用户仍在该处)]", ts, place, hier, acc+", "+formatAge(time.Duration(age)*time.Second))
+		return fmt.Sprintf("%s · %s更新（已过期）%s", short, formatAge(time.Duration(age)*time.Second), coarse)
 	}
-	return fmt.Sprintf("[LOC %s %s%s%s)]", ts, place, hier, acc+", "+formatAge(time.Duration(age)*time.Second))
+	if dwell := locationDwell(root, p); dwell != "" {
+		return fmt.Sprintf("%s · %s%s", short, dwell, coarse)
+	}
+	return fmt.Sprintf("%s · %s更新%s", short, formatAge(time.Duration(age)*time.Second), coarse)
 }
