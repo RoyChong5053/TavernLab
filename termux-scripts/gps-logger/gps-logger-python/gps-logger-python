@@ -1,0 +1,781 @@
+#!/data/data/com.termux/files/usr/bin/python3
+# -*- coding: utf-8 -*-
+# gps-logger — GT20 地理位置反馈 (v1, Python + rich TUI)
+#
+# 取定位 -> POST m64 TavernLab /api/location -> m64 调 Paikka 反查地名
+# -> time_anchor {{location}} 进对话上下文。只在你手动运行时上报，Ctrl-C 退出。
+#
+# 依赖: com.termux + com.termux.api, python3 (标准库), rich (可选, 装了就用面板)
+# 配置: ~/.config/gps-logger/env (chmod 600, 勿提交)
+#
+# ---------------------------------------------------------------------------
+# 定位必须用 `-r last`，不能用默认的 `-r once`。
+#
+# LocationAPI 的 once 请求在服务端 latch.await(30, SECONDS) 硬等 30 秒
+# (LocationAPI.java:181)。旧脚本给 network 的 timeout 只有 15s, 于是每次都在
+# API 还在等的时候被 SIGKILL -> 服务端 30 秒后写回已死的 socket ->
+# `java.io.IOException: Connection refused` -> ResultReturner 弹一条
+# "Termux:API Error"。一天几十条弹窗就是这么来的, 不是"定位不到"。
+#
+# `-r last` 读缓存瞬回 (实测 1.05-3.2s), 永远不进那个 latch, 也就永远不会被杀。
+# 代价是拿到的可能是几十分钟前的缓存点位 —— 所以下面把 elapsedMs 解析成
+# 点龄, 在面板上如实标出年龄, 不假装是实时定位。
+# ---------------------------------------------------------------------------
+
+import argparse
+import json
+import math
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+# ---- paths ----------------------------------------------------------------
+PREFIX = os.environ.get("PREFIX", "/data/data/com.termux/files/usr")
+BASE_DIR = Path(__file__).resolve().parent
+CONF = Path.home() / ".config" / "gps-logger" / "env"
+D = Path(PREFIX) / "var" / "lib" / "gps-logger"
+LOG = D / "log"
+LAST_JSON = D / "last.json"
+
+# /tmp 在 Termux 里不可写, 必须用 $PREFIX/tmp
+TMPD = Path(PREFIX) / "tmp"
+
+# ---- 可调参数 (都能用命令行覆盖, 见 argparse) ------------------------------
+INTERVAL = 600           # 基础间隔秒
+INTERVAL_STILL = 1200    # 静止时拉长到的间隔秒
+STILL_METERS = 100.0     # 位移小于此值算静止
+PROVIDERS = ["network", "passive", "gps"]
+PROV_TIMEOUT = {"network": 25, "passive": 15, "gps": 25}
+BATTERY_TIMEOUT = 15
+POST_TIMEOUT = 20
+RETRY_EVERY = 3          # 连续失败到这次就触发 Termux:API 重启自愈
+HTTP_OK = (200, 201)
+STOP = False
+
+
+def _on_signal(signum, frame):
+    global STOP
+    STOP = True
+
+
+# ---- config ---------------------------------------------------------------
+def load_env_file():
+    """读 ~/.config/gps-logger/env。格式是 KEY=VALUE 的 shell 片段。"""
+    if not CONF.exists():
+        die("缺少 %s, 先跑 install.sh" % CONF)
+    cfg = {}
+    for line in CONF.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        cfg[k.strip()] = v.strip().strip("'\"")
+    return cfg
+
+
+def die(msg):
+    log("FATAL %s" % msg)
+    print("gps-logger: %s" % msg, file=sys.stderr)
+    sys.exit(1)
+
+
+def ts():
+    return time.strftime("%F %T")
+
+
+def log(msg):
+    """追加到日志文件。日志目录可能还不存在。"""
+    try:
+        D.mkdir(parents=True, exist_ok=True)
+        with LOG.open("a", encoding="utf-8") as f:
+            f.write("%s %s\n" % (ts(), msg))
+    except OSError:
+        pass  # 日志失败不能拖垮主流程
+
+
+# ---- 定位 -----------------------------------------------------------------
+class Fix:
+    """一次定位结果。age_s 是点位年龄 (从 elapsedMs 算), 用来如实展示新鲜度。"""
+
+    def __init__(self, lat, lon, acc, provider, age_s, speed=None, bearing=None):
+        self.lat = lat
+        self.lon = lon
+        self.acc = acc
+        self.provider = provider
+        self.age_s = age_s
+        self.speed = speed
+        self.bearing = bearing
+
+    @property
+    def stale_level(self):
+        """点龄分级: fresh / warm / cold。面板按这个上色。"""
+        if self.age_s is None:
+            return "fresh"
+        if self.age_s < 300:
+            return "fresh"
+        if self.age_s < 1800:
+            return "warm"
+        return "cold"
+
+    def age_text(self):
+        if self.age_s is None:
+            return "未知"
+        s = int(self.age_s)
+        if s < 60:
+            return "%d秒前" % s
+        if s < 3600:
+            return "%d分钟前" % (s // 60)
+        return "%d小时前" % (s // 3600)
+
+    def __str__(self):
+        return "%.6f,%.6f" % (self.lat, self.lon)
+
+
+def run_api(cmd, timeout):
+    """跑一个 termux-api 包装脚本, 带硬超时。
+
+    timeout 必须大于该 API 的内部最坏等待, 否则就是"杀在飞行中" ->
+    Termux:API 报错弹窗。这里所有调用都用 -r last 这种瞬回的, timeout 只是
+    防挂死的安全网, 给得比实际耗时长得多。
+    """
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return ""
+    except OSError:
+        return ""
+    return r.stdout.decode("utf-8", errors="replace")
+
+
+def parse_location(raw):
+    """termux-location 的 JSON -> Fix。失败返回 None。
+
+    注意 API_ERROR 字段: 权限缺失/取不到时 Termux:API 会返回
+    {"API_ERROR": "..."} 而不是空, 别把它当成有效点位。
+    """
+    if not raw:
+        return None
+    try:
+        d = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(d, dict) or "API_ERROR" in d:
+        return None
+    lat = d.get("latitude")
+    lon = d.get("longitude")
+    if lat is None or lon is None:
+        return None
+    try:
+        lat, lon = float(lat), float(lon)
+    except (TypeError, ValueError):
+        return None
+    # 越界的基本不是有效坐标
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        return None
+
+    def num(key):
+        v = d.get(key)
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    elapsed = num("elapsedMs")
+    return Fix(
+        lat=lat,
+        lon=lon,
+        acc=num("accuracy"),
+        provider=d.get("provider") or "unknown",
+        age_s=(elapsed / 1000.0) if elapsed is not None else None,
+        speed=num("speed"),
+        bearing=num("bearing"),
+    )
+
+
+def get_fix():
+    """按 PROVIDERS 顺序取定位, 拿到第一个有效的就返回。
+
+    一律 `-r last`: 读缓存瞬回。**不要**改成默认的 once, 理由见文件头。
+    返回 (fix, debug) —— debug 记每个 provider 的返回字节数, 方便排障。
+    """
+    debug = []
+    for p in PROVIDERS:
+        raw = run_api(["termux-location", "-p", p, "-r", "last"],
+                      PROV_TIMEOUT.get(p, 25))
+        debug.append("%s%d" % (p[:1], len(raw)))
+        fix = parse_location(raw)
+        if fix:
+            return fix, "/".join(debug)
+    return None, "/".join(debug)
+
+
+def get_battery():
+    """电量百分比。拿不到返回 0 (服务端 omitempty, 不影响)。"""
+    raw = run_api(["termux-battery-status"], BATTERY_TIMEOUT)
+    if not raw:
+        return 0
+    try:
+        pct = json.loads(raw).get("percentage")
+        return int(pct) if pct is not None else 0
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return 0
+
+
+# ---- 上报 -----------------------------------------------------------------
+def haversine_m(lat1, lon1, lat2, lon2):
+    """两点距离(米)。公式与服务端 location.go:254 haversineKm 一致。"""
+    r = 6371000.0
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = (math.sin(dlat / 2) ** 2
+         + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2))
+         * math.sin(dlon / 2) ** 2)
+    return 2 * r * math.asin(math.sqrt(a))
+
+
+class Poster:
+    """POST 到 m64。记录最近一次结果给面板显示。"""
+
+    def __init__(self, host, token, enabled=True):
+        self.host = host.rstrip("/")
+        self.token = token
+        self.enabled = enabled
+        self.last_code = None
+        self.last_ms = None
+        self.last_error = None
+        self.place = ""
+        self.hierarchy = []
+        self.ok_count = 0
+        self.fail_count = 0
+        self.consec_fail = 0
+        self.retried = 0
+
+    def _send(self, payload):
+        body = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            self.host + "/api/location",
+            data=body,
+            headers={
+                "Authorization": "Bearer " + self.token,
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        start = time.monotonic()
+        try:
+            with urllib.request.urlopen(req, timeout=POST_TIMEOUT) as resp:
+                self.last_ms = int((time.monotonic() - start) * 1000)
+                self.last_code = resp.status
+                if resp.status in HTTP_OK:
+                    try:
+                        d = json.loads(resp.read().decode("utf-8"))
+                        if isinstance(d, dict):
+                            self.place = d.get("place") or ""
+                            self.hierarchy = d.get("hierarchy") or []
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        pass
+                    return True
+                self.last_error = "HTTP %d" % resp.status
+                return False
+        except urllib.error.HTTPError as e:
+            self.last_ms = int((time.monotonic() - start) * 1000)
+            self.last_code = e.code
+            self.last_error = "HTTP %d" % e.code
+            return False
+        except Exception as e:  # noqa: BLE001 - 网络异常种类多, 一律降级为失败
+            self.last_ms = int((time.monotonic() - start) * 1000)
+            self.last_code = None
+            self.last_error = type(e).__name__
+            return False
+
+    def send(self, fix, batt):
+        """上报一个点。enabled=False 时只本地记账, 不发网络。"""
+        payload = {
+            "lat": fix.lat,
+            "lon": fix.lon,
+            "acc": fix.acc or 0,
+            "provider": fix.provider,
+            "tst": int(time.time()),
+            "batt": batt,
+        }
+        if not self.enabled:
+            self.last_code = None
+            self.last_error = None
+            return True
+        # 先落盘再发: 万一发到一半被 Ctrl-C, 下次启动还能补发
+        try:
+            D.mkdir(parents=True, exist_ok=True)
+            LAST_JSON.write_text(json.dumps(payload), encoding="utf-8")
+        except OSError:
+            pass
+        if self._send(payload):
+            self.ok_count += 1
+            self.consec_fail = 0
+            log("OK lat=%.6f lon=%.6f acc=%s prov=%s batt=%s age=%s"
+                % (fix.lat, fix.lon, fix.acc, fix.provider, batt, fix.age_text()))
+            return True
+        self.fail_count += 1
+        self.consec_fail += 1
+        log("FAIL %s lat=%.6f lon=%.6f (consec=%d)"
+            % (self.last_error, fix.lat, fix.lon, self.consec_fail))
+        return False
+
+    def retry_last(self):
+        """补发上次没发出去的点 (重启/崩溃后调一次)。"""
+        if not self.enabled or not LAST_JSON.exists():
+            return False
+        try:
+            payload = LAST_JSON.read_text(encoding="utf-8").strip()
+        except OSError:
+            return False
+        if not payload:
+            return False
+        if self._send(payload):
+            self.retried += 1
+            log("RETRY OK")
+            try:
+                LAST_JSON.unlink()
+            except OSError:
+                pass
+            return True
+        log("RETRY FAIL %s" % self.last_error)
+        return False
+
+    def heal_api(self):
+        """重启 Termux:API 自愈。
+
+        借鉴自 BuriXon-code 的 Termux-GPS-Tracker: 取定位反复失败时,
+        Termux:API 的 KeepAliveService 可能已经僵死, 光等没用, 重启它。
+        实测本机存在:
+          termux-api-stop  -> am stopservice -n com.termux.api/.KeepAliveService
+          termux-api-start -> am startservice  -n com.termux.api/.KeepAliveService
+        **只在连续失败够多次后调用**, 正常路径绝不碰。
+        """
+        log("heal: restart Termux:API (consec_fail=%d)" % self.consec_fail)
+        for cmd in ("termux-api-stop", "termux-api-start"):
+            if shutil.which(cmd):
+                run_api([cmd], 15)
+        time.sleep(2)  # 等 API 进程起来
+
+
+# ---- 渲染 -----------------------------------------------------------------
+try:
+    from rich.console import Console, Group
+    from rich.live import Live
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
+    from rich import box
+    HAS_RICH = True
+except ImportError:
+    HAS_RICH = False
+
+AGE_STYLE = {"fresh": "bold green", "warm": "bold yellow", "cold": "bold red"}
+AGE_MARK = {"fresh": "●", "warm": "●", "cold": "●"}
+
+
+class Stats:
+    """面板要显示的运行时状态。"""
+
+    def __init__(self):
+        self.rounds = 0
+        self.skips = 0
+        self.started = time.monotonic()
+        self.history = []       # [(时间, 状态, 文本), ...] 最多 HIST_MAX 行
+        self.last_fix = None
+        self.last_dist_m = None  # 距上一点的距离
+        self.interval_now = INTERVAL
+        self.adaptive = False
+        self.state = "启动中"
+        self.state_style = "cyan"
+        self.next_at = None
+
+    HIST_MAX = 8
+
+    def add(self, ok, text):
+        self.history.append((time.strftime("%H:%M"), ok, text))
+        if len(self.history) > self.HIST_MAX:
+            self.history.pop(0)
+
+
+def build_rich(st, poster, cfg):
+    """构造 rich 布局。宽屏左右分栏, 窄屏上下堆叠。"""
+    console = Console()
+    wide = console.width >= 76
+
+    # --- 头部 ---
+    up = int(time.monotonic() - st.started)
+    up_s = "%02d:%02d" % (up // 3600, (up % 3600) // 60)
+    head = Text.from_markup(
+        "[bold]%s[/]  %s  m64 [cyan]%s[/]  间隔 [cyan]%ds[/]%s\n"
+        "运行 [cyan]%s[/] · 第 [cyan]%d[/] 轮 · %s"
+        % (st.state, "●" if st.state_style == "green" else "○",
+           cfg["host"], st.interval_now,
+           "  [dim](静止自适应)[/]" if st.adaptive else "",
+           up_s, st.rounds, time.strftime("%H:%M:%S")),
+        style=st.state_style if st.state != "已连接" else "bold",
+    )
+    header = Panel(head, border_style=st.state_style, box=box.ROUNDED,
+                   padding=(0, 1))
+
+    # --- 定位面板 ---
+    lt = Table(show_header=False, box=box.SIMPLE, padding=(0, 1),
+               expand=True, collapse_padding=True)
+    lt.add_column("k", width=10, style="dim", no_wrap=True)
+    lt.add_column("v", ratio=1, overflow="fold")
+    f = st.last_fix
+    if f:
+        lt.add_row("provider", f.provider)
+        lt.add_row("坐标", "%s" % f)
+        lt.add_row("精度", "±%.0f m" % f.acc if f.acc else "未知")
+        lvl = f.stale_level
+        lt.add_row("点龄", "[%s]%s %s[/]" % (AGE_STYLE[lvl], AGE_MARK[lvl],
+                                             f.age_text()))
+        if st.last_dist_m is not None:
+            lt.add_row("距上点", "%.1f m" % st.last_dist_m)
+    else:
+        lt.add_row("状态", "[dim]尚未取到定位[/]")
+    loc_panel = Panel(lt, title="[bold cyan]定位[/]",
+                      border_style="cyan", box=box.ROUNDED, padding=(0, 1))
+
+    # --- 发送面板 ---
+    rt = Table(show_header=False, box=box.SIMPLE, padding=(0, 1),
+               expand=True, collapse_padding=True)
+    rt.add_column("k", width=10, style="dim", no_wrap=True)
+    rt.add_column("v", ratio=1, overflow="fold")
+    if not poster.enabled:
+        rt.add_row("模式", "[yellow]未发送 (--no-post)[/]")
+    elif poster.last_code in HTTP_OK:
+        rt.add_row("上次", "[green]%d OK[/]  [dim]%dms[/]"
+                   % (poster.last_code, poster.last_ms or 0))
+    elif poster.last_code is not None:
+        rt.add_row("上次", "[red]%d %s[/]"
+                   % (poster.last_code, poster.last_error or ""))
+    else:
+        rt.add_row("上次", "[dim]尚未发送[/]")
+    if poster.place:
+        short = poster.place
+        # 层级里最后一个和 place 相同的就不重复显示了
+        for h in reversed(poster.hierarchy):
+            if h and h != short:
+                short += ", " + h
+                break
+        rt.add_row("地点", short)
+    rt.add_row("成功/失败", "[green]%d[/] / [red]%d[/]"
+               % (poster.ok_count, poster.fail_count))
+    if poster.retried:
+        rt.add_row("补发", "[green]%d[/]" % poster.retried)
+    send_panel = Panel(rt, title="[bold magenta]发送[/]",
+                       border_style="magenta", box=box.ROUNDED, padding=(0, 1))
+
+    if wide:
+        from rich.columns import Columns
+        mid = Columns([loc_panel, send_panel], expand=True, equal=True)
+    else:
+        mid = Group(loc_panel, send_panel)
+
+    # --- 轮次历史 ---
+    ht = Table(box=box.SIMPLE, expand=True, collapse_padding=True,
+               padding=(0, 1))
+    ht.add_column("时间", width=5, style="dim", no_wrap=True)
+    ht.add_column("", width=1, no_wrap=True)
+    ht.add_column("来源", width=8, no_wrap=True)
+    ht.add_column("精度", width=7, no_wrap=True)
+    ht.add_column("点龄", width=9, no_wrap=True)
+    ht.add_column("HTTP", width=7, no_wrap=True)
+    ht.add_column("耗时", width=7, no_wrap=True)
+    for t, ok, txt in st.history:
+        mark = "[green]●[/]" if ok else "[red]○[/]"
+        ht.add_row(t, mark, txt[0], txt[1], txt[2], txt[3], txt[4])
+    hist_panel = Panel(ht, title="[bold blue]轮次[/]",
+                       border_style="blue", box=box.ROUNDED, padding=(0, 1))
+
+    # --- 底部状态栏 ---
+    ok_n, skip_n = st.rounds - st.skips, st.skips
+    if st.next_at:
+        left = max(0, int(st.next_at - time.time()))
+        bar = Progress(bar_width=16, total=max(1, st.interval_now),
+                       completed=max(0, st.interval_now - left))
+        countdown = "下轮 %02d:%02d %s" % (left // 60, left % 60, bar.text)
+    else:
+        countdown = ""
+    footer = Text.from_markup(
+        "成功 [green]%d[/] · 失败 [red]%d[/] · 跳过 [yellow]%d[/] · %s\n"
+        "[dim][q]退出  [空格]立即取点[/]"
+        % (ok_n, poster.fail_count, skip_n, countdown))
+
+    return Group(header, mid, hist_panel, footer)
+
+
+class Progress:
+    def __init__(self, bar_width, total, completed):
+        self.bar_width = bar_width
+        self.total = total
+        self.completed = completed
+
+    @property
+    def text(self):
+        frac = 0.0 if self.total <= 0 else min(1.0, self.completed / self.total)
+        n = int(frac * self.bar_width)
+        return "█" * n + "░" * (self.bar_width - n)
+
+
+def build_plain(st, poster, cfg):
+    """没有 rich 时的降级渲染: 纯文本 + 清屏。"""
+    lines = []
+    up = int(time.monotonic() - st.started)
+    lines.append("=== GPS Logger ===")
+    lines.append("%s  m64 %s  间隔 %ds%s" % (
+        st.state, cfg["host"], st.interval_now,
+        "  (静止自适应)" if st.adaptive else ""))
+    lines.append("运行 %02d:%02d · 第 %d 轮 · %s" % (
+        up // 3600, (up % 3600) // 60, st.rounds, time.strftime("%H:%M:%S")))
+    lines.append("-" * 40)
+    f = st.last_fix
+    if f:
+        lines.append("  provider  %s" % f.provider)
+        lines.append("  坐标      %s" % f)
+        lines.append("  精度      ±%.0f m" % f.acc if f.acc else "  精度      未知")
+        lines.append("  点龄      %s %s" % (AGE_MARK[f.stale_level], f.age_text()))
+        if st.last_dist_m is not None:
+            lines.append("  距上点    %.1f m" % st.last_dist_m)
+    else:
+        lines.append("  尚未取到定位")
+    lines.append("-" * 40)
+    if not poster.enabled:
+        lines.append("  模式      未发送 (--no-post)")
+    elif poster.last_code in HTTP_OK:
+        lines.append("  上次      %d OK  %dms" % (poster.last_code,
+                                                 poster.last_ms or 0))
+    elif poster.last_code is not None:
+        lines.append("  上次      %d %s" % (poster.last_code,
+                                            poster.last_error or ""))
+    else:
+        lines.append("  上次      尚未发送")
+    if poster.place:
+        lines.append("  地点      %s" % poster.place)
+    lines.append("  成功/失败  %d / %d" % (poster.ok_count, poster.fail_count))
+    lines.append("-" * 40)
+    for t, ok, txt in st.history[-5:]:
+        lines.append("  %s %s %-8s %-7s %-9s %-7s %-7s" % (
+            t, "+" if ok else "-", txt[0], txt[1], txt[2], txt[3], txt[4]))
+    if st.next_at:
+        left = max(0, int(st.next_at - time.time()))
+        lines.append("  成功 %d · 失败 %d · 跳过 %d · 下轮 %02d:%02d" % (
+            st.rounds - st.skips, poster.fail_count, st.skips,
+            left // 60, left % 60))
+    lines.append("  [q]退出  [空格]立即取点")
+    return "\n".join(lines)
+
+
+# ---- 主循环 ---------------------------------------------------------------
+def one_round(st, poster, cfg, force_post=True):
+    """跑一轮: 取定位 -> 上报 -> 更新面板状态。返回本轮是否成功。"""
+    st.rounds += 1
+    st.state = "取定位中"
+    st.state_style = "cyan"
+
+    fix, debug = get_fix()
+    if not fix:
+        st.skips += 1
+        st.state = "取不到定位"
+        st.state_style = "yellow"
+        st.add(False, ("-", "-", "-", "-", "-"))
+        log("SKIP 取不到定位 [%s]" % debug)
+        return False
+
+    prev = st.last_fix
+    if prev is not None:
+        st.last_dist_m = haversine_m(prev.lat, prev.lon, fix.lat, fix.lon)
+    st.last_fix = fix
+
+    # 自适应间隔: 位移小就降频省电, 但静止期照常采样 (dwell 推断依赖连续点位)
+    if st.last_dist_m is not None and st.last_dist_m < STILL_METERS:
+        st.interval_now = INTERVAL_STILL
+        st.adaptive = True
+    else:
+        st.interval_now = INTERVAL
+        st.adaptive = False
+
+    batt = get_battery()
+    sent = poster.send(fix, batt) if force_post else True
+
+    # 连续失败够多次 -> 重启 Termux:API 自愈。其 KeepAliveService 可能已僵死,
+    # 光等没用。借鉴 BuriXon-code 的 Termux-GPS-Tracker, 但只在真失败时触发,
+    # 正常路径绝不碰 (重启会让本来 1 秒能好的调用变成几秒)。
+    healed = False
+    if not sent and poster.consec_fail >= RETRY_EVERY:
+        poster.heal_api()
+        poster.consec_fail = 0
+        healed = True
+
+    if healed:
+        st.state = "上报失败·已重启API"
+        st.state_style = "yellow"
+    else:
+        st.state = "已连接" if sent else "上报失败"
+        st.state_style = "green" if sent else "red"
+    http = (str(poster.last_code) if poster.last_code else "-")
+    ms = ("%dms" % poster.last_ms) if poster.last_ms is not None else "-"
+    st.add(sent, (fix.provider,
+                  ("±%.0fm" % fix.acc) if fix.acc else "-",
+                  fix.age_text(), http, ms))
+    return sent
+
+
+def loop(st, poster, cfg):
+    """前台主循环。Ctrl-C 或 q 退出。空格立即触发一轮。"""
+    import termios
+    import tty
+
+    # 开场先补发上次没发出去的点
+    poster.retry_last()
+
+    console = Console() if HAS_RICH else None
+    # 退出时恢复光标和 echo, 否则 Ctrl-C 后终端是花的
+    fd = sys.stdin.fileno()
+    old_attrs = None
+    try:
+        old_attrs = termios.tcgetattr(fd)
+        tty.setcbreak(fd)
+    except (termios.error, ValueError, OSError):
+        pass  # 不是 tty (比如被重定向), 就用普通输入
+
+    def cleanup():
+        if old_attrs is not None:
+            try:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+            except (termios.error, ValueError, OSError):
+                pass
+        if console is not None:
+            console.print("\n[dim]已退出 · 本次成功 %d 失败 %d 跳过 %d[/]"
+                          % (poster.ok_count, poster.fail_count, st.skips))
+        else:
+            print("\n已退出 · 成功 %d 失败 %d 跳过 %d"
+                  % (poster.ok_count, poster.fail_count, st.skips))
+
+    try:
+        if HAS_RICH:
+            with Live(console=console, refresh_per_second=4,
+                      screen=True) as live:
+                while not STOP:
+                    one_round(st, poster, cfg)
+                    st.next_at = time.time() + st.interval_now
+                    live.update(build_rich(st, poster, cfg))
+                    # 间隔内可按空格打断立刻取点, 也能被 Ctrl-C 打断
+                    end = time.time() + st.interval_now
+                    while not STOP and time.time() < end:
+                        try:
+                            if select_has_input(fd, 0.4):
+                                ch = os.read(fd, 1).decode("utf-8", "replace")
+                                if ch in ("q", "Q", "\x03"):
+                                    STOP = True
+                                    break
+                                if ch == " ":
+                                    end = 0
+                                    break
+                        except OSError:
+                            break
+        else:
+            while not STOP:
+                one_round(st, poster, cfg)
+                st.next_at = time.time() + st.interval_now
+                print("\033[2J\033[H" + build_plain(st, poster, cfg))
+                end = time.time() + st.interval_now
+                while not STOP and time.time() < end:
+                    time.sleep(0.4)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        cleanup()
+
+
+def select_has_input(fd, timeout):
+    """有输入就返回 True。用 select 而不是直接 read, 否则会阻塞。"""
+    import select
+    try:
+        r, _, _ = select.select([fd], [], [], timeout)
+        return bool(r)
+    except (OSError, ValueError):
+        return False
+
+
+# ---- CLI ------------------------------------------------------------------
+def main():
+    ap = argparse.ArgumentParser(
+        description="GT20 地理位置反馈 -> m64 TavernLab -> 对话上下文")
+    ap.add_argument("--once", action="store_true",
+                    help="取一个点就退出 (可放进 cron)")
+    ap.add_argument("--interval", type=int, default=None,
+                    help="基础间隔秒 (默认读配置, 再默认 600)")
+    ap.add_argument("--plain", action="store_true",
+                    help="强制纯文本输出, 不用 rich")
+    ap.add_argument("--no-post", action="store_true",
+                    help="只本地显示, 不发 m64 (调试用)")
+    ap.add_argument("--host", default=None, help="覆盖配置里的 HOST")
+    ap.add_argument("--token", default=None, help="覆盖配置里的 TOKEN")
+    args = ap.parse_args()
+
+    cfg = load_env_file()
+    host = args.host or cfg.get("HOST")
+    token = args.token or cfg.get("TOKEN")
+    if not host:
+        die("配置里没有 HOST (m64 TavernLab, 如 http://192.168.100.78:8888)")
+    if not token:
+        die("配置里没有 TOKEN (app_token)")
+    cfg["host"] = host
+
+    if args.interval:
+        globals()["INTERVAL"] = args.interval
+        globals()["INTERVAL_STILL"] = max(args.interval * 2, args.interval + 60)
+    elif cfg.get("GL_INTERVAL"):
+        try:
+            globals()["INTERVAL"] = int(cfg["GL_INTERVAL"])
+            globals()["INTERVAL_STILL"] = INTERVAL * 2
+        except ValueError:
+            pass
+
+    if args.plain:
+        global HAS_RICH
+        HAS_RICH = False
+
+    if not shutil.which("termux-location"):
+        die("缺 termux-location (装 com.termux.api 并给位置权限)")
+
+    signal.signal(signal.SIGINT, _on_signal)
+    signal.signal(signal.SIGTERM, _on_signal)
+
+    D.mkdir(parents=True, exist_ok=True)
+    log("=== start v1 host=%s interval=%ds post=%s ==="
+        % (host, INTERVAL, not args.no_post))
+
+    st = Stats()
+    st.interval_now = INTERVAL
+    poster = Poster(host, token, enabled=not args.no_post)
+
+    if args.once:
+        one_round(st, poster, cfg)
+        f = st.last_fix
+        if f:
+            print("lat=%s lon=%s acc=%s prov=%s age=%s"
+                  % (f.lat, f.lon, f.acc, f.provider, f.age_text()))
+        else:
+            print("取不到定位")
+        if poster.last_code is not None:
+            print("http=%s %s" % (poster.last_code, poster.last_error or "OK"))
+        if poster.place:
+            print("place=%s" % poster.place)
+        return 0 if f else 1
+
+    loop(st, poster, cfg)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
