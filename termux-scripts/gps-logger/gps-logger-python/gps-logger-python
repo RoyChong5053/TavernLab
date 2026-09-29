@@ -56,12 +56,15 @@ BATTERY_TIMEOUT = 15
 POST_TIMEOUT = 20
 RETRY_EVERY = 3          # 连续失败到这次就触发 Termux:API 重启自愈
 HTTP_OK = (200, 201)
-STOP = False
+
+# 退出标志用可变容器而不是裸 global —— 在 loop() 里给 global STOP 赋值会让它
+# 变成局部变量, 直接 UnboundLocalError (只有在 tty 下才走到, 非 tty 测不出来)。
+_STOP = [False]
 
 
 def _on_signal(signum, frame):
-    global STOP
-    STOP = True
+    """信号处理: 只置标志位, 真正的退出交给主循环收尾 (恢复终端属性)。"""
+    _STOP[0] = True
 
 
 # ---- config ---------------------------------------------------------------
@@ -404,9 +407,12 @@ class Stats:
             self.history.pop(0)
 
 
-def build_rich(st, poster, cfg):
-    """构造 rich 布局。宽屏左右分栏, 窄屏上下堆叠。"""
-    console = Console()
+def build_rich(st, poster, cfg, console):
+    """构造 rich 布局。宽屏左右分栏, 窄屏自动上下堆叠。
+
+    console 必须由调用方传进来 —— 自己 new 一个 Console() 量的是真实终端宽度,
+    而 Live 可能被限制成别的宽度, 两者不一致会让「窄屏」分支永远不生效。
+    """
     wide = console.width >= 76
 
     # --- 头部 ---
@@ -481,18 +487,30 @@ def build_rich(st, poster, cfg):
         mid = Group(loc_panel, send_panel)
 
     # --- 轮次历史 ---
-    ht = Table(box=box.SIMPLE, expand=True, collapse_padding=True,
-               padding=(0, 1))
-    ht.add_column("时间", width=5, style="dim", no_wrap=True)
-    ht.add_column("", width=1, no_wrap=True)
-    ht.add_column("来源", width=8, no_wrap=True)
-    ht.add_column("精度", width=7, no_wrap=True)
-    ht.add_column("点龄", width=9, no_wrap=True)
-    ht.add_column("HTTP", width=7, no_wrap=True)
-    ht.add_column("耗时", width=7, no_wrap=True)
-    for t, ok, txt in st.history:
-        mark = "[green]●[/]" if ok else "[red]○[/]"
-        ht.add_row(t, mark, txt[0], txt[1], txt[2], txt[3], txt[4])
+    # 窄屏时 7 列会被 rich 挤到全是省略号, 所以窄屏改用「时间+标记+摘要」
+    # 三列, 摘要自己拼成一行。
+    if wide:
+        ht = Table(box=box.SIMPLE, expand=True, collapse_padding=True,
+                   padding=(0, 1))
+        ht.add_column("时间", width=7, style="dim", no_wrap=True)
+        ht.add_column("", width=1, no_wrap=True)
+        ht.add_column("来源", width=8, no_wrap=True)
+        ht.add_column("精度", width=7, no_wrap=True)
+        ht.add_column("点龄", width=9, no_wrap=True)
+        ht.add_column("HTTP", width=7, no_wrap=True)
+        ht.add_column("耗时", width=7, no_wrap=True)
+        for t, ok, txt in st.history:
+            ht.add_row(t, "[green]●[/]" if ok else "[red]○[/]",
+                       txt[0], txt[1], txt[2], txt[3], txt[4])
+    else:
+        ht = Table(box=box.SIMPLE, expand=True, collapse_padding=True,
+                   padding=(0, 1), show_header=False)
+        ht.add_column("时间", width=7, style="dim", no_wrap=True)
+        ht.add_column("", width=1, no_wrap=True)
+        ht.add_column("摘要", ratio=1, overflow="ellipsis", no_wrap=True)
+        for t, ok, txt in st.history:
+            ht.add_row(t, "[green]●[/]" if ok else "[red]○[/]",
+                       " ".join(x for x in txt if x != "-"))
     hist_panel = Panel(ht, title="[bold blue]轮次[/]",
                        border_style="blue", box=box.ROUNDED, padding=(0, 1))
 
@@ -563,8 +581,9 @@ def build_plain(st, poster, cfg):
     lines.append("  成功/失败  %d / %d" % (poster.ok_count, poster.fail_count))
     lines.append("-" * 40)
     for t, ok, txt in st.history[-5:]:
-        lines.append("  %s %s %-8s %-7s %-9s %-7s %-7s" % (
-            t, "+" if ok else "-", txt[0], txt[1], txt[2], txt[3], txt[4]))
+        lines.append("  %s %s %s" % (
+            t, "+" if ok else "-",
+            " ".join(x for x in txt if x != "-")))
     if st.next_at:
         left = max(0, int(st.next_at - time.time()))
         lines.append("  成功 %d · 失败 %d · 跳过 %d · 下轮 %02d:%02d" % (
@@ -664,18 +683,18 @@ def loop(st, poster, cfg):
         if HAS_RICH:
             with Live(console=console, refresh_per_second=4,
                       screen=True) as live:
-                while not STOP:
+                while not _STOP[0]:
                     one_round(st, poster, cfg)
                     st.next_at = time.time() + st.interval_now
-                    live.update(build_rich(st, poster, cfg))
+                    live.update(build_rich(st, poster, cfg, console))
                     # 间隔内可按空格打断立刻取点, 也能被 Ctrl-C 打断
                     end = time.time() + st.interval_now
-                    while not STOP and time.time() < end:
+                    while not _STOP[0] and time.time() < end:
                         try:
                             if select_has_input(fd, 0.4):
                                 ch = os.read(fd, 1).decode("utf-8", "replace")
                                 if ch in ("q", "Q", "\x03"):
-                                    STOP = True
+                                    _STOP[0] = True
                                     break
                                 if ch == " ":
                                     end = 0
@@ -683,12 +702,12 @@ def loop(st, poster, cfg):
                         except OSError:
                             break
         else:
-            while not STOP:
+            while not _STOP[0]:
                 one_round(st, poster, cfg)
                 st.next_at = time.time() + st.interval_now
                 print("\033[2J\033[H" + build_plain(st, poster, cfg))
                 end = time.time() + st.interval_now
-                while not STOP and time.time() < end:
+                while not _STOP[0] and time.time() < end:
                     time.sleep(0.4)
     except KeyboardInterrupt:
         pass
