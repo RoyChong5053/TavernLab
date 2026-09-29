@@ -47,6 +47,21 @@ type Settings struct {
 	DistillMaxEntryChars int    `json:"distill_max_entry_chars,omitempty"` // max chars per log entry (default 300)
 	DistillModel         string `json:"distill_model,omitempty"`           // empty = main model
 	DistillPrompt        string `json:"distill_prompt,omitempty"`          // empty = built-in default
+	// DistillRecentLogs is how many of the most recent [LOG] entries are shown
+	// back to the extractor so it can write continuous, non-duplicative
+	// entries. Bounded on purpose: the extractor must never see the whole diary,
+	// or its output could grow with history. 0 = default (30).
+	DistillRecentLogs int `json:"distill_recent_logs,omitempty"`
+	// Reitti is the OPTIONAL movement-evidence source for distillation
+	// (reitti-mcp on m64). Entirely independent of the GT20 gps-logger feed
+	// that backs {{location}}: when disabled or unreachable, distillation runs
+	// exactly as before. ReittiWindowHours is only a fallback for the very first
+	// run; normally the window is [last distillation, now].
+	ReittiEnabled     bool   `json:"reitti_enabled"`                // master switch (default false)
+	ReittiMCPURL      string `json:"reitti_mcp_url,omitempty"`      // e.g. http://192.168.100.78:8200/mcp base
+	ReittiTimezone    string `json:"reitti_timezone,omitempty"`     // IANA, e.g. Asia/Kuala_Lumpur; empty = server default
+	ReittiWindowHours int    `json:"reitti_window_hours,omitempty"` // fallback window when there is no previous run (default 3)
+	ReittiTimeoutSec  int    `json:"reitti_timeout_sec,omitempty"`  // per-call timeout (default 15)
 	// Login gate (server-side only: flags/env or direct file edit + restart;
 	// the WebUI can never change these). Empty AdminUser = auth disabled.
 	AdminUser           string `json:"admin_user,omitempty"`
@@ -82,6 +97,12 @@ func Defaults() Settings {
 		DistillStateMaxDays:  30,
 		DistillMaxLogPerDay:  40,
 		DistillMaxEntryChars: 300,
+		DistillRecentLogs:    30,
+		ReittiEnabled:        false,
+		ReittiMCPURL:         "http://192.168.100.78:8200",
+		ReittiTimezone:       "Asia/Kuala_Lumpur",
+		ReittiWindowHours:    3,
+		ReittiTimeoutSec:     15,
 	}
 }
 
@@ -201,6 +222,24 @@ func Load(root string) Settings {
 	}
 	if f.DistillPrompt != "" {
 		s.DistillPrompt = f.DistillPrompt
+	}
+	if f.DistillRecentLogs > 0 {
+		s.DistillRecentLogs = f.DistillRecentLogs
+	}
+	// ReittiEnabled defaults false (opt-in experiment): Load starts from
+	// Defaults(false), and only an explicit true turns it on.
+	s.ReittiEnabled = f.ReittiEnabled
+	if f.ReittiMCPURL != "" {
+		s.ReittiMCPURL = f.ReittiMCPURL
+	}
+	if f.ReittiTimezone != "" {
+		s.ReittiTimezone = f.ReittiTimezone
+	}
+	if f.ReittiWindowHours > 0 {
+		s.ReittiWindowHours = f.ReittiWindowHours
+	}
+	if f.ReittiTimeoutSec > 0 {
+		s.ReittiTimeoutSec = f.ReittiTimeoutSec
 	}
 	if f.AdminUser != "" {
 		s.AdminUser = f.AdminUser

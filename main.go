@@ -38,6 +38,7 @@ import (
 	"github.com/RoyChong5053/TavernLab/internal/memory"
 	"github.com/RoyChong5053/TavernLab/internal/obs"
 	"github.com/RoyChong5053/TavernLab/internal/proxy"
+	"github.com/RoyChong5053/TavernLab/internal/reitti"
 	"github.com/RoyChong5053/TavernLab/internal/settings"
 	"github.com/RoyChong5053/TavernLab/internal/store"
 )
@@ -209,6 +210,33 @@ func (r *runtimeSettings) update(root string, patch map[string]any) settings.Set
 		if s, ok := v.(string); ok {
 			r.cur.DistillPrompt = s
 		}
+	}
+	if v, ok := patch["distill_recent_logs"]; ok {
+		if f, ok := v.(float64); ok && f >= 0 {
+			r.cur.DistillRecentLogs = int(f)
+		}
+	}
+	// Reitti (movement evidence for distillation). Independent switch: turning
+	// this off restores the exact pre-Reitti behaviour and does not touch the
+	// GT20 {{location}} feed.
+	if v, ok := patch["reitti_enabled"].(bool); ok {
+		r.cur.ReittiEnabled = v
+	}
+	if v, ok := patch["reitti_mcp_url"]; ok {
+		if s, ok := v.(string); ok {
+			r.cur.ReittiMCPURL = strings.TrimSpace(s)
+		}
+	}
+	if v, ok := patch["reitti_timezone"]; ok {
+		if s, ok := v.(string); ok {
+			r.cur.ReittiTimezone = strings.TrimSpace(s)
+		}
+	}
+	if v, ok := patch["reitti_window_hours"].(float64); ok && v > 0 {
+		r.cur.ReittiWindowHours = int(v)
+	}
+	if v, ok := patch["reitti_timeout_sec"].(float64); ok && v > 0 {
+		r.cur.ReittiTimeoutSec = int(v)
 	}
 	_ = settings.Save(root, r.cur) // best-effort; key stays usable in memory regardless
 	return r.cur
@@ -383,8 +411,12 @@ func main() {
 				"distill_max_log_per_day": s.DistillMaxLogPerDay, "distill_max_entry_chars": s.DistillMaxEntryChars,
 				"distill_model":  s.DistillModel,
 				"distill_prompt": s.DistillPrompt, "distill_prompt_default": distill.DefaultPrompt,
-				"estimate_scale": engine.TextScale(),
-				"auth_enabled":   auth.Enabled(), "admin_user": auth.User(),
+				"distill_recent_logs": s.DistillRecentLogs,
+				"reitti_enabled":      s.ReittiEnabled, "reitti_mcp_url": s.ReittiMCPURL,
+				"reitti_timezone": s.ReittiTimezone, "reitti_window_hours": s.ReittiWindowHours,
+				"reitti_timeout_sec": s.ReittiTimeoutSec,
+				"estimate_scale":     engine.TextScale(),
+				"auth_enabled":       auth.Enabled(), "admin_user": auth.User(),
 			})
 		case "PUT":
 			b, _ := io.ReadAll(r.Body)
@@ -2399,6 +2431,46 @@ var (
 	events      = newHub()
 )
 
+// fetchReittiMovement returns the [Recent Movement] narrative for the window
+// since the last distillation, or "" on any failure. It never returns an error:
+// movement evidence is a bonus, and a dead reitti-mcp must degrade to "no
+// geography" rather than fail a distillation (losing a whole 8-turn batch of
+// extracted facts because an optional side-channel blinked would be a bad
+// trade).
+//
+// The window is anchored to meta.LastRun rather than a fixed "last 3h" so
+// consecutive extractions tile without a gap: 8 user turns can easily span more
+// than 3 hours, and a fixed window would silently drop the earlier movement.
+func fetchReittiMovement(ctx context.Context, s settings.Settings, meta distill.Meta) string {
+	if !s.ReittiEnabled {
+		return ""
+	}
+	if strings.TrimSpace(s.ReittiMCPURL) == "" {
+		obs.Warn("reitti enabled but no url", nil)
+		return ""
+	}
+	rc := reitti.New(s.ReittiMCPURL, s.ReittiTimezone,
+		time.Duration(s.ReittiTimeoutSec)*time.Second)
+	// First run has no anchor; fall back to the configured fallback window.
+	since := ""
+	if meta.LastRun != "" {
+		if t, err := time.Parse(time.RFC3339, meta.LastRun); err == nil {
+			since = t.Format(time.RFC3339)
+		}
+	}
+	text, err := rc.MovementWindow(ctx, since, s.ReittiWindowHours)
+	if err != nil {
+		obs.Warn("reitti movement unavailable", map[string]any{"error": err.Error()})
+		return ""
+	}
+	if !reitti.HasMovement(text) {
+		obs.Info("reitti movement empty", map[string]any{"since": since})
+		return ""
+	}
+	obs.Info("reitti movement ok", map[string]any{"since": since, "bytes": len(text)})
+	return text
+}
+
 // maybeDistill fires a background distillation once enough fresh user turns
 // have accumulated. Never blocks the chat path.
 func maybeDistill(st *store.Store, client *http.Client, root string, s settings.Settings, session string) {
@@ -2504,9 +2576,15 @@ func runDistill(ctx context.Context, st *store.Store, client *http.Client, root 
 	if timeline == "" {
 		return "", fmt.Errorf("没有可蒸馏的新消息")
 	}
-	// The extractor sees only the current state (small) + the new messages; it
-	// never receives the whole diary, so its output cannot grow with history.
+	// The extractor sees the current state (small), a BOUNDED tail of recent
+	// entries (continuity) and the new messages; it never receives the whole
+	// diary, so its output cannot grow with history.
 	state := distill.LoadState(root, session, 0)
+	recentLogs := distill.RecentLogEntries(root, session, s.DistillRecentLogs)
+	// Movement evidence from reitti-mcp. Strictly optional and fail-open: any
+	// failure, empty window, or disabled switch yields "" and the distillation
+	// runs exactly as it did before this feature existed.
+	movement := fetchReittiMovement(ctx, s, meta)
 	promptTpl := s.DistillPrompt
 	if promptTpl == "" {
 		promptTpl = distill.DefaultPrompt
@@ -2519,7 +2597,7 @@ func runDistill(ctx context.Context, st *store.Store, client *http.Client, root 
 		"max_tokens": distillMaxTokens,
 		"messages": []map[string]any{
 			{"role": "system", "content": prompt},
-			{"role": "user", "content": distill.BuildUser(state, timeline)},
+			{"role": "user", "content": distill.BuildUser(state, recentLogs, movement, timeline)},
 		},
 	})
 	// Even with an explicit budget a weak/free channel can still cut the turn

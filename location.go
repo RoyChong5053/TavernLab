@@ -167,7 +167,7 @@ func reversePaikka(client *http.Client, base string, lat, lon float64) (Location
 	}
 	var body struct {
 		Results []struct {
-			DisplayName string `json:"display_name"`
+			DisplayName string            `json:"display_name"`
 			Names       map[string]string `json:"names"`
 			Hierarchy   []struct {
 				Name string `json:"name"`

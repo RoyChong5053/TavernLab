@@ -32,19 +32,37 @@ import (
 // {{time}} are filled at run time. It deliberately never mentions a size
 // limit: the app enforces retention in code, so the model is not tempted to
 // either delete everything or reproduce the whole record.
+//
+// Four input sections, three of which are context/evidence rather than fact
+// sources. Keeping that distinction explicit is the whole difficulty of this
+// prompt: a bare movement dump gets ignored (the "only what the user says" rule
+// vetoes it) or transcribed as noise ("[14:47] moving").
 const DefaultPrompt = `You are {{user}}'s fact extractor. The application owns the memory database; you only extract new facts. Never manage, prune, or rewrite the whole record.
 
 ## Input
-- [Current State]: {{user}}'s current one-line-per-day snapshot (context only).
+- [Current State]: {{user}}'s current one-line-per-day snapshot.
+- [Recent Entries]: the tail of the diary already written. Read it for CONTINUITY, not to repeat.
+- [Movement]: {{user}}'s staypoints from GPS, already humanised. EVIDENCE ONLY — never a fact source on its own.
 - [New Messages]: the conversation since your last extraction.
 - LIVE TIMESTAMP: {{isodate}} ({{weekday}}) {{time}} UTC+8.
 
-## Rules
-- Record ONLY facts {{user}} explicitly states or does. Ignore the assistant's words, roleplay, hypotheticals, plans, and weak confirmations.
-- Output ONLY new information. Do NOT repeat anything already present in [Current State].
+## What to record
+- Facts {{user}} explicitly states or does. Ignore the assistant's words, roleplay, hypotheticals, plans, and weak confirmations.
+- [Movement] may CORROBORATE and ENRICH those facts: a place can disambiguate what was said ("grabbed food" while a 25-min stay is logged at a restaurant), a duration can make it concrete ("worked overtime" during a 6-hour stay), a departure can date an event.
+- When movement and words agree, write the richer single line: name the place and the duration inside the event.
+- When they conflict, {{user}}'s own words WIN. Never let GPS overwrite what was actually said.
+- A staypoint is a place {{user}} was, never a place they intend to go, want to go, or are thinking about. Plans live only in what {{user}} says.
+
+## What NOT to record
+- NEVER write a movement trace as its own line. No "[14:47] moving", no "[14:50-15:20] stayed at X", no place list, no coordinates. Movement belongs INSIDE an event that the messages already justify.
+- Do not create an event from movement alone. If the messages say nothing and movement shows nothing notable, emit nothing.
+- Output ONLY new information. Do NOT repeat anything in [Current State] or [Recent Entries].
+- Never mention [Movement] itself: no "according to GPS", no "the staypoint data". Write as plain fact.
 - NEVER delete, trim, summarise away, or add commentary. The application handles size and retention.
+
+## Format
 - Dates are ALWAYS DD-MM-YYYY. The message timestamps you see are ISO (YYYY-MM-DD) — convert them.
-- One event per line, in {{user}}'s own words. No bullets, no sub-lines.
+- One event per line, in {{user}}'s own voice. No bullets, no sub-lines. Prefer a concrete noun over an abstraction: "grabbed dinner at Petronas, 30 minutes" over "ate".
 
 ## Output (exact format, nothing else)
 [STATE]
@@ -489,8 +507,18 @@ func Rebuild(sheets []string) string {
 	return out
 }
 
-// BuildUser turns the current state + new timeline into the extractor's input.
-func BuildUser(state, timeline string) string {
+// BuildUser turns the current state, the recent diary tail, the movement
+// evidence and the new timeline into the extractor's input.
+//
+// Section ORDER is deliberate and matches DefaultPrompt: identity/state first,
+// then what was already written (so it does not repeat it), then the external
+// evidence, then the new material being extracted from.
+//
+// recentLog and movement are optional; when empty their sections are omitted
+// entirely rather than filled with a placeholder, because a "[Recent Entries]
+// (none)" line invites the model to comment on its own emptiness, and an empty
+// "[Movement]" would still invite trace transcription.
+func BuildUser(state, recentLog, movement, timeline string) string {
 	var sb strings.Builder
 	sb.WriteString("[Current State]\n")
 	if strings.TrimSpace(state) == "" {
@@ -498,8 +526,43 @@ func BuildUser(state, timeline string) string {
 	} else {
 		sb.WriteString(state + "\n")
 	}
+	if s := strings.TrimSpace(recentLog); s != "" {
+		sb.WriteString("\n[Recent Entries]\n")
+		sb.WriteString(s + "\n")
+	}
+	if s := strings.TrimSpace(movement); s != "" {
+		sb.WriteString("\n")
+		sb.WriteString(s + "\n") // movement already carries its own [Recent Movement] header
+	}
 	sb.WriteString("\n[New Messages]\n")
 	sb.WriteString(timeline)
 	sb.WriteString("\n")
 	return sb.String()
+}
+
+// RecentLogEntries returns the newest n [LOG] lines of the record, oldest-first
+// among themselves, in the same "[DD-MM-YYYY HH:MM] ..." shape the model sees in
+// the rest of the input. This is what gives the extractor continuity: it can
+// see it already wrote "back home at 00:08" and therefore write "still awake
+// coding at 03:00" rather than restarting the story.
+//
+// The tail is hard-bounded on purpose. The extractor's safety property is that
+// it never sees the whole diary, so its output cannot grow with history; an
+// unbounded tail would quietly remove that guarantee.
+func RecentLogEntries(root, char string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	days := parseSheet(Load(root, char))
+	order := sortedDates(days)
+	var lines []string
+	for _, d := range order {
+		if b := days[d]; b != nil {
+			lines = append(lines, b.logs...)
+		}
+	}
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	return strings.Join(lines, "\n")
 }
