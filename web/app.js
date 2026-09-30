@@ -114,6 +114,122 @@ async function bootAuth() {
   return true;
 }
 
+/* ---------- message formatting (markdown, latex, code highlight) ---------- */
+let markdownConverter = null;
+function initMarkdownConverter() {
+  if (markdownConverter) return markdownConverter;
+  if (typeof showdown === 'undefined') {
+    console.warn('[TavernLab] showdown not loaded, markdown disabled');
+    return null;
+  }
+  markdownConverter = new showdown.Converter({
+    emoji: true,
+    literalMidWordUnderscores: true,
+    parseImgDimensions: true,
+    tables: true,
+    underline: true,
+    simpleLineBreaks: true,
+    strikethrough: true,
+    disableForced4SpacesIndentedSublists: true,
+    extensions: [
+      // Custom extension: single underscore for italic (but not inside code)
+      {
+        type: 'output',
+        regex: /(<code(?:\s+[^>]*)?>[\s\S]*?<\/code>|<style(?:\s+[^>]*)?>[\s\S]*?<\/style>)|\b(?<!_)_(?!_)(.*?)(?<!_)_(?!_)\b/gi,
+        replace: function (match, tagContent, italicContent) {
+          if (tagContent) return match;
+          if (italicContent) return '<em>' + italicContent + '</em>';
+          return match;
+        }
+      },
+      // Custom extension: add data-lang to pre tags from code class
+      {
+        type: 'output',
+        regex: /<pre><code class="language-([a-z0-9#+.-]+)">/gi,
+        replace: '<pre data-lang="$1"><code>'
+      },
+      // Remove language-* class from code tag
+      {
+        type: 'output',
+        regex: /<code class="language-[a-z0-9#+.-]+">/gi,
+        replace: '<code>'
+      }
+    ]
+  });
+  return markdownConverter;
+}
+
+function formatMessage(text, isUser, isSystem) {
+  if (!text) return '';
+
+  // System messages: plain text only (escape HTML)
+  if (isSystem) return escapeHtml(text);
+
+  const converter = initMarkdownConverter();
+  if (!converter) return escapeHtml(text);
+
+  let html = text;
+
+  // Assistant messages: full markdown + LaTeX
+  // User messages: markdown only (no LaTeX to avoid accidental rendering)
+  const renderLatex = !isUser;
+  if (renderLatex) {
+    html = html.replace(/\\begin\{align\*\}/g, '$$');
+    html = html.replace(/\\end\{align\*\}/g, '$$');
+  }
+
+  // Convert markdown to HTML
+  html = converter.makeHtml(html);
+
+  // Fix code blocks: showdown creates <br> in code blocks, normalize
+  html = html.replace(/<code([^>]*)>[\s\S]*?<\/code>/g, function (match) {
+    return match.replace(/\n/g, '\u0000');
+  });
+  html = html.replace(/\u0000/g, '\n');
+
+  // Fix & in code blocks
+  html = html.replace(/<code([^>]*)>[\s\S]*?<\/code>/g, function (match) {
+    return match.replace(/&/g, '&');
+  });
+
+  // Sanitize with DOMPurify
+  if (typeof DOMPurify !== 'undefined') {
+    html = DOMPurify.sanitize(html, {
+      RETURN_DOM: false,
+      RETURN_DOM_FRAGMENT: false,
+      RETURN_TRUSTED_TYPE: false,
+      ADD_TAGS: ['custom-style'],
+      ADD_ATTR: ['target', 'rel', 'data-lang']
+    });
+  }
+
+  return html;
+}
+
+function escapeHtml(text) {
+  const div = document.createElement('div');
+  div.textContent = text;
+  return div.innerHTML;
+}
+
+function renderMath(el) {
+  if (typeof window.renderMathInElement === 'function') {
+    try {
+      window.renderMathInElement(el, {
+        delimiters: [
+          {left: '$$', right: '$$', display: true},
+          {left: '$', right: '$', display: false},
+          {left: '\\(', right: '\\)', display: false},
+          {left: '\\[', right: '\\]', display: true}
+        ],
+        throwOnError: false
+      });
+    } catch (e) {
+      console.warn('[TavernLab] KaTeX render error:', e);
+    }
+  }
+}
+
 /* ---------- ui scale (persisted, replaces browser 130% zoom) ---------- */
 // Compensated transform instead of body.zoom: body.zoom + overflow:hidden used
 // to clip the layout so the page could not scroll once zoomed in.
@@ -411,7 +527,12 @@ function renderMsg(role, text, who, prepend, images, id) {
   w.textContent = who || defaultWho;
   const b = document.createElement('div');
   b.className = 'body';
-  b.textContent = text;
+  // Use markdown formatting for assistant and system messages; user messages stay plain text
+  const isUser = role === 'user';
+  const isSystem = role === 'sys';
+  b.innerHTML = formatMessage(text, isUser, isSystem);
+  // Render LaTeX math after inserting into DOM
+  renderMath(b);
   d.append(w, b);
   if (images && images.length) {
     const im = document.createElement('div');
@@ -475,7 +596,9 @@ function subscribeChat() {
     if (m.role === 'assistant' && pendingAssistant) {
       const pb = pendingAssistant.querySelector('.body');
       if (pb && (pb.classList.contains('cursor') || pb.textContent === m.text)) {
-        pb.textContent = m.text;
+        // SSE delivers final message: render full markdown + LaTeX
+        pb.innerHTML = formatMessage(m.text, false, false);
+        renderMath(pb);
         pb.classList.remove('cursor');
         if (m.id) { pendingAssistant.dataset.id = m.id; seenMsgIds.add(m.id); }
         pendingAssistant = null;
@@ -593,7 +716,7 @@ async function send(regen = false) {
     ? { model: settings.model || undefined, session: settings.char, regenerate: true, stream, blocks, context: ctxCfg(), max_tokens: maxTokens }
     : { model: settings.model || undefined, session: settings.char, text, images: imgs, stream, blocks, context: ctxCfg(), max_tokens: maxTokens };
   try {
-    if (stream) {
+      if (stream) {
       const r = await api('/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
       if (!r.ok || !r.body) throw new Error('HTTP ' + r.status + ' ' + (await r.text()).slice(0, 200));
       const reader = r.body.getReader();
@@ -625,8 +748,14 @@ async function send(regen = false) {
         }
       }
       belly.classList.remove('cursor');
+      // Stream complete: render full markdown + LaTeX
+      if (full.trim()) {
+        belly.innerHTML = formatMessage(full, false, false);
+        renderMath(belly);
+      } else {
+        belly.textContent = '（空回复）';
+      }
       pendingAssistant = null;
-      if (!full.trim()) { belly.textContent = '（空回复）'; }
       setPending(false);
       if (streamError) toast('上游流中断，回复可能不完整：' + streamError, 'err', 6000);
       else if (finishReason === 'length') toast('回复触到生成上限被截断（finish=length），可调大“生成上限”', 'err', 5000);
