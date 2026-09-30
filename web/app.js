@@ -19,7 +19,7 @@ const settings = Object.assign(
     context_window: 16384, reply_reserve: 4096, history_min_turns: 4,
     rerank_url: 'http://127.0.0.1:11437', char: 'Leer乐儿', model: '',
     stream: false, visible_turns: 10, user_name: 'RoyChong', avatar_px: 88,
-    ui_scale: 100,
+    ui_scale: 100, theme: 'st-dark', theme_custom: {},
   },
   store.get('settings', {}),
 );
@@ -176,6 +176,13 @@ function formatMessage(text, isUser, isSystem) {
   if (renderLatex) {
     html = html.replace(/\\begin\{align\*\}/g, '$$');
     html = html.replace(/\\end\{align\*\}/g, '$$');
+    // Money guard (ported from App markdown_math.dart): a lone $ before a
+    // number ("it costs $5 and $7") must not open a formula. Stash it as a
+    // PUA placeholder OUTSIDE code spans only, restore after KaTeX (renderMath
+    // skips pre/code tags, so code needs no guard and must keep raw $).
+    // NOTE: `\$` escaping does NOT work — auto-render's left-delimiter regex
+    // has no escape check and the backslash would stay visible.
+    html = protectMoneyOutsideCode(html);
   }
 
   // Convert markdown to HTML
@@ -187,9 +194,10 @@ function formatMessage(text, isUser, isSystem) {
   });
   html = html.replace(/\u0000/g, '\n');
 
-  // Fix & in code blocks
+  // Fix double-encoded entities inside code blocks (ST parity:
+  // showdown escapes & to &amp; there; decode once back to &).
   html = html.replace(/<code([^>]*)>[\s\S]*?<\/code>/g, function (match) {
-    return match.replace(/&/g, '&');
+    return match.replace(/&amp;/g, '&');
   });
 
   // Sanitize with DOMPurify
@@ -222,6 +230,9 @@ function renderMath(el) {
           {left: '\\(', right: '\\)', display: false},
           {left: '\\[', right: '\\]', display: true}
         ],
+        // Code stays code: $$ inside a fence must not become a formula
+        // (App parity: markdown_widgets PreBlockBuilder owns fences).
+        ignoredTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code', 'option'],
         throwOnError: false
       });
     } catch (e) {
@@ -230,6 +241,122 @@ function renderMath(el) {
   }
 }
 
+/* ---------- code highlight (hljs, no copy button by design) ---------- */
+// Highlight.js is vendored locally (web/vendor/). Streaming frames skip it:
+// highlighting is sync CPU work and re-running per chunk is what made long
+// replies stutter in the App (markdown_widgets.dart). Final render only.
+function highlightCode(el) {
+  if (!el || typeof window.hljs === 'undefined' || !window.hljs.highlightElement) return;
+  try {
+    el.querySelectorAll('pre code').forEach((c) => {
+      if (c.dataset.hljs) return;
+      c.dataset.hljs = '1';
+      window.hljs.highlightElement(c);
+    });
+  } catch (e) {
+    console.warn('[TavernLab] hljs error:', e);
+  }
+}
+
+// Placeholder for money-$ while KaTeX runs (private-use, never typed).
+const MONEY_PH = '\uE000';
+function protectMoneyOutsideCode(text) {
+  // Even segments = prose (guard), odd = code spans/fences (untouched).
+  const parts = String(text).split(/(\s{0,3}```[\s\S]*?(?:```|$)|`[^`\n]*`)/g);
+  for (let i = 0; i < parts.length; i += 2) {
+    parts[i] = parts[i].replace(/(?<![$\\])\$(?=\d[\d,.]*(\s|$|[,.，。！？、]))/g, MONEY_PH);
+  }
+  return parts.join('');
+}
+
+// Single choke point for "rich" message bodies: markdown -> sanitize ->
+// KaTeX -> hljs -> money restore. Every path (history / SSE /
+// stream-complete / non-stream) must go through here so none renders
+// half-styled.
+function renderRichBody(el, text, isUser) {
+  el.innerHTML = formatMessage(text, isUser, false);
+  renderMath(el);
+  highlightCode(el);
+  if (el.innerHTML.indexOf(MONEY_PH) >= 0) {
+    el.innerHTML = el.innerHTML.split(MONEY_PH).join('$');
+  }
+}
+
+/* ---------- theme (custom colors; local-only preference) ---------- */
+const THEMES = {
+  'st-dark': { name: 'ST 暗灰（默认）' },
+  'tavern-glass': { name: 'Tavern 玻璃（旧版）' },
+  'paper': { name: '纸白（浅色）' },
+  'custom': { name: '自定义' },
+};
+function applyTheme() {
+  const t = settings.theme || 'st-dark';
+  document.body.dataset.theme = t;
+  const c = settings.theme_custom || {};
+  const root = document.documentElement;
+  ['--bg', '--bg2', '--card', '--txt', '--mut', '--acc'].forEach((k) => {
+    if (t === 'custom' && c[k]) root.style.setProperty(k, c[k]);
+    else root.style.removeProperty(k);
+  });
+  const sel = $('#set-theme');
+  if (sel && sel.value !== t) sel.value = t;
+  const box = $('#theme-custom');
+  if (box) box.classList.toggle('hidden', t !== 'custom');
+  Object.keys(c).forEach((k) => {
+    const el = document.querySelector(`[data-themek="${k}"]`);
+    if (el && el.value !== c[k]) el.value = c[k];
+  });
+}
+function setTheme(t) {
+  settings.theme = THEMES[t] ? t : 'st-dark';
+  store.set('settings', settings);
+  applyTheme();
+}
+function setThemeCustom(k, v) {
+  settings.theme_custom = Object.assign({}, settings.theme_custom, { [k]: v });
+  store.set('settings', settings);
+  if ((settings.theme || 'st-dark') === 'custom') {
+    document.documentElement.style.setProperty(k, v);
+  }
+}
+
+/* ---------- avatars (per-message + mood expressions) ---------- */
+// Cached from GET /api/characters/:name: base avatar + expressions/ dir list.
+// Mood flow: classifyAndBadge(label) -> expressions/<label>.webp|png|jpg|gif
+// (character.go listExpressions; expression.go labels). Browsers play animated
+// webp natively, so dynamic stickers need no code change — just drop files.
+let charAvatarURL = '', charExpressions = [];
+function pickExpressionURL(label) {
+  if (!label) return '';
+  const files = charExpressions || [];
+  const lower = files.map((f) => String(f).toLowerCase());
+  for (const ext of ['.webp', '.png', '.jpg', '.jpeg', '.gif']) {
+    const i = lower.findIndex((f) => f.endsWith('/' + label + ext) || f === label + ext || f.endsWith(label + ext));
+    if (i >= 0) return '/chars/' + encodeURIComponent(settings.char) + '/' + files[i];
+  }
+  return '';
+}
+function avatarFor(role, moodLabel) {
+  if (role === 'user') return '';
+  if (moodLabel) {
+    const u = pickExpressionURL(moodLabel);
+    if (u) return imgURL(u);
+  }
+  return imgURL(charAvatarURL);
+}
+const BLANK_GIF = 'data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==';
+function userInitial() {
+  const n = (settings.user_name || '你').trim();
+  return (n ? [...n][0] : '你').toUpperCase();
+}
+function fmtTime(t) {
+  if (!t) return '';
+  try {
+    const d = new Date(String(t).replace(' ', 'T'));
+    if (isNaN(d)) return String(t).slice(11, 16) || '';
+    return d.toTimeString().slice(0, 5);
+  } catch { return ''; }
+}
 /* ---------- ui scale (persisted, replaces browser 130% zoom) ---------- */
 // Compensated transform instead of body.zoom: body.zoom + overflow:hidden used
 // to clip the layout so the page could not scroll once zoomed in.
@@ -516,24 +643,59 @@ document.addEventListener('DOMContentLoaded', () => {
   const bb = $('#btn-bottom');
   if (bb) bb.onclick = () => { const b2 = chatBox(); if (b2) { scrollToBottom(b2); userPinned = true; bb.classList.add('hidden'); } };
 });
-function renderMsg(role, text, who, prepend, images, id) {
+function renderMsg(role, text, who, prepend, images, id, time, mood) {
   const d = document.createElement('div');
   d.className = 'msg ' + (role === 'user' ? 'user' : role === 'assistant' ? 'ai' : 'sys');
   d.dataset.role = role;
   if (id) { d.dataset.id = id; seenMsgIds.add(id); }
+  // Avatar gutter (ST-style row). User = initial block; assistant = char
+  // avatar (mood expression when known); sys = none.
+  if (role === 'user' || role === 'assistant') {
+    const av = document.createElement('div');
+    av.className = 'avatar-gutter';
+    if (role === 'user') {
+      const u = document.createElement('div');
+      u.className = 'avatar user-avatar';
+      u.textContent = userInitial();
+      u.title = settings.user_name || '你';
+      av.appendChild(u);
+    } else {
+      const img = document.createElement('img');
+      img.className = 'avatar';
+      img.alt = '';
+      img.loading = 'lazy';
+      img.dataset.base = '1'; // base avatar; mood swaps delete this flag
+      img.src = avatarFor(role, mood) || BLANK_GIF;
+      av.appendChild(img);
+    }
+    d.appendChild(av);
+  }
+  const content = document.createElement('div');
+  content.className = 'msg-content';
   const w = document.createElement('div');
   w.className = 'who';
-  const defaultWho = role === 'user' ? '你' : role === 'assistant' ? settings.char : (role === 'distilled_memory' ? 'Distilled Memory' : '系统');
-  w.textContent = who || defaultWho;
+  const defaultWho = role === 'user' ? (settings.user_name || '你') : role === 'assistant' ? settings.char : (role === 'distilled_memory' ? 'Distilled Memory' : '系统');
+  const nameEl = document.createElement('span');
+  nameEl.className = 'who-name';
+  nameEl.textContent = who || defaultWho;
+  w.appendChild(nameEl);
+  const tt = fmtTime(time);
+  if (tt) {
+    const tEl = document.createElement('span');
+    tEl.className = 'who-time';
+    tEl.textContent = tt;
+    w.appendChild(tEl);
+  }
   const b = document.createElement('div');
   b.className = 'body';
-  // Use markdown formatting for assistant and system messages; user messages stay plain text
   const isUser = role === 'user';
   const isSystem = role === 'sys';
-  b.innerHTML = formatMessage(text, isUser, isSystem);
-  // Render LaTeX math after inserting into DOM
-  renderMath(b);
-  d.append(w, b);
+  if (!text && images && images.length) {
+    b.className += ' body-media-only';
+  } else {
+    renderRichBody(b, text, isUser);
+  }
+  content.append(w, b);
   if (images && images.length) {
     const im = document.createElement('div');
     im.className = 'msg-images';
@@ -543,8 +705,9 @@ function renderMsg(role, text, who, prepend, images, id) {
       img.src = p.startsWith('data:') ? p : withToken('/chars/' + encodeURIComponent(settings.char) + '/' + p);
       im.appendChild(img);
     });
-    d.appendChild(im);
+    content.appendChild(im);
   }
+  d.appendChild(content);
   const box = $('#chat');
   const cbox = chatBox();
   if (prepend && box.firstChild) box.insertBefore(d, box.firstChild);
@@ -571,7 +734,7 @@ async function loadEarlier() {
   const anchor = chat.firstChild;
   const oldTop = anchor ? anchor.getBoundingClientRect().top : 0;
   const oldScroll = cbox ? cbox.scrollTop : 0;
-  [...msgs].reverse().forEach((m) => renderMsg(m.role, m.text, null, true, m.images, m.id));
+  [...msgs].reverse().forEach((m) => renderMsg(m.role, m.text, null, true, m.images, m.id, m.time));
   historyShown += msgs.length;
   if (cbox && anchor) {
     const newTop = anchor.getBoundingClientRect().top;
@@ -596,13 +759,14 @@ function subscribeChat() {
     if (m.role === 'assistant' && pendingAssistant) {
       const pb = pendingAssistant.querySelector('.body');
       if (pb && (pb.classList.contains('cursor') || pb.textContent === m.text)) {
-        // SSE delivers final message: render full markdown + LaTeX
-        pb.innerHTML = formatMessage(m.text, false, false);
-        renderMath(pb);
+        // SSE delivers final message: full rich render (markdown+LaTeX+hljs)
+        renderRichBody(pb, m.text, false);
         pb.classList.remove('cursor');
-        if (m.id) { pendingAssistant.dataset.id = m.id; seenMsgIds.add(m.id); }
+        const doneBox = pendingAssistant;
+        if (m.id) { doneBox.dataset.id = m.id; seenMsgIds.add(m.id); }
         pendingAssistant = null;
         assistantSseSeq++;
+        if (m.text) classifyAndBadge(m.text, doneBox);
         return;
       }
     }
@@ -616,13 +780,16 @@ function subscribeChat() {
       if (m.role === 'assistant') assistantSseSeq++;
       return;
     }
-    renderMsg(m.role, m.text, null, false, m.images, m.id);
+    renderMsg(m.role, m.text, null, false, m.images, m.id, m.time);
     if (m.role === 'assistant') assistantSseSeq++;
-    if (m.role === 'assistant' && m.text) classifyAndBadge(m.text);
+    if (m.role === 'assistant' && m.text) {
+      const boxes = [...document.querySelectorAll('#chat .msg.ai')];
+      classifyAndBadge(m.text, boxes[boxes.length - 1] || null);
+    }
   });
   chatES.onerror = () => { /* browser auto-reconnects */ };
 }
-async function classifyAndBadge(text) {
+async function classifyAndBadge(text, msgEl) {
   try {
     const r = await api('/api/expression/classify', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -631,6 +798,23 @@ async function classifyAndBadge(text) {
     const j = await r.json();
     $('#expr-badge').textContent = j.fallback ? '心情 · 😐 平静' : '心情 · 😊 ' + j.label;
     $('#expr-badge').title = JSON.stringify(j.scores || {});
+    // Mood avatar: swap this bubble's avatar to the expression file when the
+    // character ships one (expressions/<label>.webp...). Preload to avoid
+    // flashing; fall back silently to the base avatar.
+    if (!j.fallback && j.label && msgEl) {
+      const u = pickExpressionURL(j.label);
+      if (u) {
+        const probe = new Image();
+        probe.onload = () => {
+          const img = msgEl.querySelector('.avatar-gutter img.avatar');
+          if (img) { img.src = imgURL(u); delete img.dataset.base; }
+          // The head avatar follows the latest mood too.
+          const head = $('#chat-avatar');
+          if (head) head.src = imgURL(u);
+        };
+        probe.src = imgURL(u);
+      }
+    }
   } catch { /* 静默：表情失败不打断聊天 */ }
 }
 /* ---------- image attach ---------- */
@@ -748,10 +932,9 @@ async function send(regen = false) {
         }
       }
       belly.classList.remove('cursor');
-      // Stream complete: render full markdown + LaTeX
+      // Stream complete: full rich render (markdown+LaTeX+hljs)
       if (full.trim()) {
-        belly.innerHTML = formatMessage(full, false, false);
-        renderMath(belly);
+        renderRichBody(belly, full, false);
       } else {
         belly.textContent = '（空回复）';
       }
@@ -760,7 +943,7 @@ async function send(regen = false) {
       if (streamError) toast('上游流中断，回复可能不完整：' + streamError, 'err', 6000);
       else if (finishReason === 'length') toast('回复触到生成上限被截断（finish=length），可调大“生成上限”', 'err', 5000);
       else if (finishReason === 'content_filter') toast('回复被安全策略截断（finish=content_filter）', 'err', 5000);
-      if (full.trim()) classifyAndBadge(full);
+      if (full.trim()) classifyAndBadge(full, box);
       return;
     }
     const r = await api('/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
@@ -778,9 +961,16 @@ async function send(regen = false) {
     // response lands); only add the bubble if it isn't already the last one.
     const lastAi = [...document.querySelectorAll('#chat .msg.ai .body')].pop();
     const sseRenderedMine = lastAi && lastAi.textContent === reply && assistantSseSeq > seqAtStart;
-    if (!sseRenderedMine) addMsg('assistant', reply);
+    let mineBox = null;
+    if (!sseRenderedMine) mineBox = addMsg('assistant', reply);
     setPending(false);
-    classifyAndBadge(reply);
+    // Mood badge must update even when SSE won the race (mineBox null):
+    // fall back to the last assistant bubble.
+    if (!mineBox) {
+      const boxes = [...document.querySelectorAll('#chat .msg.ai')];
+      mineBox = boxes[boxes.length - 1] || null;
+    }
+    classifyAndBadge(reply, mineBox);
   } catch (e) {
     setPending(false);
     pendingAssistant = null;
@@ -949,16 +1139,29 @@ $('#btn-log-copy').onclick = () => asyncAction($('#btn-log-copy'), async () => {
   toast('日志已复制');
 });
 
-/* ---------- chat avatar size (global) ---------- */
+/* ---------- chat avatar size (global, header + per-message) ---------- */
 function applyAvatarSize() {
   const px = Math.min(240, Math.max(32, +settings.avatar_px || 88));
-  $('#chat-avatar').style.width = px + 'px';
-  $('#chat-avatar').style.height = px + 'px';
+  document.documentElement.style.setProperty('--avatar-px', px + 'px');
+  const h = $('#chat-avatar');
+  if (h) { h.style.width = px + 'px'; h.style.height = px + 'px'; }
 }
 function syncChatHead() {
   $('#chat-char-name').textContent = settings.char;
   api('/api/characters/' + encodeURIComponent(settings.char)).then((r) => r.json()).then((j) => {
-    $('#chat-avatar').src = imgURL(j.avatar_url) || 'data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==';
+    charAvatarURL = j.avatar_url || '';
+    charExpressions = j.expressions || [];
+    $('#chat-avatar').src = imgURL(charAvatarURL) || BLANK_GIF;
+    // History may have rendered before this fetch landed (selectChar races
+    // syncChatHead vs loadHistory): backfill base avatars, leave mood ones.
+    const fresh = imgURL(charAvatarURL);
+    if (fresh) {
+      document.querySelectorAll('#chat .msg.ai .avatar-gutter img.avatar[data-base]').forEach((im) => {
+        if (im.src !== fresh) im.src = fresh;
+      });
+    }
+    const ex = $('#char-expr');
+    if (ex) ex.textContent = (charExpressions || []).length ? '表情：' + charExpressions.join(', ') : '';
   }).catch(() => {});
 }
 
@@ -1266,6 +1469,7 @@ function fillSettingsForm() {
   $('#set-visible').value = settings.visible_turns || 10;
   $('#set-user').value = settings.user_name || '';
   $('#set-avatar-size').value = settings.avatar_px || 88;
+  applyTheme();
 }
 async function saveSettings(silent) {
   settings.context_window = Math.min(131072, Math.max(2048, +$('#set-window').value || 16384));
@@ -1302,10 +1506,16 @@ async function saveSettings(silent) {
   apiKeyDirty = false;
   $('#set-apikey').value = '';
   applyAvatarSize();
+  applyTheme();
   if (!silent) toast('偏好已保存');
   return r;
 }
 $('#btn-settings-save').onclick = () => asyncAction($('#btn-settings-save'), async () => { await saveSettings(false); await loadServerSettings(); refreshModels(); });
+// Theme picker: local-only, applies instantly (no server round-trip).
+{ const t = $('#set-theme'); if (t) t.addEventListener('change', () => setTheme(t.value)); }
+document.querySelectorAll('[data-themek]').forEach((el) => {
+  el.addEventListener('input', () => setThemeCustom(el.dataset.themek, el.value));
+});
 // autosave: any change in the settings form persists (debounced)
 let settingsSaveTimer = null;
 function scheduleSettingsSave() {
@@ -1329,7 +1539,9 @@ const _loginForm = $('#login-form');
 if (_loginForm) _loginForm.addEventListener('submit', (e) => { e.preventDefault(); doLogin(); });
 if ($('#btn-logout')) $('#btn-logout').onclick = doLogout;
 async function init() {
+  applyTheme(); // before auth gate so the login screen already wears it
   if (!(await bootAuth())) return; // gate: stop booting until logged in
+  applyTheme();
   fillSettingsForm();
   applyUiScale();
   await loadServerSettings();

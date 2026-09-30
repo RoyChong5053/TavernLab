@@ -7,12 +7,14 @@
 <link rel="icon" type="image/png" href="/icon.png">
 <link rel="apple-touch-icon" href="/icon.png">
 <link rel="stylesheet" href="style.css">
-<!-- Markdown & formatting libraries (CDN) -->
-<script src="https://cdn.jsdelivr.net/npm/showdown@2.1.0/dist/showdown.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/dompurify@3.0.11/dist/purify.min.js"></script>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
-<script src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"></script>
+<!-- Formatting libs, vendored locally (no CDN: LAN/offline-safe, rclone-friendly) -->
+<link rel="stylesheet" href="vendor/katex.min.css">
+<link rel="stylesheet" href="vendor/hljs-github-dark.min.css">
+<script src="vendor/showdown.min.js"></script>
+<script src="vendor/purify.min.js"></script>
+<script src="vendor/katex.min.js"></script>
+<script src="vendor/auto-render.min.js"></script>
+<script src="vendor/highlight.min.js"></script>
 </head>
 <body>
 <button id="hamburger" aria-label="菜单">☰</button>
@@ -209,6 +211,20 @@
         <p class="meta">输入预算 = 上下文窗口 − 回复预留（例如 16384 − 4096 = 12288）。窗口内先放锁定块，RAG 与对话按级别淘汰。</p>
         <div class="row">
           <label>界面缩放 <input id="set-uiscale" type="number" min="80" max="150" value="100" style="width:64px"> %（存本机，替代浏览器130%）</label>
+        </div>
+        <div class="row">
+          <label>主题 <select id="set-theme">
+            <option value="st-dark">ST 暗灰（默认）</option>
+            <option value="tavern-glass">Tavern 玻璃（旧版）</option>
+            <option value="paper">纸白（浅色）</option>
+            <option value="custom">自定义…</option>
+          </select>（存本机）</label>
+        </div>
+        <div id="theme-custom" class="row hidden">
+          <label>背景 <input type="color" data-themek="--bg" value="#23262d"></label>
+          <label>卡片 <input type="color" data-themek="--card" value="#2e3138"></label>
+          <label>文字 <input type="color" data-themek="--txt" value="#e6e8eb"></label>
+          <label>强调 <input type="color" data-themek="--acc" value="#7dd3fc"></label>
         </div>
         <label>Reranker（表情判定） <input id="set-rerank" size="26" value="http://127.0.0.1:11437"></label>
         <label>主模型 <select id="set-model" style="max-width:230px"></select>（与 App 共用，存服务端）</label>
