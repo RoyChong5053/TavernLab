@@ -957,6 +957,9 @@ async function loadServerSettings() {
     $('#mem-threshold').value = s.mcp_threshold ?? -1;
     $('#mem-enabled').checked = !!s.mcp_enabled;
     if (s.current_char && s.current_char !== settings.char) { settings.char = s.current_char; store.set('settings', settings); }
+    // Seed the local model from the server-shared one when this browser has
+    // never picked one, so WebUI and App talk about the same alias.
+    if (s.chat_model && !settings.model) { settings.model = s.chat_model; store.set('settings', settings); }
     if (s.user_name) $('#set-user').value = s.user_name;
     $('#set-ntfy-url').value = s.ntfy_url || '';
     $('#set-ntfy-topic').value = s.ntfy_topic || '';
@@ -1074,6 +1077,20 @@ $('#btn-dmem-rebuild').onclick = () => asyncAction($('#btn-dmem-rebuild'), async
 });
 
 /* ---------- models ---------- */
+// The main chat model is shared with the Flutter app: it lives server-side as
+// settings.chat_model. The browser keeps its own copy in localStorage purely
+// so the dropdown survives an offline reload; picking one writes both.
+function setChatModel(model, persist) {
+  settings.model = model;
+  store.set('settings', settings);
+  if (persist) {
+    api('/api/settings', {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_model: model }),
+    }).catch(() => {});
+  }
+}
+
 async function refreshModels() {
   try {
     const j = await (await api('/api/models')).json();
@@ -1081,11 +1098,33 @@ async function refreshModels() {
     const sel = $('#set-model');
     sel.innerHTML = ids.map((id) => `<option value="${id}">${id}</option>`).join('');
     if (ids.includes(settings.model)) sel.value = settings.model;
-    else if (ids.length) { sel.value = ids[0]; settings.model = ids[0]; store.set('settings', settings); }
+    else if (ids.length) { setChatModel(ids[0], true); sel.value = ids[0]; }
   } catch { /* 上游未通时静默 */ }
+  checkModelStatus();
+}
+
+// Warn (sticky banner) when the configured main model is no longer offered by
+// one-api — the exact silent-403 failure mode. Purely advisory.
+async function checkModelStatus() {
+  const el = $('#model-banner');
+  if (!el) return;
+  try {
+    const st = await (await api('/api/model-status')).json();
+    if (st && st.ok === false) {
+      const avail = (st.available || []).slice(0, 8).join(', ');
+      el.innerHTML = `⚠ 主模型「${st.model || '?'}」不可用：${st.error || '不在上游模型列表'}。` +
+        (avail ? ` 可用：${avail}…` : '') +
+        ` <a id="model-banner-fix">去设置</a>`;
+      el.classList.remove('hidden');
+      const fix = $('#model-banner-fix');
+      if (fix) fix.onclick = () => { document.querySelector('[data-page="settings"]')?.click(); };
+    } else {
+      el.classList.add('hidden');
+    }
+  } catch { el.classList.add('hidden'); }
 }
 $('#btn-models-refresh').onclick = refreshModels;
-$('#set-model').onchange = (e) => { settings.model = e.target.value; store.set('settings', settings); };
+$('#set-model').onchange = (e) => setChatModel(e.target.value, true);
 
 /* ---------- settings ---------- */
 function fillSettingsForm() {
@@ -1121,6 +1160,7 @@ async function saveSettings(silent) {
     context_window: settings.context_window,
     reply_reserve: settings.reply_reserve,
     history_min_turns: settings.history_min_turns,
+    chat_model: settings.model || '',
   };
   if (upstreamDirty) body.upstream = $('#set-upstream').value.trim();
   if (apiKeyDirty && $('#set-apikey').value) body.api_key = $('#set-apikey').value;

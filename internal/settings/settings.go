@@ -47,6 +47,12 @@ type Settings struct {
 	DistillMaxEntryChars int    `json:"distill_max_entry_chars,omitempty"` // max chars per log entry (default 300)
 	DistillModel         string `json:"distill_model,omitempty"`           // empty = main model
 	DistillPrompt        string `json:"distill_prompt,omitempty"`          // empty = built-in default
+	// ChatModel is the single source of truth for the main chat model used by
+	// the WebUI, the Flutter app and (via fallback) titles/distillation. It is
+	// the one model alias TavernLab sends when the client omits one. Empty =
+	// Defaults().ChatModel. Never hardcode an alias elsewhere: one-api is the
+	// source of truth and aliases get renamed.
+	ChatModel string `json:"chat_model,omitempty"`
 	// DistillRecentLogs is how many of the most recent [LOG] entries are shown
 	// back to the extractor so it can write continuous, non-duplicative
 	// entries. Bounded on purpose: the extractor must never see the whole diary,
@@ -98,6 +104,7 @@ func Defaults() Settings {
 		DistillMaxLogPerDay:  40,
 		DistillMaxEntryChars: 300,
 		DistillRecentLogs:    30,
+		ChatModel:            "auto-chat",
 		ReittiEnabled:        false,
 		ReittiMCPURL:         "http://192.168.100.78:8200",
 		ReittiTimezone:       "Asia/Kuala_Lumpur",
@@ -225,6 +232,9 @@ func Load(root string) Settings {
 	}
 	if f.DistillRecentLogs > 0 {
 		s.DistillRecentLogs = f.DistillRecentLogs
+	}
+	if f.ChatModel != "" {
+		s.ChatModel = f.ChatModel
 	}
 	// ReittiEnabled defaults false (opt-in experiment): Load starts from
 	// Defaults(false), and only an explicit true turns it on.

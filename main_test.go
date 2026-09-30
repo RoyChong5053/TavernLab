@@ -310,3 +310,29 @@ func TestIsUpstreamCut(t *testing.T) {
 		}
 	}
 }
+
+func TestDefaultChatModelNeverHardcodesGoneAlias(t *testing.T) {
+	// One-api is the source of truth and aliases get renamed; the fallback must
+	// come from settings, defaulting to auto-chat (never the removed auto-gemini).
+	if got := defaultChatModel(settings.Settings{}); got != "auto-chat" {
+		t.Fatalf("empty settings default = %q, want auto-chat", got)
+	}
+	if got := defaultChatModel(settings.Settings{ChatModel: "auto-agent"}); got != "auto-agent" {
+		t.Fatalf("configured model = %q, want auto-agent", got)
+	}
+}
+
+func TestChatModelSettingRoundTrips(t *testing.T) {
+	root := t.TempDir()
+	s := settings.Load(root)
+	if s.ChatModel != "auto-chat" {
+		t.Fatalf("fresh load ChatModel = %q, want auto-chat", s.ChatModel)
+	}
+	s.ChatModel = "auto-agent"
+	if err := settings.Save(root, s); err != nil {
+		t.Fatal(err)
+	}
+	if got := settings.Load(root).ChatModel; got != "auto-agent" {
+		t.Fatalf("reload ChatModel = %q, want auto-agent", got)
+	}
+}

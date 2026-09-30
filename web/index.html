@@ -30,6 +30,7 @@
     </div>
   </aside>
   <main class="content">
+    <div id="model-banner" class="model-banner hidden"></div>
     <!-- CHAT (default) -->
     <section class="page on" id="page-chat">
       <div class="chat-head glass">
@@ -204,7 +205,7 @@
           <label>界面缩放 <input id="set-uiscale" type="number" min="80" max="150" value="100" style="width:64px"> %（存本机，替代浏览器130%）</label>
         </div>
         <label>Reranker（表情判定） <input id="set-rerank" size="26" value="http://127.0.0.1:11437"></label>
-        <label>模型 <select id="set-model" style="max-width:230px"></select>（存本机，刷新不丢）</label>
+        <label>主模型 <select id="set-model" style="max-width:230px"></select>（与 App 共用，存服务端）</label>
         <label><input type="checkbox" id="set-stream"> 流式输出</label>
         <label>聊天显示最近 <input id="set-visible" type="number" value="10" min="5" max="200" style="width:60px"> 轮（滑动窗口，上下文不受影响）</label>
         <div class="row">

@@ -206,6 +206,11 @@ func (r *runtimeSettings) update(root string, patch map[string]any) settings.Set
 			r.cur.DistillModel = s
 		}
 	}
+	if v, ok := patch["chat_model"]; ok {
+		if s, ok := v.(string); ok {
+			r.cur.ChatModel = strings.TrimSpace(s)
+		}
+	}
 	if v, ok := patch["distill_prompt"]; ok {
 		if s, ok := v.(string); ok {
 			r.cur.DistillPrompt = s
@@ -283,6 +288,9 @@ func main() {
 	client := &http.Client{Timeout: 10 * time.Minute}
 	events = newHub()
 	loadCalibration(cfg.DataRoot)
+	// Startup self-check: warn early if the configured chat model no longer
+	// exists upstream (renamed alias), rather than only on the first send.
+	go refreshModelCheck(client, rt.get())
 
 	mux := http.NewServeMux()
 
@@ -412,7 +420,8 @@ func main() {
 				"distill_model":  s.DistillModel,
 				"distill_prompt": s.DistillPrompt, "distill_prompt_default": distill.DefaultPrompt,
 				"distill_recent_logs": s.DistillRecentLogs,
-				"reitti_enabled":      s.ReittiEnabled, "reitti_mcp_url": s.ReittiMCPURL,
+				"chat_model":          s.ChatModel, "chat_model_default": "auto-chat",
+				"reitti_enabled": s.ReittiEnabled, "reitti_mcp_url": s.ReittiMCPURL,
 				"reitti_timezone": s.ReittiTimezone, "reitti_window_hours": s.ReittiWindowHours,
 				"reitti_timeout_sec": s.ReittiTimeoutSec,
 				"estimate_scale":     engine.TextScale(),
@@ -426,6 +435,15 @@ func main() {
 				return
 			}
 			s := rt.update(cfg.DataRoot, patch)
+			// Only re-probe the upstream model list when something that can
+			// change the answer did; the web autosaves other fields often.
+			if _, a := patch["chat_model"]; a {
+				refreshModelCheck(client, s)
+			} else if _, b := patch["upstream"]; b {
+				refreshModelCheck(client, s)
+			} else if _, c := patch["api_key"]; c {
+				refreshModelCheck(client, s)
+			}
 			writeJSON(w, map[string]any{"ok": true, "upstream": s.Upstream, "api_key_set": s.APIKey != "", "api_key_hint": settings.Mask(s.APIKey)})
 		default:
 			http.Error(w, "method not allowed", 405)
@@ -460,6 +478,14 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(resp.StatusCode)
 		_, _ = w.Write(b)
+	})
+
+	// Chat-model health for the WebUI banner: probes /v1/models and reports
+	// whether settings.chat_model is actually offered upstream.
+	mux.HandleFunc("/api/model-status", func(w http.ResponseWriter, r *http.Request) {
+		s := rt.get()
+		refreshModelCheck(client, s)
+		writeJSON(w, modelCheck.snapshot())
 	})
 
 	// Distilled Memory: current fact sheet + run-now trigger.
@@ -732,7 +758,7 @@ func main() {
 		blocks = renderBlocks(cfg.DataRoot, session, s.UserName, blocks)
 		model := in.Model
 		if model == nil || model == "" {
-			model = "default"
+			model = defaultChatModel(s)
 		}
 		setActiveModel(fmt.Sprint(model))
 		ragItems, memInfo := resolveMCP(r.Context(), s, turns)
@@ -1298,7 +1324,7 @@ func main() {
 		}
 		b, _ := io.ReadAll(r.Body)
 		_ = json.Unmarshal(b, &in)
-		model := firstNonEmpty(in.Model, "auto-gemini")
+		model := firstNonEmpty(in.Model, defaultChatModel(s))
 		session := store.CleanSession(firstNonEmpty(s.CurrentChar, "tavernlab"))
 		// The app mirrors the server: only the newest user message matters;
 		// full context is slid server-side out of the character's JSONL.
@@ -1538,7 +1564,7 @@ func main() {
 		}
 		b, _ := io.ReadAll(r.Body)
 		_ = json.Unmarshal(b, &in)
-		model := firstNonEmpty(in.Model, "auto-gemini")
+		model := firstNonEmpty(in.Model, defaultChatModel(s))
 		title := stubTitle(in.Prompt)
 		upBody, _ := json.Marshal(map[string]any{
 			"model": model, "max_tokens": 256,
@@ -1720,6 +1746,14 @@ func firstNonEmpty(ss ...string) string {
 		}
 	}
 	return ""
+}
+
+// defaultChatModel is the model alias used when a client omits one. one-api is
+// the source of truth for aliases and they do get renamed, so this must never
+// be a hardcoded literal in a handler: everything reads settings.chat_model
+// (default "auto-chat") instead.
+func defaultChatModel(s settings.Settings) string {
+	return firstNonEmpty(s.ChatModel, "auto-chat")
 }
 
 // loadCharMeta reads data/characters/<name>/meta.json ({} when absent).
@@ -2075,6 +2109,65 @@ func upstreamModelIDs(client *http.Client, upstream, apiKey string) []string {
 		}
 	}
 	return ids
+}
+
+// modelCheckState caches the last validation of settings.chat_model against
+// upstream /v1/models. The WebUI/app read this to warn *before* a send, instead
+// of discovering a renamed alias only after one-api answers 403.
+type modelCheckState struct {
+	mu        sync.RWMutex
+	model     string
+	ok        bool
+	available []string
+	err       string
+	checkedAt time.Time
+}
+
+var modelCheck modelCheckState
+
+func (m *modelCheckState) set(model string, ids []string, errMsg string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.model = model
+	m.available = ids
+	m.err = errMsg
+	m.ok = errMsg == "" && strings.TrimSpace(model) != ""
+	m.checkedAt = time.Now()
+}
+
+func (m *modelCheckState) snapshot() map[string]any {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return map[string]any{
+		"model": m.model, "ok": m.ok, "available": m.available,
+		"error": m.err, "checked_at": m.checkedAt.Format(time.RFC3339),
+	}
+}
+
+// refreshModelCheck probes upstream /v1/models and records whether the
+// configured chat model is actually offered. Any failure is advisory (it never
+// blocks sending); it only powers the warning banner.
+func refreshModelCheck(client *http.Client, s settings.Settings) {
+	m := defaultChatModel(s)
+	if strings.TrimSpace(s.Upstream) == "" {
+		modelCheck.set(m, nil, "")
+		return
+	}
+	ids := upstreamModelIDs(client, s.Upstream, s.APIKey)
+	if len(ids) == 0 {
+		modelCheck.set(m, nil, "无法从上游获取模型列表")
+		obs.Warn("model check: upstream model list unavailable", map[string]any{"model": m, "upstream": s.Upstream})
+		return
+	}
+	for _, id := range ids {
+		if id == m {
+			modelCheck.set(m, ids, "")
+			obs.Info("model check ok", map[string]any{"model": m})
+			return
+		}
+	}
+	modelCheck.set(m, ids, "主模型 "+m+" 不在上游模型列表中")
+	obs.Warn("model check failed: chat model not offered by upstream", map[string]any{"model": m, "available": ids})
 }
 
 // streamUpBody builds the upstream body, adding stream_options.include_usage
@@ -2590,7 +2683,7 @@ func runDistill(ctx context.Context, st *store.Store, client *http.Client, root 
 		promptTpl = distill.DefaultPrompt
 	}
 	prompt := applyMacros(promptTpl, time.Now(), firstNonEmpty(s.UserName, "user"))
-	model := firstNonEmpty(s.DistillModel, "auto-gemini")
+	model := firstNonEmpty(s.DistillModel, defaultChatModel(s))
 	upBody, _ := json.Marshal(map[string]any{
 		"model":      model,
 		"stream":     false,

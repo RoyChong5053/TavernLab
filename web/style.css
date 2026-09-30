@@ -18,6 +18,9 @@ body{margin:0;background:radial-gradient(1200px 600px at 20% -10%,#1e293b,transp
 .health{font-size:12px;color:var(--mut)}.health.ok{color:#86efac}
 .hint{font-size:11px;color:var(--mut)}
 .content{flex:1;min-width:0;overflow:auto;padding:2px}
+.model-banner{position:sticky;top:0;z-index:20;margin:2px 2px 8px;padding:8px 12px;border-radius:10px;font-size:13px;background:rgba(255,180,60,.14);border:1px solid rgba(255,180,60,.45);color:#ffd27b}
+.model-banner.hidden{display:none}
+.model-banner a{color:inherit;text-decoration:underline;cursor:pointer}
 .page{display:none;flex-direction:column;gap:10px;max-width:980px}
 .page.on{display:flex}
 .page h2{margin:2px 0;font-size:16px}.page h2 small{color:var(--mut);font-weight:400;font-size:12px}
