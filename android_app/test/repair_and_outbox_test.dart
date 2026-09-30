@@ -120,6 +120,32 @@ void main() {
       expect(f.isRetryable, isFalse);
     });
 
+    test('403 for a disallowed model is a rejection, not an expired login', () {
+      // one-api answers this when the alias was renamed/removed. It must not be
+      // misreported as "登录凭证失效" (the old silent-failure trap).
+      final f = classifySendError(Exception('x'),
+          status: 403,
+          body:
+              '{"error":{"message":"This API key does not have permission to use the model: auto-gemini","type":"one_api_error"}}');
+      expect(f.kind, SendKind.rejected);
+      expect(f.isAuth, isFalse);
+      expect(f.message, contains('auto-gemini'));
+    });
+
+    test('a bare 403 with no model hint is still treated as auth', () {
+      final f = classifySendError(Exception('x'), status: 403, body: 'forbidden');
+      expect(f.kind, SendKind.auth);
+    });
+
+    test('the streaming NDJSON error envelope is unwrapped', () {
+      final f = classifySendError(Exception('x'),
+          status: 403,
+          body:
+              '{"model":"auto-gemini","done":true,"done_reason":"error","error":"{\\"error\\":{\\"message\\":\\"This API key does not have permission to use the model: auto-gemini\\"}}"}\n');
+      expect(f.kind, SendKind.rejected);
+      expect(f.message, contains('auto-gemini'));
+    });
+
     test('400 surfaces the server-supplied reason', () {
       final f = classifySendError(Exception('x'),
           status: 400, body: '图片保存失败：空图片或解码失败');

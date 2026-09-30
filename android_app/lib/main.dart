@@ -45,11 +45,13 @@ const useHost = true;
 // host of tavernlab, must be accessible from the client, without trailing slash, will always be accepted as valid
 const fixedHost = "http://192.168.100.78:8888";
 // use model or not, if false selector is shown
-const useModel = true;
-// model name as string, must be valid ollama model!
-const fixedModel = "auto-gemini";
+const useModel = false;
+// Legacy compile-time pin, kept only as a seed for `useModel = true` builds.
+// The live model now comes from the server-shared settings.chat_model (see
+// seedModelFromServer) so a renamed one-api alias never needs an APK rebuild.
+const fixedModel = "auto-chat";
 // recommended models, shown with as star in model selector
-const recommendedModels = ["auto-gemini"];
+const recommendedModels = ["auto-chat", "auto-agent"];
 // allow opening of settings
 const allowSettings = true;
 // allow multiple chats
@@ -67,6 +69,10 @@ final GlobalKey<ScaffoldMessengerState> messengerKey =
 StreamSubscription<String>? eventSub;
 
 String? model;
+// Server-shared main chat model (settings.chat_model), used as the fallback
+// when the locally chosen alias is missing. Never hardcode an alias in a
+// request body: one-api renames them.
+String? serverChatModel;
 String? host;
 
 bool multimodal = false;
@@ -216,6 +222,68 @@ Future<Map<String, dynamic>> apiGet(String path, {int seconds = 15}) async {
       .get(Uri.parse("$host$path"), headers: serverHeaders())
       .timeout(Duration(seconds: seconds));
   return jsonDecode(r.body) as Map<String, dynamic>;
+}
+
+/// Resolve the chat model at boot: prefer the locally chosen alias if upstream
+/// still offers it, otherwise fall back to the server-shared `chat_model`, then
+/// to the first available upstream model. This is what makes a one-api alias
+/// rename (e.g. auto-gemini -> auto-chat) a no-op instead of a silent 403.
+Future<void> seedModelFromServer() async {
+  serverChatModel = null;
+  if (host == null) {
+    model = prefs?.getString('model');
+    return;
+  }
+  try {
+    final j = await apiGet('/api/settings');
+    final v = (j['chat_model'] ?? '').toString().trim();
+    if (v.isNotEmpty) serverChatModel = v;
+  } catch (_) {}
+  List<String> avail = [];
+  try {
+    final j = await apiGet('/api/models');
+    avail = ((j['data'] as List?) ?? [])
+        .map((e) => (e is Map ? (e['id'] ?? '') : '').toString())
+        .where((s) => s.isNotEmpty)
+        .toList();
+  } catch (_) {}
+
+  var candidate = prefs?.getString('model');
+  final candidateValid = candidate != null &&
+      candidate.isNotEmpty &&
+      (avail.isEmpty || avail.contains(candidate));
+  if (!candidateValid) {
+    final sm = serverChatModel;
+    if (sm != null && (avail.isEmpty || avail.contains(sm))) {
+      candidate = sm;
+    } else if (avail.isNotEmpty) {
+      candidate = avail.first;
+    } else {
+      candidate = sm ?? candidate;
+    }
+  }
+  model = (candidate != null && candidate.isNotEmpty) ? candidate : null;
+  if (model != null) prefs?.setString('model', model!);
+}
+
+/// Slash-command palette. Typing a leading "/" surfaces these in the composer
+/// (Telegram-bot style) so commands are discoverable instead of silent.
+const List<List<String>> kSlashCommands = [
+  ['/regenerate', '重新生成上一条回复'],
+  ['/regen', '重新生成（简写）'],
+  ['/重发', '重新发送上一条'],
+  ['/重新生成', '重新生成上一条'],
+  ['/重新回复', '重新回复上一条'],
+];
+
+bool shouldShowSlashMenu(String raw) {
+  final s = raw.trimLeft();
+  if (!s.startsWith('/')) return false;
+  if (s.contains(' ') || s.contains('\n') || s.contains('\t')) return false;
+  for (final c in kSlashCommands) {
+    if (s == c[0]) return false; // already a complete command
+  }
+  return true;
 }
 
 
@@ -677,7 +745,7 @@ Future<void> sendTurn(OutboxItem item) async {
         ...serverHeaders(),
       })
       ..body = jsonEncode({
-        "model": model ?? "auto-gemini",
+        "model": model ?? serverChatModel ?? "auto-chat",
         "stream": true,
         "client_msg_id": item.id,
         "messages": [
@@ -739,6 +807,12 @@ Future<void> regenerateTurn() async {
   liveStreamMsgId = msgId;
   liveStreamEpoch = myEpoch;
   setAwaitingReply(true);
+  // Immediate acknowledgement: /regenerate used to look like a no-op while the
+  // request was in flight.
+  messengerKey.currentState?.showSnackBar(const SnackBar(
+    content: Text("正在重新生成上一条回复…"),
+    duration: Duration(seconds: 2),
+  ));
   pokeUI();
   try {
     final req = http.Request("POST", Uri.parse("$h/api/chat"))
@@ -748,7 +822,7 @@ Future<void> regenerateTurn() async {
         ...serverHeaders(),
       })
       ..body = jsonEncode({
-        "model": model ?? "auto-gemini",
+        "model": model ?? serverChatModel ?? "auto-chat",
         "stream": true,
         "regenerate": true,
         "messages": <Map<String, dynamic>>[],
@@ -1514,11 +1588,17 @@ class _MainAppState extends State<MainApp> with WidgetsBindingObserver {
         }
 
         // Thin mirror: load the current character from the server.
+        host = useHost ? fixedHost : prefs?.getString("host");
+        if (useModel) {
+          model = fixedModel;
+        } else {
+          // Resolve against the server-shared model + upstream /v1/models so a
+          // renamed alias can never silently 403.
+          await seedModelFromServer();
+        }
         setState(() {
-          model = useModel ? fixedModel : prefs!.getString("model");
           chatAllowed = !(model == null);
           multimodal = prefs?.getBool("multimodal") ?? false;
-          host = useHost ? fixedHost : prefs?.getString("host");
         });
 
         if (host == null) {
@@ -1946,6 +2026,16 @@ class _MainAppState extends State<MainApp> with WidgetsBindingObserver {
                                             color: Colors.white,
                                             fontSize: 16,
                                             fontWeight: FontWeight.w500),
+                                        // flutter_markdown's plain constructor
+                                        // leaves em/strong null, so **bold**
+                                        // and *italic* rendered as untouched
+                                        // body text. Give them explicit styles.
+                                        em: const TextStyle(
+                                            color: Colors.white,
+                                            fontStyle: FontStyle.italic),
+                                        strong: const TextStyle(
+                                            color: Colors.white,
+                                            fontWeight: FontWeight.w800),
                                         blockquoteDecoration: BoxDecoration(
                                           color: Colors.grey[800],
                                           borderRadius:
@@ -1987,6 +2077,12 @@ class _MainAppState extends State<MainApp> with WidgetsBindingObserver {
                                                 color: Colors.black,
                                                 fontSize: 16,
                                                 fontWeight: FontWeight.w500),
+                                            em: const TextStyle(
+                                                color: Color(0xFF1E6FD9),
+                                                fontStyle: FontStyle.italic),
+                                            strong: const TextStyle(
+                                                color: Colors.black,
+                                                fontWeight: FontWeight.w800),
                                             blockquoteDecoration: BoxDecoration(
                                               color: Colors.grey[200],
                                               borderRadius:
@@ -2017,6 +2113,12 @@ class _MainAppState extends State<MainApp> with WidgetsBindingObserver {
                                                 color: Colors.white,
                                                 fontSize: 16,
                                                 fontWeight: FontWeight.w500),
+                                            em: const TextStyle(
+                                                color: Color(0xFF8FD3FF),
+                                                fontStyle: FontStyle.italic),
+                                            strong: const TextStyle(
+                                                color: Colors.white,
+                                                fontWeight: FontWeight.w800),
                                             blockquoteDecoration: BoxDecoration(
                                               color: Colors.grey[800]!,
                                               borderRadius:
@@ -2058,50 +2160,94 @@ class _MainAppState extends State<MainApp> with WidgetsBindingObserver {
                                       width: w, fit: BoxFit.cover))),
                         );
                       },
-                      listBottomWidget: pendingImages.isEmpty
-                          ? null
-                          : Container(
-                              margin: const EdgeInsets.only(
-                                  left: 12, right: 12, top: 6, bottom: 2),
-                              alignment: Alignment.centerLeft,
-                              child: Stack(children: [
-                                 ClipRRect(
+                      listBottomWidget: () {
+                        final slash = shouldShowSlashMenu(composer.text);
+                        final hasImg = pendingImages.isNotEmpty;
+                        if (!slash && !hasImg) return null;
+                        return Column(
+                          mainAxisSize: MainAxisSize.min,
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            if (slash)
+                              Container(
+                                margin: const EdgeInsets.only(
+                                    left: 12, right: 12, top: 6, bottom: 2),
+                                child: SingleChildScrollView(
+                                  scrollDirection: Axis.horizontal,
+                                  child: Row(children: [
+                                    for (final c in kSlashCommands)
+                                      Padding(
+                                        padding:
+                                            const EdgeInsets.only(right: 6),
+                                        child: ActionChip(
+                                          visualDensity: VisualDensity.compact,
+                                          label: Text('${c[0]}  ${c[1]}',
+                                              style: const TextStyle(
+                                                  fontSize: 12)),
+                                          onPressed: () {
+                                            HapticFeedback.selectionClick();
+                                            final cmd = c[0];
+                                            composer.value = TextEditingValue(
+                                              text: cmd,
+                                              selection:
+                                                  TextSelection.collapsed(
+                                                      offset: cmd.length),
+                                            );
+                                            setState(() {
+                                              sendable = true;
+                                            });
+                                          },
+                                        ),
+                                      ),
+                                  ]),
+                                ),
+                              ),
+                            if (hasImg)
+                              Container(
+                                margin: const EdgeInsets.only(
+                                    left: 12, right: 12, top: 6, bottom: 2),
+                                alignment: Alignment.centerLeft,
+                                child: Stack(children: [
+                                  ClipRRect(
                                     borderRadius: BorderRadius.circular(12),
                                     child: buildImageWidget(pendingImages.first,
                                         width: 96,
                                         height: 96,
                                         fit: BoxFit.cover,
                                         gapless: false),
-                                 ),
-                                Positioned(
-                                  right: 0,
-                                  top: 0,
-                                  child: GestureDetector(
-                                    onTap: () {
-                                      HapticFeedback.selectionClick();
-                                      setState(() {
-                                        pendingImages.clear();
-                                        // The only reason the field held a
-                                        // sentinel was the image that just went
-                                        // away.
-                                        if (composerIsEffectivelyEmpty(
-                                            composer.text)) {
-                                          composer.clear();
-                                        }
-                                      });
-                                    },
-                                    child: Container(
-                                      decoration: const BoxDecoration(
-                                          color: Colors.black54,
-                                          shape: BoxShape.circle),
-                                      padding: const EdgeInsets.all(2),
-                                      child: const Icon(Icons.close,
-                                          size: 16, color: Colors.white),
+                                  ),
+                                  Positioned(
+                                    right: 0,
+                                    top: 0,
+                                    child: GestureDetector(
+                                      onTap: () {
+                                        HapticFeedback.selectionClick();
+                                        setState(() {
+                                          pendingImages.clear();
+                                          // The only reason the field held a
+                                          // sentinel was the image that just
+                                          // went away.
+                                          if (composerIsEffectivelyEmpty(
+                                              composer.text)) {
+                                            composer.clear();
+                                          }
+                                        });
+                                      },
+                                      child: Container(
+                                        decoration: const BoxDecoration(
+                                            color: Colors.black54,
+                                            shape: BoxShape.circle),
+                                        padding: const EdgeInsets.all(2),
+                                        child: const Icon(Icons.close,
+                                            size: 16, color: Colors.white),
+                                      ),
                                     ),
                                   ),
-                                ),
-                              ]),
-                            ),
+                                ]),
+                              ),
+                          ],
+                        );
+                      }(),
                       disableImageGallery: true,
                       // keyboardDismissBehavior:
                       //     ScrollViewKeyboardDismissBehavior.onDrag,

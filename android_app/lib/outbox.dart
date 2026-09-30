@@ -133,7 +133,21 @@ class OutboxHttpError implements Exception {
 /// Classify a transport or HTTP failure into something actionable.
 SendFailure classifySendError(Object error, {int? status, String? body}) {
   if (status != null) {
-    if (status == 401 || status == 403) {
+    if (status == 401) {
+      return SendFailure(SendKind.auth, '登录凭证失效，请在设置里检查 host headers',
+          status: status);
+    }
+    if (status == 403) {
+      // TavernLab's own gate answers 401, so a 403 almost always comes from
+      // one-api: most commonly "This API key does not have permission to use
+      // the model: <alias>". Surface the real reason (and the alias) instead of
+      // mislabelling it as an expired login.
+      final b = (body ?? '').toLowerCase();
+      if (b.contains('permission') ||
+          b.contains('model') ||
+          b.contains('does not have')) {
+        return SendFailure(SendKind.rejected, _cleanBody(body), status: status);
+      }
       return SendFailure(SendKind.auth, '登录凭证失效，请在设置里检查 host headers',
           status: status);
     }
@@ -162,13 +176,21 @@ SendFailure classifySendError(Object error, {int? status, String? body}) {
 String _cleanBody(String? body) {
   if (body == null || body.trim().isEmpty) return '请求被服务器拒绝';
   var s = body.trim();
-  // The shim answers errors as plain text; strip any JSON wrapper.
-  if (s.startsWith('{')) {
+  // The shim answers errors as JSON (and the streaming path wraps one JSON
+  // string inside another), so unwrap a few times to reach the human message.
+  for (var i = 0; i < 3; i++) {
+    if (!s.startsWith('{')) break;
     try {
       final m = jsonDecode(s);
-      if (m is Map && m['error'] != null) s = m['error'].toString();
+      if (m is Map && m['error'] != null) {
+        s = m['error'].toString();
+      } else if (m is Map && m['message'] != null) {
+        s = m['message'].toString();
+      } else {
+        break;
+      }
     } catch (_) {
-      // keep the raw text
+      break; // keep the raw text
     }
   }
   return s.length > 200 ? '${s.substring(0, 200)}…' : s;
@@ -350,27 +372,33 @@ class Outbox {
         onSettled?.call(it, null, null);
       } catch (e) {
         it.attempts++;
-        it.lastError = classifySendError(e, status: _statusOf(e), body: _bodyOf(e)).message;
-        if (it.attempts >= kOutboxBackoff.length) {
-          it.nextAttemptAt = DateTime.now()
-              .millisecondsSinceEpoch +
-              5 * 60 * 1000;
-        } else {
-          it.nextAttemptAt = DateTime.now().millisecondsSinceEpoch +
-              kOutboxBackoff[it.attempts - 1] * 1000;
-        }
-        if (it.exhausted) {
+        final f = classifySendError(e, status: _statusOf(e), body: _bodyOf(e));
+        it.lastError = f.message;
+        // A rejected request (bad/renamed model, bad image, upstream refusal)
+        // and an auth failure will never succeed by retrying: surface them at
+        // once (red bubble + snackbar) instead of leaving the user staring at
+        // "努力回复中" for the full give-up window.
+        final terminal =
+            f.kind == SendKind.rejected || f.kind == SendKind.auth;
+        if (terminal || it.exhausted) {
           it.state = OutboxState.failed;
         } else {
+          if (it.attempts >= kOutboxBackoff.length) {
+            it.nextAttemptAt =
+                DateTime.now().millisecondsSinceEpoch + 5 * 60 * 1000;
+          } else {
+            it.nextAttemptAt = DateTime.now().millisecondsSinceEpoch +
+                kOutboxBackoff[it.attempts - 1] * 1000;
+          }
           it.state = OutboxState.queued;
         }
         await _persist(prefs);
         onChanged?.call();
         onSettled?.call(it, e, _statusOf(e));
         // A transport-level failure will hit every remaining entry too; stop
-        // and let the backoff ladder space them out.
-        final f = classifySendError(e, status: _statusOf(e));
-        if (f.isRetryable || f.isAuth) break;
+        // and let the backoff ladder space them out. Terminal failures stop the
+        // loop as well: the reason is shown, not retried forever.
+        if (terminal || f.isRetryable) break;
       }
     }
   }
