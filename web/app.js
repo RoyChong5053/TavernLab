@@ -337,13 +337,47 @@ function pickExpressionURL(label) {
   return '';
 }
 function avatarFor(role, moodLabel) {
-  if (role === 'user') return '';
+  if (role === 'user') return imgURL(userAvatarURL);
   if (moodLabel) {
     const u = pickExpressionURL(moodLabel);
     if (u) return imgURL(u);
   }
   return imgURL(charAvatarURL);
 }
+// User avatar element: uploaded photo, else initial block. Tagged with
+// data-useravatar so upload/delete/rename can backfill live bubbles.
+function makeUserAvatarEl() {
+  if (userAvatarURL) {
+    const img = document.createElement('img');
+    img.className = 'avatar';
+    img.alt = '';
+    img.loading = 'lazy';
+    img.dataset.useravatar = '1';
+    img.src = imgURL(userAvatarURL);
+    return img;
+  }
+  const u = document.createElement('div');
+  u.className = 'avatar user-avatar';
+  u.textContent = userInitial();
+  u.title = settings.user_name || '你';
+  u.dataset.useravatar = '1';
+  return u;
+}
+function refreshUserAvatarGutters() {
+  document.querySelectorAll('#chat .avatar-gutter').forEach((g) => {
+    if (g.querySelector('[data-useravatar]')) g.replaceChildren(makeUserAvatarEl());
+  });
+  const prev = $('#user-avatar-preview');
+  if (prev) prev.src = imgURL(userAvatarURL) || BLANK_GIF;
+}
+async function loadUserAvatar() {
+  try {
+    const j = await (await api('/api/user/avatar/')).json();
+    userAvatarURL = j.avatar_url || '';
+  } catch { userAvatarURL = ''; }
+  refreshUserAvatarGutters();
+}
+let userAvatarURL = '';
 const BLANK_GIF = 'data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==';
 function userInitial() {
   const n = (settings.user_name || '你').trim();
@@ -654,11 +688,7 @@ function renderMsg(role, text, who, prepend, images, id, time, mood) {
     const av = document.createElement('div');
     av.className = 'avatar-gutter';
     if (role === 'user') {
-      const u = document.createElement('div');
-      u.className = 'avatar user-avatar';
-      u.textContent = userInitial();
-      u.title = settings.user_name || '你';
-      av.appendChild(u);
+      av.appendChild(makeUserAvatarEl());
     } else {
       const img = document.createElement('img');
       img.className = 'avatar';
@@ -1506,11 +1536,40 @@ async function saveSettings(silent) {
   apiKeyDirty = false;
   $('#set-apikey').value = '';
   applyAvatarSize();
+  refreshUserAvatarGutters(); // user_name 改了首字块也要跟
   applyTheme();
   if (!silent) toast('偏好已保存');
   return r;
 }
 $('#btn-settings-save').onclick = () => asyncAction($('#btn-settings-save'), async () => { await saveSettings(false); await loadServerSettings(); refreshModels(); });
+/* ---------- user avatar (global, settings page) ---------- */
+{ const f = $('#user-avatar-file');
+  if (f) f.addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    e.target.value = '';
+    if (!file) return;
+    if (!file.type.startsWith('image/')) { toast('选中的不是图片', 'err'); return; }
+    if (file.size > 8 * 1024 * 1024) { toast('图片太大（上限8MB）', 'err', 4200); return; }
+    const fd = new FormData();
+    fd.append('file', file);
+    try {
+      const r = await api('/api/user/avatar/', { method: 'PUT', body: fd });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error((j && j.error) || ('HTTP ' + r.status));
+      userAvatarURL = j.avatar_url || '';
+      refreshUserAvatarGutters();
+      toast('我的头像已更新');
+    } catch (err) { toast('上传失败：' + (err.message || err), 'err', 4200); }
+  });
+}
+{ const del = $('#btn-user-avatar-del');
+  if (del) del.onclick = () => asyncAction(del, async () => {
+    await api('/api/user/avatar/', { method: 'DELETE' });
+    userAvatarURL = '';
+    refreshUserAvatarGutters();
+    toast('我的头像已删除，改用名字首字');
+  });
+}
 // Theme picker: local-only, applies instantly (no server round-trip).
 { const t = $('#set-theme'); if (t) t.addEventListener('change', () => setTheme(t.value)); }
 document.querySelectorAll('[data-themek]').forEach((el) => {
@@ -1549,6 +1608,7 @@ async function init() {
   applyUiScale();
   $('#chat-char-name').textContent = settings.char;
   applyAvatarSize();
+  loadUserAvatar();
   loadBlocks();
   refreshChars();
   refreshModels();

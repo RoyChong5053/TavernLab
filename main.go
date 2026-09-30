@@ -903,6 +903,87 @@ func main() {
 		writeJSON(w, expression.Classify(client, in.RerankURL, in.Text))
 	})
 
+	// User avatar: data/user_avatar.<ext> (mirrors character avatars, but global
+	// to the user, not per character). <img> uses ?token= like /chars/.
+	// Note the trailing slash: the same handler serves ./raw (file bytes).
+	mux.HandleFunc("/api/user/avatar/", func(w http.ResponseWriter, r *http.Request) {
+		raw := strings.HasSuffix(r.URL.Path, "/raw")
+		switch {
+		case r.Method == "GET" && raw:
+			name := userAvatarName(cfg.DataRoot)
+			if name == "" {
+				http.Error(w, "no avatar", 404)
+				return
+			}
+			switch strings.ToLower(filepath.Ext(name)) {
+			case ".png":
+				w.Header().Set("Content-Type", "image/png")
+			case ".jpg", ".jpeg":
+				w.Header().Set("Content-Type", "image/jpeg")
+			case ".gif":
+				w.Header().Set("Content-Type", "image/gif")
+			default:
+				w.Header().Set("Content-Type", "image/webp")
+			}
+			http.ServeFile(w, r, filepath.Join(cfg.DataRoot, name))
+		case r.Method == "GET":
+			if name := userAvatarName(cfg.DataRoot); name != "" {
+				writeJSON(w, map[string]any{"ok": true, "avatar_url": "/api/user/avatar/raw"})
+				return
+			}
+			writeJSON(w, map[string]any{"ok": true, "avatar_url": ""})
+		case r.Method == "PUT":
+			r.Body = http.MaxBytesReader(w, r.Body, 8<<20) // same cap as chat images
+			if err := r.ParseMultipartForm(8 << 20); err != nil {
+				http.Error(w, "need file field (max 8MB)", 400)
+				return
+			}
+			f, h, err := r.FormFile("file")
+			if err != nil {
+				http.Error(w, "need file field", 400)
+				return
+			}
+			defer f.Close()
+			fname := "user_avatar.webp"
+			switch n := strings.ToLower(h.Filename); {
+			case strings.HasSuffix(n, ".png"):
+				fname = "user_avatar.png"
+			case strings.HasSuffix(n, ".jpg") || strings.HasSuffix(n, ".jpeg"):
+				fname = "user_avatar.jpg"
+			case strings.HasSuffix(n, ".gif"):
+				fname = "user_avatar.gif"
+			}
+			dst, err := os.Create(filepath.Join(cfg.DataRoot, fname))
+			if err != nil && os.IsNotExist(err) {
+				_ = os.MkdirAll(cfg.DataRoot, 0o755)
+				dst, err = os.Create(filepath.Join(cfg.DataRoot, fname))
+			}
+			if err != nil {
+				http.Error(w, "save failed", 500)
+				return
+			}
+			defer dst.Close()
+			if _, err := io.Copy(dst, f); err != nil {
+				http.Error(w, "save failed", 500)
+				return
+			}
+			for _, alt := range []string{"user_avatar.webp", "user_avatar.png", "user_avatar.jpg", "user_avatar.jpeg", "user_avatar.gif"} {
+				if alt != fname {
+					_ = os.Remove(filepath.Join(cfg.DataRoot, alt))
+				}
+			}
+			obs.Info("user avatar saved", map[string]any{"file": fname})
+			writeJSON(w, map[string]any{"ok": true, "avatar_url": "/api/user/avatar/raw"})
+		case r.Method == "DELETE":
+			for _, alt := range []string{"user_avatar.webp", "user_avatar.png", "user_avatar.jpg", "user_avatar.jpeg", "user_avatar.gif"} {
+				_ = os.Remove(filepath.Join(cfg.DataRoot, alt))
+			}
+			writeJSON(w, map[string]any{"ok": true})
+		default:
+			http.Error(w, "method not allowed", 405)
+		}
+	})
+
 	// Characters: list/create/detail/delete + card + avatar.
 	// Self-contained layout: data/characters/<name>/{card.json,avatar.*,chat.jsonl,media/,archive/}
 	mux.HandleFunc("/api/characters", func(w http.ResponseWriter, r *http.Request) {

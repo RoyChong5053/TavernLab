@@ -57,6 +57,16 @@ func charAvatarURL(root, name string) string {
 	return ""
 }
 
+// userAvatarName finds the user's own avatar file under data root, if any.
+func userAvatarName(root string) string {
+	for _, cand := range []string{"user_avatar.webp", "user_avatar.png", "user_avatar.jpg", "user_avatar.jpeg", "user_avatar.gif"} {
+		if _, err := os.Stat(filepath.Join(root, cand)); err == nil {
+			return cand
+		}
+	}
+	return ""
+}
+
 // charAvatarPx reads meta.json avatar_px (default 88).
 func charAvatarPx(base string) int {
 	meta := loadCharMeta(base)

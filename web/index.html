@@ -234,6 +234,12 @@
           <label>聊天头像大小 <input id="set-avatar-size" type="number" min="32" max="240" value="88" style="width:64px"> px</label>
         </div>
         <label>导出时我的名字 <input id="set-user" size="12" placeholder="RoyChong" autocomplete="off"></label>
+        <div class="row">
+          <img id="user-avatar-preview" class="avatar sq" alt="我的头像" style="width:64px;height:64px">
+          <label class="filebtn">上传我的头像 <input type="file" id="user-avatar-file" accept=".webp,.png,.jpg,.jpeg,.gif" hidden></label>
+          <button id="btn-user-avatar-del" class="danger">删除</button>
+          <span class="meta">显示在每条消息左侧；不设则用名字首字。</span>
+        </div>
         <div class="row"><button id="btn-settings-save" class="primary">保存偏好</button><button id="btn-models-refresh">刷新模型列表</button></div>
         <p class="meta">upstream/key/current_char 存后端 data/settings.json（0600，不进 git）；其余存浏览器 localStorage。</p>
       </div>
