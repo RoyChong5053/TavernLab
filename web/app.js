@@ -274,6 +274,7 @@ function protectMoneyOutsideCode(text) {
 // stream-complete / non-stream) must go through here so none renders
 // half-styled.
 function renderRichBody(el, text, isUser) {
+  el.dataset.raw = text || '';
   el.innerHTML = formatMessage(text, isUser, false);
   renderMath(el);
   highlightCode(el);
@@ -720,6 +721,9 @@ function renderMsg(role, text, who, prepend, images, id, time, mood) {
   b.className = 'body';
   const isUser = role === 'user';
   const isSystem = role === 'sys';
+  // Raw source for SSE dedupe: rendered textContent differs from source when
+  // markdown is present (**x** -> x), so text-compare must use this, not DOM.
+  b.dataset.raw = text || '';
   if (!text && images && images.length) {
     b.className += ' body-media-only';
   } else {
@@ -788,7 +792,7 @@ function subscribeChat() {
     // (mid-stream or exact match) rather than adding a second identical bubble.
     if (m.role === 'assistant' && pendingAssistant) {
       const pb = pendingAssistant.querySelector('.body');
-      if (pb && (pb.classList.contains('cursor') || pb.textContent === m.text)) {
+      if (pb && (pb.classList.contains('cursor') || (pb.dataset.raw || '') === (m.text || ''))) {
         // SSE delivers final message: full rich render (markdown+LaTeX+hljs)
         renderRichBody(pb, m.text, false);
         pb.classList.remove('cursor');
@@ -804,8 +808,9 @@ function subscribeChat() {
     const lastBody = bodies[bodies.length - 1];
     // Only absorb into a LOCAL (id-less) bubble we rendered optimistically; a
     // server bubble already carries data-id, so a legitimately repeated
-    // identical reply still renders as its own message.
-    if (lastBody && lastBody.textContent === m.text && lastBody.parentElement && !lastBody.parentElement.dataset.id) {
+    // identical reply still renders as its own message. Compare dataset.raw:
+    // rendered textContent loses markdown (**x** -> x) and never matches.
+    if (lastBody && (lastBody.dataset.raw || '') === (m.text || '') && lastBody.parentElement && !lastBody.parentElement.dataset.id) {
       if (m.id) { lastBody.parentElement.dataset.id = m.id; seenMsgIds.add(m.id); }
       if (m.role === 'assistant') assistantSseSeq++;
       return;
@@ -957,7 +962,7 @@ async function send(regen = false) {
             const fr = j.choices?.[0]?.finish_reason || '';
             if (fr) finishReason = fr;
             const delta = j.choices?.[0]?.delta?.content || '';
-            if (delta) { full += delta; belly.textContent = full; }
+            if (delta) { full += delta; belly.textContent = full; belly.dataset.raw = full; }
           } catch (err) { console.warn('sse parse', err, payload); }
         }
       }
@@ -989,8 +994,10 @@ async function send(regen = false) {
     else if (finish === 'content_filter') toast('回复被安全策略截断（finish=content_filter）', 'err', 4200);
     // SSE may have already rendered this reply (server publishes before our HTTP
     // response lands); only add the bubble if it isn't already the last one.
-    const lastAi = [...document.querySelectorAll('#chat .msg.ai .body')].pop();
-    const sseRenderedMine = lastAi && lastAi.textContent === reply && assistantSseSeq > seqAtStart;
+    // Compare dataset.raw: rendered textContent drops markdown and mismatches.
+    const lastAiBox = [...document.querySelectorAll('#chat .msg.ai')].pop();
+    const lastAiBody = lastAiBox ? lastAiBox.querySelector('.body') : null;
+    const sseRenderedMine = lastAiBody && (lastAiBody.dataset.raw || '') === reply && assistantSseSeq > seqAtStart;
     let mineBox = null;
     if (!sseRenderedMine) mineBox = addMsg('assistant', reply);
     setPending(false);
