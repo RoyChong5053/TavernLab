@@ -26,6 +26,11 @@ const DefaultTimeout = 120 * time.Second
 type Client struct {
 	BaseURL string
 	HTTP    *http.Client
+	// WaitSeconds is sent as wait_seconds so rag-mcp-server blocks for a result
+	// instead of returning a pollable job. It is derived from the HTTP timeout
+	// minus a safety margin, keeping this synchronous, non-agent client on the
+	// direct-result path.
+	WaitSeconds int
 }
 
 // New builds a client with the default timeout.
@@ -37,7 +42,15 @@ func NewWithTimeout(baseURL string, timeout time.Duration) *Client {
 	if timeout <= 0 {
 		timeout = DefaultTimeout
 	}
-	return &Client{BaseURL: strings.TrimRight(baseURL, "/"), HTTP: &http.Client{Timeout: timeout}}
+	wait := int(timeout.Seconds()) - 5
+	if wait < 1 {
+		wait = 1
+	}
+	return &Client{
+		BaseURL:     strings.TrimRight(baseURL, "/"),
+		HTTP:        &http.Client{Timeout: timeout},
+		WaitSeconds: wait,
+	}
 }
 
 var resultHead = regexp.MustCompile(`(?m)^--- Result \d+ \(score: ([\d.]+)\) ---\n?`)
@@ -132,11 +145,40 @@ func (c *Client) Search(ctx context.Context, query, collection string, topK int,
 	if threshold >= 0 {
 		args["threshold"] = threshold
 	}
+	// Keep this synchronous caller on the direct-result path: ask the server to
+	// wait up to (HTTP timeout - margin) instead of handing back a job at 10s.
+	if c.WaitSeconds > 0 {
+		args["wait_seconds"] = c.WaitSeconds
+	}
 	text, err := c.CallTool(ctx, "search_memory", args)
 	if err != nil {
 		return nil, err
 	}
+	if jobID, ok := pendingJobID(text); ok {
+		return nil, fmt.Errorf("rag-mcp-server returned a pending job %s (search exceeded wait_seconds); result not ready", jobID)
+	}
 	return splitResults(text), nil
+}
+
+// pendingJobID detects the {status:pending, job_id:...} payload rag-mcp-server
+// returns when a tool call exceeds wait_seconds. It must be caught before
+// splitResults, which would otherwise misread the JSON as a memory chunk.
+func pendingJobID(text string) (string, bool) {
+	t := strings.TrimSpace(text)
+	if !strings.HasPrefix(t, "{") {
+		return "", false
+	}
+	var p struct {
+		Status string `json:"status"`
+		JobID  string `json:"job_id"`
+	}
+	if err := json.Unmarshal([]byte(t), &p); err != nil {
+		return "", false
+	}
+	if p.Status == "pending" {
+		return p.JobID, true
+	}
+	return "", false
 }
 
 // splitResults chops the "--- Result N (score: X) ---" formatted text into hits.
