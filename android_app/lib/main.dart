@@ -25,6 +25,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 // ignore: depend_on_referenced_packages
 import 'package:flutter_chat_types/flutter_chat_types.dart' as types;
 import 'package:flutter_chat_ui/flutter_chat_ui.dart';
+// ignore: depend_on_referenced_packages
+import 'package:scroll_to_index/scroll_to_index.dart';
 import 'package:uuid/uuid.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:visibility_detector/visibility_detector.dart';
@@ -126,6 +128,28 @@ void restoreDraft(String text) {
 }
 
 List<types.Message> messages = [];
+
+// Own the chat list's scroll position so a server sync can re-pin it to the
+// newest message (offset 0 on a reversed list) instead of leaving the viewport
+// wherever flutter_chat_ui's list diff happened to move it.
+final AutoScrollController chatScrollController = AutoScrollController();
+
+/// Keep the chat list on the newest message after a rebuild. Only pins when the
+/// user is already near the bottom, so scrolling up to read history is never
+/// yanked away; [force] is for the first load after opening.
+void pinChatToBottom({bool force = false}) {
+  WidgetsBinding.instance.addPostFrameCallback((_) {
+    try {
+      if (!chatScrollController.hasClients) return;
+      if (!force && chatScrollController.position.pixels > 80) return;
+      chatScrollController.jumpTo(0);
+    } catch (_) {
+      // The Chat widget disposes its scroll controller when it unmounts; a
+      // sync that races that teardown is harmless, just skip the re-pin.
+    }
+  });
+}
+
 String? chatUuid;
 bool chatAllowed = true;
 
@@ -318,10 +342,14 @@ Future<List<types.Message>> fetchServerMessages() async {
       out.add(types.TextMessage(author: author, id: id, text: text));
     }
     final imgs = (m["images"] as List?) ?? [];
+    var imgIndex = 0;
     for (final p in imgs) {
+      // Derive the image id from the server row so it is stable across
+      // fetches. A random id per fetch made flutter_chat_ui treat every sync
+      // as a full delete+insert, which is what made the list jump.
       out.add(types.ImageMessage(
         author: author,
-        id: const Uuid().v4(),
+        id: "$id-img-${imgIndex++}",
         name: "image",
         size: 0,
         uri: "$host/chars/${Uri.encodeComponent(currentChar)}/$p",
@@ -1197,9 +1225,9 @@ Future<void> syncFromServer({bool silent = false}) async {
     pruneImgCache();
     sendEpoch++; // invalidate any zombie stream still patching the old list
     offlineMode = false;
+    final firstLoad = lastSeenAssistantId == null;
     if (newestAssistantId != null &&
         newestAssistantId != lastSeenAssistantId) {
-      final firstLoad = lastSeenAssistantId == null;
       lastSeenAssistantId = newestAssistantId;
       if (!firstLoad) {
         if (suppressChimeOnce) {
@@ -1213,6 +1241,9 @@ Future<void> syncFromServer({bool silent = false}) async {
     } else {
       pokeUI();
     }
+    // Re-pin after the list rebuild: on open always jump to the newest, and
+    // afterwards only when the user had not scrolled up to read history.
+    pinChatToBottom(force: firstLoad);
     if (!silent) HapticFeedback.lightImpact();
   } catch (e) {
     offlineMode = true;
@@ -1249,7 +1280,11 @@ void startEvents() {
         if (line.startsWith("data:")) {
           try {
             final m = jsonDecode(line.substring(5).trim());
-            if (m is Map && m["role"] != null) {
+            final role = (m is Map) ? (m["role"] ?? "").toString() : "";
+            // Only roles the list actually renders trigger a full re-sync;
+            // a background distilled_memory row would otherwise replace the
+            // whole list for a message that never appears on screen.
+            if (role == "user" || role == "assistant") {
               // A local stream owns the UI while it runs; the poller will
               // reconcile with server truth once it ends.
               if (!chatAllowed) return;
@@ -1810,6 +1845,7 @@ class _MainAppState extends State<MainApp> with WidgetsBindingObserver {
                   : const SizedBox.shrink(),
               Expanded(
                   child: Chat(
+                      scrollController: chatScrollController,
                       messages: messages,
                       // Full-bleed assistant bubbles (DeepSeek style) while
                       // user bubbles keep the classic right-aligned look.
