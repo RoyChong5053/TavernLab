@@ -1487,6 +1487,7 @@ func main() {
 			priorRow, priorReply, hasPrior, hasPriorReply :=
 				st.FindTurn(session, in.ClientMsgID)
 			if hasFresh {
+				var savedPaths []string
 				if hasPrior {
 					upImages = loadMediaAsDataURLs(cfg.DataRoot, session, priorRow.Images)
 					obs.Info("app turn retried", map[string]any{
@@ -1495,6 +1496,7 @@ func main() {
 					})
 				} else {
 					paths, dataURLs, imgErr := saveImages(cfg.DataRoot, session, freshImages)
+					savedPaths = paths
 					if len(freshImages) > 0 && len(paths) == 0 && len(dataURLs) == 0 {
 						obs.Warn("app image save failed", map[string]any{"session": session, "error": imgErrString(imgErr)})
 						http.Error(w, "图片保存失败："+imgErrString(imgErr), 400)
@@ -1504,8 +1506,10 @@ func main() {
 				}
 				if !hasPrior {
 					// A duplicate row would point at a second copy of the same photo,
-					// so only append when the turn is genuinely new.
-					msg, _ := st.AppendChatID(session, in.ClientMsgID, "user", strings.TrimSpace(freshText))
+					// so only append when the turn is genuinely new. savedPaths must
+					// ride on the row or the app shows the image only from its local
+					// optimistic bubble and loses it after a restart.
+					msg, _ := st.AppendChatID(session, in.ClientMsgID, "user", strings.TrimSpace(freshText), savedPaths...)
 					events.publish(session, msg)
 				}
 			}
