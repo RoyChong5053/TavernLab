@@ -501,6 +501,10 @@ Widget buildImageWidget(String uri,
         fit: fit,
         headers: serverHeaders(),
         gaplessPlayback: true,
+        cacheWidth: 512,
+        frameBuilder: (c, child, frame, wasSynchronouslyLoaded) => frame == null
+            ? Container(width: width, height: height, color: Colors.grey.shade300)
+            : child,
         errorBuilder: (c, e, s) => const Icon(Icons.broken_image));
   }
   return Image.file(File(uri),
@@ -508,6 +512,10 @@ Widget buildImageWidget(String uri,
       height: height,
       fit: fit,
       gaplessPlayback: true,
+      cacheWidth: 512,
+      frameBuilder: (c, child, frame, wasSynchronouslyLoaded) => frame == null
+          ? Container(width: width, height: height, color: Colors.grey.shade300)
+          : child,
       errorBuilder: (c, e, s) => const Icon(Icons.broken_image));
 }
 
@@ -895,9 +903,10 @@ void renderOutboxTurn(String id, String text, List<String> imgs) {
   if (text.isNotEmpty) {
     messages.insert(0, types.TextMessage(author: user, id: id, text: text));
   }
+  var imgIndex = 0;
   for (final u in imgs) {
     messages.insert(0, types.ImageMessage(
-        author: user, id: "$id-img", name: "image", size: 0, uri: u));
+        author: user, id: "$id-img-${imgIndex++}", name: "image", size: 0, uri: u));
   }
   pokeUI();
 }
@@ -2190,10 +2199,11 @@ class _MainAppState extends State<MainApp> with WidgetsBindingObserver {
                           },
                           child: SizedBox(
                               width: w,
+                              height: w,
                               child: ClipRRect(
                                   borderRadius: BorderRadius.circular(8),
                                   child: buildImageWidget(p0.uri,
-                                      width: w, fit: BoxFit.cover))),
+                                      width: w, height: w, fit: BoxFit.cover))),
                         );
                       },
                       listBottomWidget: () {
