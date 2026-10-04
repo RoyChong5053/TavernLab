@@ -26,11 +26,6 @@ const DefaultTimeout = 120 * time.Second
 type Client struct {
 	BaseURL string
 	HTTP    *http.Client
-	// WaitSeconds is sent as wait_seconds so rag-mcp-server blocks for a result
-	// instead of returning a pollable job. It is derived from the HTTP timeout
-	// minus a safety margin, keeping this synchronous, non-agent client on the
-	// direct-result path.
-	WaitSeconds int
 }
 
 // New builds a client with the default timeout.
@@ -42,14 +37,9 @@ func NewWithTimeout(baseURL string, timeout time.Duration) *Client {
 	if timeout <= 0 {
 		timeout = DefaultTimeout
 	}
-	wait := int(timeout.Seconds()) - 5
-	if wait < 1 {
-		wait = 1
-	}
 	return &Client{
-		BaseURL:     strings.TrimRight(baseURL, "/"),
-		HTTP:        &http.Client{Timeout: timeout},
-		WaitSeconds: wait,
+		BaseURL: strings.TrimRight(baseURL, "/"),
+		HTTP:    &http.Client{Timeout: timeout},
 	}
 }
 
@@ -130,14 +120,18 @@ func (c *Client) CallTool(ctx context.Context, name string, args map[string]any)
 }
 
 // Search calls search_memory. Empty collection = server default (global_memory).
+// collection may be a single id or a CSV list ("a,b"); multiple distinct ids are
+// sent as collection_ids so the server searches them in one call.
 // topK<=0 omits top_k (server default); threshold<0 omits threshold.
 func (c *Client) Search(ctx context.Context, query, collection string, topK int, threshold float64) ([]memory.Hit, error) {
 	if strings.TrimSpace(query) == "" {
 		return nil, fmt.Errorf("empty query")
 	}
 	args := map[string]any{"query": query}
-	if collection != "" {
-		args["collection_id"] = collection
+	if ids := splitCollectionCSV(collection); len(ids) > 1 {
+		args["collection_ids"] = ids
+	} else if len(ids) == 1 {
+		args["collection_id"] = ids[0]
 	}
 	if topK > 0 {
 		args["top_k"] = topK
@@ -145,40 +139,24 @@ func (c *Client) Search(ctx context.Context, query, collection string, topK int,
 	if threshold >= 0 {
 		args["threshold"] = threshold
 	}
-	// Keep this synchronous caller on the direct-result path: ask the server to
-	// wait up to (HTTP timeout - margin) instead of handing back a job at 10s.
-	if c.WaitSeconds > 0 {
-		args["wait_seconds"] = c.WaitSeconds
-	}
 	text, err := c.CallTool(ctx, "search_memory", args)
 	if err != nil {
 		return nil, err
 	}
-	if jobID, ok := pendingJobID(text); ok {
-		return nil, fmt.Errorf("rag-mcp-server returned a pending job %s (search exceeded wait_seconds); result not ready", jobID)
-	}
 	return splitResults(text), nil
 }
 
-// pendingJobID detects the {status:pending, job_id:...} payload rag-mcp-server
-// returns when a tool call exceeds wait_seconds. It must be caught before
-// splitResults, which would otherwise misread the JSON as a memory chunk.
-func pendingJobID(text string) (string, bool) {
-	t := strings.TrimSpace(text)
-	if !strings.HasPrefix(t, "{") {
-		return "", false
+// splitCollectionCSV turns "a, b, a" into ["a", "b"] (trim + dedupe).
+func splitCollectionCSV(s string) []string {
+	var ids []string
+	seen := map[string]bool{}
+	for _, part := range strings.Split(s, ",") {
+		if id := strings.TrimSpace(part); id != "" && !seen[id] {
+			seen[id] = true
+			ids = append(ids, id)
+		}
 	}
-	var p struct {
-		Status string `json:"status"`
-		JobID  string `json:"job_id"`
-	}
-	if err := json.Unmarshal([]byte(t), &p); err != nil {
-		return "", false
-	}
-	if p.Status == "pending" {
-		return p.JobID, true
-	}
-	return "", false
+	return ids
 }
 
 // splitResults chops the "--- Result N (score: X) ---" formatted text into hits.

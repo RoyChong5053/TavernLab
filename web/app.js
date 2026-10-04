@@ -1349,6 +1349,45 @@ $('#char-file').onchange = async (e) => {
 };
 
 /* ---------- memory (server-backed) ---------- */
+// The collection picker is a <select multiple>; settings keep one CSV string.
+// memCollectionWanted holds the ids that should be selected once the async
+// list from rag-mcp-server arrives (load and refresh can race).
+let memCollectionWanted = [];
+function applyCollectionSelection() {
+  const sel = $('#mem-collection');
+  if (!sel) return;
+  const want = new Set(memCollectionWanted);
+  for (const o of sel.options) o.selected = want.has(o.value);
+  // A stored id missing from the fetched list must stay visible/selected so
+  // a stale setting is never silently dropped (e.g. rag-mcp unreachable).
+  const missing = memCollectionWanted.filter((id) => ![...sel.options].some((o) => o.value === id));
+  for (const id of missing) {
+    const o = document.createElement('option');
+    o.value = id;
+    o.textContent = id + '（不在列表）';
+    o.selected = true;
+    sel.appendChild(o);
+  }
+}
+async function refreshCollections() {
+  try {
+    const list = await (await api('/api/mcp/collections')).json();
+    const sel = $('#mem-collection');
+    if (!Array.isArray(list) || !sel) return;
+    if (!memCollectionWanted.length) {
+      memCollectionWanted = Array.from(sel.selectedOptions).map((o) => o.value);
+    }
+    sel.innerHTML = list.map((c) => {
+      const tags = [];
+      if (!c.enabled) tags.push('disabled');
+      if (c.exists === false) tags.push('missing');
+      const label = `${c.name} · ${c.chunk_count ?? '?'} chunks${tags.length ? ' (' + tags.join(', ') + ')' : ''}`;
+      const disabled = (!c.enabled || c.exists === false) ? ' disabled' : '';
+      return `<option value="${c.name}"${disabled}>${label}</option>`;
+    }).join('');
+    applyCollectionSelection();
+  } catch { /* rag-mcp unreachable: keep whatever selection exists readable */ }
+}
 async function loadServerSettings() {
   try {
     const s = await (await api('/api/settings')).json();
@@ -1360,11 +1399,12 @@ async function loadServerSettings() {
     store.set('settings', settings);
     $('#set-key-state').textContent = s.api_key_set ? ('API Key 已设置 ' + (s.api_key_hint || '')) : 'API Key 未设置';
     $('#mem-url').value = s.mcp_url || '';
-    $('#mem-collection').value = s.mcp_collection || '';
+    memCollectionWanted = (s.mcp_collection || '').split(',').map((x) => x.trim()).filter(Boolean);
+    applyCollectionSelection();
     $('#mem-topk').value = s.mcp_topk ?? 10;
     $('#mem-budget').value = s.mcp_budget_tokens ?? 2000;
     $('#mem-perhit').value = s.mcp_per_hit_chars ?? 2000;
-    $('#mem-timeout').value = s.mcp_timeout ?? 120;
+    $('#mem-timeout').value = s.mcp_timeout ?? 180;
     $('#mem-threshold').value = s.mcp_threshold ?? -1;
     $('#mem-enabled').checked = !!s.mcp_enabled;
     if (s.current_char && s.current_char !== settings.char) { settings.char = s.current_char; store.set('settings', settings); }
@@ -1382,11 +1422,11 @@ async function saveMemory(silent) {
     method: 'PUT', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       mcp_url: $('#mem-url').value.trim(),
-      mcp_collection: $('#mem-collection').value.trim(),
+      mcp_collection: Array.from($('#mem-collection').selectedOptions).map((o) => o.value).join(','),
       mcp_topk: +$('#mem-topk').value || 10,
       mcp_budget_tokens: +$('#mem-budget').value || 2000,
       mcp_per_hit_chars: +$('#mem-perhit').value || 2000,
-      mcp_timeout: +$('#mem-timeout').value || 120,
+      mcp_timeout: +$('#mem-timeout').value || 180,
       mcp_threshold: +$('#mem-threshold').value,
       mcp_enabled: $('#mem-enabled').checked,
     }),
@@ -1653,6 +1693,7 @@ async function init() {
   fillSettingsForm();
   applyUiScale();
   await loadServerSettings();
+  refreshCollections();
   fillSettingsForm();
   applyUiScale();
   $('#chat-char-name').textContent = settings.char;

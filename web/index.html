@@ -134,18 +134,19 @@
       <h2>Memory <small>MCP-RAG 每轮自动检索你的发言注入 rag_mcp block</small></h2>
       <div class="glass pad form">
         <label>MCP 地址 <input id="mem-url" size="28" placeholder="http://192.168.10.2:8199"></label>
-        <label>Collection ID（空=服务端默认 global_memory） <input id="mem-collection" size="18" placeholder="空=默认"></label>
+        <label>Collection（可多选，空=服务端默认） <select id="mem-collection" multiple size="4"></select></label>
         <div class="row">
           <label>top-k（仅服务端hint，数量由rag-mcp-server定） <input id="mem-topk" type="number" value="10" style="width:56px"></label>
           <label>记忆预算 <input id="mem-budget" type="number" min="200" value="2000" style="width:80px"> tokens</label>
           <label>单条上限 <input id="mem-perhit" type="number" min="200" value="2000" style="width:80px"> chars</label>
         </div>
         <div class="row">
-          <label>timeout（秒） <input id="mem-timeout" type="number" min="1" value="120" style="width:64px"></label>
+          <label>timeout（秒） <input id="mem-timeout" type="number" min="1" value="180" style="width:64px"></label>
           <label>threshold（-1=服务端默认） <input id="mem-threshold" type="number" step="0.01" value="-1" style="width:64px"></label>
           <label><input type="checkbox" id="mem-enabled"> 每轮自动检索</label>
         </div>
         <p class="meta">TavernLab 不决定拿几条 docs，只按“记忆预算 tokens”裁剪；后端 chunk 约 500char，jina reranker 上限 1024 tokens，超长单条会被截断并在 Audit 标注。</p>
+        <p class="meta">多选说明：每个 collection 各召回 30 候选 → 合并一次 rerank → 输出仍是全局 top-k（不是 top-k×N）。主力机（qdrant + RTX4060）多选无压力；若 qdrant 主机关机、改由 CPU 设备 fan-out 算 vectra 库，请少选（1–2 个），过慢可到 rag-mcp WebUI 把 rerank 预设调成 20 docs/库。平时建议只选角色记忆库，知识库检索留到后续 <code>/full-rag</code> 开关。</p>
         <div class="row">
           <input id="mem-test-q" size="30" placeholder="测试查询，如：我上周睡眠咋样">
           <button id="btn-mem-test">测试检索</button>

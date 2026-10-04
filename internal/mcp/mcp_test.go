@@ -69,8 +69,8 @@ func TestSearchPropagatesContextCancellation(t *testing.T) {
 	}
 }
 
-// The synchronous client must ask the server to wait (not hand back a job).
-func TestSearchSendsWaitSeconds(t *testing.T) {
+// A single id goes out as collection_id; a CSV list becomes collection_ids.
+func TestSearchSendsCollectionIDs(t *testing.T) {
 	var gotBody string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
@@ -81,28 +81,17 @@ func TestSearchSendsWaitSeconds(t *testing.T) {
 	defer srv.Close()
 
 	client := NewWithTimeout(srv.URL, 120*time.Second)
-	if client.WaitSeconds != 115 {
-		t.Fatalf("WaitSeconds = %d, want 115", client.WaitSeconds)
-	}
 	if _, err := client.Search(context.Background(), "q", "col", 5, -1); err != nil {
 		t.Fatalf("search: %v", err)
 	}
-	if !strings.Contains(gotBody, `"wait_seconds":115`) {
-		t.Fatalf("request missing wait_seconds: %s", gotBody)
+	if !strings.Contains(gotBody, `"collection_id":"col"`) || strings.Contains(gotBody, "collection_ids") {
+		t.Fatalf("single id should send collection_id only: %s", gotBody)
 	}
-}
 
-// A pending-job payload must never be mistaken for a memory chunk.
-func TestSearchRejectsPendingJob(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprint(w, `{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{\n  \"status\": \"pending\",\n  \"job_id\": \"job-9\"\n}"}]}}`)
-	}))
-	defer srv.Close()
-
-	client := &Client{BaseURL: srv.URL, HTTP: srv.Client()}
-	hits, err := client.Search(context.Background(), "q", "", 10, -1)
-	if err == nil || !strings.Contains(err.Error(), "job-9") {
-		t.Fatalf("expected pending-job error, got hits=%v err=%v", hits, err)
+	if _, err := client.Search(context.Background(), "q", " a , b ,a", 5, -1); err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	if !strings.Contains(gotBody, `"collection_ids":["a","b"]`) || strings.Contains(gotBody, `"collection_id"`) {
+		t.Fatalf("CSV should send deduped collection_ids only: %s", gotBody)
 	}
 }

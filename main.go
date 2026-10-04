@@ -451,6 +451,31 @@ func main() {
 		}
 	})
 
+	// Collection list, proxied from rag-mcp-server (collection_info with an
+	// empty id returns every collection as JSON) so the settings UI can offer
+	// a picker instead of free-typing a case-sensitive id.
+	mux.HandleFunc("/api/mcp/collections", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", 405)
+			return
+		}
+		s := rt.get()
+		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+		defer cancel()
+		text, err := mcp.NewWithTimeout(firstNonEmpty(s.MCPURL, "http://192.168.10.2:8199"), 15*time.Second).
+			CallTool(ctx, "collection_info", map[string]any{"collection_id": ""})
+		if err != nil {
+			http.Error(w, "mcp collections error: "+err.Error(), 502)
+			return
+		}
+		if !json.Valid([]byte(text)) {
+			http.Error(w, "mcp collections returned non-json", 502)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(text))
+	})
+
 	// Model list, proxied through the backend so the browser never sees the key.
 	mux.HandleFunc("/api/models", func(w http.ResponseWriter, r *http.Request) {
 		s := rt.get()
@@ -2477,7 +2502,7 @@ func lastUserText(chat []engine.Message) string {
 func mcpTimeout(s settings.Settings) time.Duration {
 	seconds := s.MCPTimeout
 	if seconds <= 0 {
-		seconds = 120
+		seconds = 180
 	}
 	return time.Duration(seconds) * time.Second
 }

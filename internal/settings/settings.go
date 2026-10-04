@@ -85,7 +85,7 @@ func Defaults() Settings {
 		MCPCollection:        "",
 		MCPEnabled:           false,
 		MCPTopK:              10,
-		MCPTimeout:           120,
+		MCPTimeout:           180,
 		MCPThreshold:         -1,
 		MCPBudgetTokens:      2000,
 		MCPPerHitChars:       2000,
