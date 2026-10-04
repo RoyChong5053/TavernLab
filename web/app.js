@@ -469,6 +469,7 @@ document.querySelectorAll('.nav button').forEach((b) => {
     if (b.dataset.page === 'audit') refreshAudit();
     if (b.dataset.page === 'chars') refreshChars();
     if (b.dataset.page === 'logs') openLogs(); else stopLogStream();
+    if (b.dataset.page === 'gps') refreshGPS();
   };
 });
 $('#hamburger').onclick = () => document.body.classList.toggle('nav-open');
@@ -1174,6 +1175,47 @@ $('#log-level').onchange = async () => {
 $('#btn-log-copy').onclick = () => asyncAction($('#btn-log-copy'), async () => {
   await navigator.clipboard.writeText($('#log-view').innerText);
   toast('日志已复制');
+});
+
+
+/* ---------- GPS-Logger page ---------- */
+async function refreshGPS() {
+  await Promise.all([refreshGT20(), refreshReitti()]);
+}
+async function refreshGT20() {
+  try {
+    const loc = await (await api('/api/location')).json();
+    if (loc.ok) {
+      const p = loc.latest || {}, g = loc.geocode || {};
+      $('#gt20-render').textContent = '{{location}} → ' + (loc.render || '(空)') +
+        `\n坐标 ${p.lat}, ${p.lon} · acc ${p.acc || '?'}m · batt ${p.batt ?? '?'}% · provider ${p.provider || '?'}` +
+        `\nplace: ${g.place || '?'}  [${(g.hierarchy || []).join(' > ')}]`;
+    } else { $('#gt20-render').textContent = '暂无定位上报'; }
+    const pts = await (await api('/api/location/points?cap=50')).json();
+    const rows = (pts.points || []).slice(-20).map(p =>
+      `${new Date(p.tst*1000).toLocaleString()}  ${p.lat},${p.lon}  acc=${p.acc||'?'}  batt=${p.batt ?? '?'}  ${p.provider||''}`);
+    $('#gt20-points').textContent = rows.length ? rows.join('\n') : '无点位记录';
+    const jl = await (await api('/api/logs?limit=200')).json();
+    const lines = (jl.entries || []).filter(e => /location|geocode|paikka/i.test(e.msg))
+      .map(e => `[${(e.time||'').replace('T',' ').replace(/\+.*$/,'')}] ${e.level} ${e.msg} ${e.fields ? JSON.stringify(e.fields) : ''}`);
+    $('#gt20-log').textContent = lines.length ? lines.join('\n') : '无相关日志';
+    $('#gt20-state').textContent = '更新于 ' + new Date().toLocaleTimeString();
+  } catch (e) { $('#gt20-state').textContent = '加载失败: ' + e.message; }
+}
+async function refreshReitti() {
+  try {
+    const j = await (await api('/api/reitti/movements?limit=30')).json();
+    const rows = (j.movements || []).map(m =>
+      `### ${m.ts || ''}  (session: ${m.session || '?'}, since: ${m.since || 'default'})\n${m.text || ''}`);
+    $('#reitti-list').textContent = rows.length ? rows.join('\n\n') : '尚无落盘的 narrative（蒸馏触发时记录）';
+    $('#reitti-state').textContent = '更新于 ' + new Date().toLocaleTimeString();
+  } catch (e) { $('#reitti-state').textContent = '加载失败: ' + e.message; }
+}
+$('#btn-gt20-refresh').onclick = () => asyncAction($('#btn-gt20-refresh'), refreshGT20);
+$('#btn-reitti-refresh').onclick = () => asyncAction($('#btn-reitti-refresh'), refreshReitti);
+$('#btn-reitti-live').onclick = () => asyncAction($('#btn-reitti-live'), async () => {
+  const j = await (await api('/api/reitti/movement')).json();
+  $('#reitti-live-out').textContent = j.ok ? (j.text || '(空窗口)') : ('错误: ' + (j.error || 'unknown'));
 });
 
 /* ---------- chat avatar size (global, header + per-message) ---------- */

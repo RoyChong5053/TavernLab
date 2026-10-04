@@ -28,6 +28,7 @@
       <button data-page="blocks">🧱 Blocks</button>
       <button data-page="audit">🔍 Audit</button>
       <button data-page="memory">🧠 Memory</button>
+      <button data-page="gps">📍 GPS-Logger</button>
       <button data-page="logs">🪵 Logs</button>
       <button data-page="settings">⚙️ 设置</button>
     </nav>
@@ -195,6 +196,27 @@
         <span id="log-state" class="meta">—</span>
       </div>
       <pre id="log-view" class="glass audit">正在加载…</pre>
+    </section>
+    <!-- GPS-LOGGER -->
+    <section class="page" id="page-gps">
+      <h2>GPS-Logger <small>地理位置：GT20 兜底 + Reitti MCP</small></h2>
+      <div class="glass audit" style="margin-bottom:12px">
+        <b>① GT20 兜底（{{location}} · Termux 脚本 → Paikka，省电）</b>
+        <div class="row"><button id="btn-gt20-refresh">刷新</button><span id="gt20-state" class="meta">—</span></div>
+        <pre id="gt20-render" class="preview-text">加载中…</pre>
+        <pre id="gt20-points" class="preview-text"></pre>
+        <pre id="gt20-log" class="preview-text"></pre>
+      </div>
+      <div class="glass audit">
+        <b>② Reitti MCP（staypoint 轨迹 narrative）</b>
+        <div class="row">
+          <button id="btn-reitti-refresh">刷新历史</button>
+          <button id="btn-reitti-live">实时拉取</button>
+          <span id="reitti-state" class="meta">—</span>
+        </div>
+        <pre id="reitti-live-out" class="preview-text"></pre>
+        <pre id="reitti-list" class="preview-text">加载中…</pre>
+      </div>
     </section>
     <!-- SETTINGS -->
     <section class="page" id="page-settings">

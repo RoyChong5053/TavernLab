@@ -27,6 +27,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -1258,11 +1259,49 @@ func main() {
 				writeJSON(w, map[string]any{"ok": false})
 				return
 			}
-			g, _ := loadLocationGeocode(cfg.DataRoot)
-			writeJSON(w, map[string]any{"ok": true, "latest": p, "geocode": g})
+		g, _ := loadLocationGeocode(cfg.DataRoot)
+		writeJSON(w, map[string]any{"ok": true, "latest": p, "geocode": g, "render": renderLocationText(cfg.DataRoot, rt.get(), client, time.Now())})
 		default:
 			http.Error(w, "method not allowed", 405)
 		}
+	})
+
+	// GT20 live points: recent raw reports for the GPS-Logger page.
+	mux.HandleFunc("/api/location/points", func(w http.ResponseWriter, r *http.Request) {
+		days, _ := strconv.Atoi(r.URL.Query().Get("days"))
+		cap, _ := strconv.Atoi(r.URL.Query().Get("cap"))
+		if cap <= 0 || cap > 500 {
+			cap = 200
+		}
+		_ = days
+		writeJSON(w, map[string]any{"ok": true, "points": loadRecentPoints(cfg.DataRoot, cap)})
+	})
+
+	// Stored + live Reitti movement narratives.
+	mux.HandleFunc("/api/reitti/movements", func(w http.ResponseWriter, r *http.Request) {
+		limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+		if limit <= 0 {
+			limit = 50
+		}
+		writeJSON(w, map[string]any{"ok": true, "movements": loadReittiMovements(cfg.DataRoot, limit)})
+	})
+	mux.HandleFunc("/api/reitti/movement", func(w http.ResponseWriter, r *http.Request) {
+		s := rt.get()
+		if !s.ReittiEnabled || strings.TrimSpace(s.ReittiMCPURL) == "" {
+			writeJSON(w, map[string]any{"ok": false, "error": "reitti disabled"})
+			return
+		}
+		rc := reitti.New(s.ReittiMCPURL, s.ReittiTimezone, time.Duration(s.ReittiTimeoutSec)*time.Second)
+		since := r.URL.Query().Get("since")
+		hours, _ := strconv.Atoi(r.URL.Query().Get("hours"))
+		ctx, cancel := context.WithTimeout(r.Context(), time.Duration(s.ReittiTimeoutSec)*time.Second)
+		defer cancel()
+		text, err := rc.MovementWindow(ctx, since, hours)
+		if err != nil {
+			writeJSON(w, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		writeJSON(w, map[string]any{"ok": true, "text": text, "since": since, "hours": hours})
 	})
 
 	// Live events: GET /api/events?session=<char> (SSE). Foreground clients
@@ -2615,7 +2654,7 @@ var (
 // The window is anchored to meta.LastRun rather than a fixed "last 3h" so
 // consecutive extractions tile without a gap: 8 user turns can easily span more
 // than 3 hours, and a fixed window would silently drop the earlier movement.
-func fetchReittiMovement(ctx context.Context, s settings.Settings, meta distill.Meta) string {
+func fetchReittiMovement(ctx context.Context, s settings.Settings, root, session string, meta distill.Meta) string {
 	if !s.ReittiEnabled {
 		return ""
 	}
@@ -2642,7 +2681,49 @@ func fetchReittiMovement(ctx context.Context, s settings.Settings, meta distill.
 		return ""
 	}
 	obs.Info("reitti movement ok", map[string]any{"since": since, "bytes": len(text)})
+	saveReittiMovement(root, session, since, text)
 	return text
+}
+
+// saveReittiMovement appends one narrative to data/reitti/movement.jsonl so
+// the GPS-Logger page (and future RAG export) can read history without
+// re-calling the MCP server.
+func saveReittiMovement(root, session, since, text string) {
+	dir := filepath.Join(root, "reitti")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return
+	}
+	row := map[string]any{"ts": time.Now().Format(time.RFC3339), "session": session, "since": since, "text": text}
+	b, _ := json.Marshal(row)
+	f, err := os.OpenFile(filepath.Join(dir, "movement.jsonl"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return
+	}
+	fmt.Fprintln(f, string(b))
+	f.Close()
+}
+
+// loadReittiMovements returns up to limit newest rows, oldest-first.
+func loadReittiMovements(root string, limit int) []map[string]any {
+	b, err := os.ReadFile(filepath.Join(root, "reitti", "movement.jsonl"))
+	if err != nil {
+		return nil
+	}
+	var out []map[string]any
+	for _, ln := range strings.Split(string(b), "\n") {
+		ln = strings.TrimSpace(ln)
+		if ln == "" {
+			continue
+		}
+		var m map[string]any
+		if json.Unmarshal([]byte(ln), &m) == nil {
+			out = append(out, m)
+		}
+	}
+	if limit > 0 && len(out) > limit {
+		out = out[len(out)-limit:]
+	}
+	return out
 }
 
 // maybeDistill fires a background distillation once enough fresh user turns
@@ -2758,7 +2839,7 @@ func runDistill(ctx context.Context, st *store.Store, client *http.Client, root 
 	// Movement evidence from reitti-mcp. Strictly optional and fail-open: any
 	// failure, empty window, or disabled switch yields "" and the distillation
 	// runs exactly as it did before this feature existed.
-	movement := fetchReittiMovement(ctx, s, meta)
+	movement := fetchReittiMovement(ctx, s, root, session, meta)
 	promptTpl := s.DistillPrompt
 	if promptTpl == "" {
 		promptTpl = distill.DefaultPrompt
