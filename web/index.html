@@ -172,6 +172,8 @@
           <label>每天最多 <input id="dmem-perday" type="number" min="1" value="40" style="width:56px"> 条</label>
           <label>单条最多 <input id="dmem-entry" type="number" min="20" value="300" style="width:64px"> 字</label>
           <button id="btn-dmem-rebuild" title="从 chat.jsonl 里所有 distilled_memory 记录重建事实表（找回旧版被丢弃的天，不调用 LLM）">回填旧记录</button>
+          <label class="meta" title="每次蒸馏后把审计文件（raw+delta+movement）append 进召回同库。混库只许 append，禁 rebuild。"><input type="checkbox" id="dmem-vec-enabled"> 自动入库RAG</label>
+          <label title="空=跟随 Memory 的召回库">库 <input id="dmem-vec-collection" size="14" placeholder="空=跟随召回库"></label>
         </div>
         <textarea id="dmem-prompt" rows="6" placeholder="蒸馏提示词（留空用内置默认）"></textarea>
         <div class="row"><button id="btn-dmem-prompt-reset">恢复默认提示词</button><button id="btn-dmem-prompt-view">查看已保存事实表</button></div>

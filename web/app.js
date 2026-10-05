@@ -1474,12 +1474,14 @@ async function loadDistill() {
     $('#dmem-perday').value = j.max_log_per_day || 40;
     $('#dmem-entry').value = j.max_entry_chars || 300;
     $('#dmem-model').value = j.model || '';
+    $('#dmem-vec-enabled').checked = !!j.vectorize_enabled;
+    $('#dmem-vec-collection').value = (j.vectorize_collection || '') === '(server default)' ? '' : (j.vectorize_collection || '');
     // Open editable prompt: always show the effective template, not a blank box.
     $('#dmem-prompt').value = j.prompt || distillDefaultPrompt;
     $('#dmem-prompt').placeholder = '蒸馏提示词（可直接编辑；点“恢复默认提示词”重置）';
     const m = j.meta || {};
     const days = j.days || 0;
-    $('#dmem-meta').textContent = (m.runs ? `已运行 ${m.runs} 次 · 上次 ${(m.last_run || '').replace('T', ' ').replace(/\+.*$/, '')}` : '尚未蒸馏') + (days ? ` · ${days} 天日志` : '');
+    $('#dmem-meta').textContent = (m.runs ? `已运行 ${m.runs} 次 · 上次 ${(m.last_run || '').replace('T', ' ').replace(/\+.*$/, '')}` : '尚未蒸馏') + (days ? ` · ${days} 天日志` : '') + (m.last_vectorize ? ` · 入库 ${(m.last_vectorize || '').replace('T', ' ').replace(/\+.*$/, '')}${m.last_vectorize_error ? '⚠' : ''}` : '');
     $('#dmem-out').textContent = (j.sheet && j.sheet.trim()) ? j.sheet : '（还没有记录，攒够轮数或点“立即蒸馏”）';
   } catch (e) { toast('蒸馏信息加载失败：' + e.message, 'err'); }
 }
@@ -1496,12 +1498,14 @@ async function saveDistill(silent) {
       distill_max_entry_chars: +$('#dmem-entry').value || 300,
       distill_model: $('#dmem-model').value.trim(),
       distill_prompt: $('#dmem-prompt').value,
+      distill_vectorize_enabled: $('#dmem-vec-enabled').checked,
+      distill_vectorize_collection: $('#dmem-vec-collection').value.trim(),
     }),
   });
   if (!silent) toast('蒸馏设置已保存');
 }
 $('#btn-dmem-save').onclick = () => asyncAction($('#btn-dmem-save'), () => saveDistill(false));
-['dmem-enabled', 'dmem-interval', 'dmem-maxchars', 'dmem-retain', 'dmem-state-days', 'dmem-perday', 'dmem-entry', 'dmem-model', 'dmem-prompt'].forEach((id) => {
+['dmem-enabled', 'dmem-interval', 'dmem-maxchars', 'dmem-retain', 'dmem-state-days', 'dmem-perday', 'dmem-entry', 'dmem-model', 'dmem-prompt', 'dmem-vec-enabled', 'dmem-vec-collection'].forEach((id) => {
   const el = document.getElementById(id); if (el) el.addEventListener('change', () => saveDistill(true).catch((e) => toast('保存失败：' + e.message, 'err')));
 });
 $('#btn-dmem-run').onclick = () => asyncAction($('#btn-dmem-run'), async () => {

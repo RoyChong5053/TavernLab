@@ -58,6 +58,13 @@ type Settings struct {
 	// entries. Bounded on purpose: the extractor must never see the whole diary,
 	// or its output could grow with history. 0 = default (30).
 	DistillRecentLogs int `json:"distill_recent_logs,omitempty"`
+	// DistillVectorize appends each distillation's audit file
+	// (raw window + delta + movement, see internal/vectorize) to the recall
+	// collection via store_memory. Same-collection append-only: a rebuild
+	// would wipe distilled lines, so mixed collections must never reindex.
+	DistillVectorizeEnabled    bool   `json:"distill_vectorize_enabled"`
+	DistillVectorizeCollection string `json:"distill_vectorize_collection,omitempty"` // empty = follow MCPCollection
+	DistillTmpKeep             int    `json:"distill_tmp_keep,omitempty"`             // audit files kept per char (default 1000)
 	// Reitti is the OPTIONAL movement-evidence source for distillation
 	// (reitti-mcp on m64). Entirely independent of the GT20 gps-logger feed
 	// that backs {{location}}: when disabled or unreachable, distillation runs
@@ -104,6 +111,7 @@ func Defaults() Settings {
 		DistillMaxLogPerDay:  40,
 		DistillMaxEntryChars: 300,
 		DistillRecentLogs:    30,
+		DistillTmpKeep:       1000,
 		ChatModel:            "auto-chat",
 		ReittiEnabled:        false,
 		ReittiMCPURL:         "http://192.168.100.78:8200",
@@ -232,6 +240,13 @@ func Load(root string) Settings {
 	}
 	if f.DistillRecentLogs > 0 {
 		s.DistillRecentLogs = f.DistillRecentLogs
+	}
+	s.DistillVectorizeEnabled = f.DistillVectorizeEnabled
+	if f.DistillVectorizeCollection != "" || explicitEmpty(b, "distill_vectorize_collection") {
+		s.DistillVectorizeCollection = f.DistillVectorizeCollection
+	}
+	if f.DistillTmpKeep > 0 {
+		s.DistillTmpKeep = f.DistillTmpKeep
 	}
 	if f.ChatModel != "" {
 		s.ChatModel = f.ChatModel

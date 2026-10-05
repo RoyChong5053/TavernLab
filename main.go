@@ -42,6 +42,7 @@ import (
 	"github.com/RoyChong5053/TavernLab/internal/reitti"
 	"github.com/RoyChong5053/TavernLab/internal/settings"
 	"github.com/RoyChong5053/TavernLab/internal/store"
+	"github.com/RoyChong5053/TavernLab/internal/vectorize"
 )
 
 //go:embed web
@@ -221,6 +222,17 @@ func (r *runtimeSettings) update(root string, patch map[string]any) settings.Set
 		if f, ok := v.(float64); ok && f >= 0 {
 			r.cur.DistillRecentLogs = int(f)
 		}
+	}
+	if v, ok := patch["distill_vectorize_enabled"].(bool); ok {
+		r.cur.DistillVectorizeEnabled = v
+	}
+	if v, ok := patch["distill_vectorize_collection"]; ok {
+		if s, ok := v.(string); ok {
+			r.cur.DistillVectorizeCollection = strings.TrimSpace(s)
+		}
+	}
+	if v, ok := patch["distill_tmp_keep"].(float64); ok && v > 0 {
+		r.cur.DistillTmpKeep = int(v)
 	}
 	// Reitti (movement evidence for distillation). Independent switch: turning
 	// this off restores the exact pre-Reitti behaviour and does not touch the
@@ -420,8 +432,10 @@ func main() {
 				"distill_max_log_per_day": s.DistillMaxLogPerDay, "distill_max_entry_chars": s.DistillMaxEntryChars,
 				"distill_model":  s.DistillModel,
 				"distill_prompt": s.DistillPrompt, "distill_prompt_default": distill.DefaultPrompt,
-				"distill_recent_logs": s.DistillRecentLogs,
-				"chat_model":          s.ChatModel, "chat_model_default": "auto-chat",
+				"distill_recent_logs":          s.DistillRecentLogs,
+				"distill_vectorize_enabled":    s.DistillVectorizeEnabled,
+				"distill_vectorize_collection": s.DistillVectorizeCollection, "distill_tmp_keep": s.DistillTmpKeep,
+				"chat_model": s.ChatModel, "chat_model_default": "auto-chat",
 				"reitti_enabled": s.ReittiEnabled, "reitti_mcp_url": s.ReittiMCPURL,
 				"reitti_timezone": s.ReittiTimezone, "reitti_window_hours": s.ReittiWindowHours,
 				"reitti_timeout_sec": s.ReittiTimeoutSec,
@@ -532,6 +546,8 @@ func main() {
 			"max_entry_chars": s.DistillMaxEntryChars,
 			"model":           s.DistillModel,
 			"prompt":          prompt, "default_prompt": distill.DefaultPrompt,
+			"vectorize_enabled":    s.DistillVectorizeEnabled,
+			"vectorize_collection": firstNonEmpty(s.DistillVectorizeCollection, s.MCPCollection, "(server default)"),
 		})
 	})
 	mux.HandleFunc("/api/distilled/run", func(w http.ResponseWriter, r *http.Request) {
@@ -1284,8 +1300,8 @@ func main() {
 				writeJSON(w, map[string]any{"ok": false})
 				return
 			}
-		g, _ := loadLocationGeocode(cfg.DataRoot)
-		writeJSON(w, map[string]any{"ok": true, "latest": p, "geocode": g, "render": renderLocationText(cfg.DataRoot, rt.get(), client, time.Now())})
+			g, _ := loadLocationGeocode(cfg.DataRoot)
+			writeJSON(w, map[string]any{"ok": true, "latest": p, "geocode": g, "render": renderLocationText(cfg.DataRoot, rt.get(), client, time.Now())})
 		default:
 			http.Error(w, "method not allowed", 405)
 		}
@@ -1366,17 +1382,20 @@ func main() {
 		}
 	})
 
-	// Export timeline md (same shape as raw_chat_timeline_process.py output so it
-	// feeds the RAG pipeline directly): GET /api/export?session=<char>&user=RoyChong
+	// Unified export (feeds the RAG pipeline directly): GET /api/export?session=<char>&user=RoyChong
 	// &archives=1 also prepends every archived floor (full lifetime, for RAG).
+	// Same builder as the auto vectorize files: raw timeline + current
+	// distilled sheet + latest location, so the insurance file can rebuild the
+	// collection if distilled output ever corrupts it.
 	mux.HandleFunc("/api/export", func(w http.ResponseWriter, r *http.Request) {
 		session := store.CleanSession(firstNonEmpty(r.URL.Query().Get("session"), rt.get().CurrentChar))
 		userName := strings.TrimSpace(r.URL.Query().Get("user"))
 		if userName == "" {
 			userName = firstNonEmpty(rt.get().UserName, "user")
 		}
+		withArchives := r.URL.Query().Get("archives") == "1"
 		var all []store.ChatMessage
-		if r.URL.Query().Get("archives") == "1" {
+		if withArchives {
 			names, _ := st.ListArchives(session)
 			for i := len(names) - 1; i >= 0; i-- { // oldest floor first
 				if msgs, err := st.LoadArchive(session, names[i]); err == nil {
@@ -1390,7 +1409,10 @@ func main() {
 			return
 		}
 		all = append(all, cur...)
-		md := timelineMD(session, userName, all)
+		s := rt.get()
+		md := vectorize.BuildFull(session, userName, all,
+			distill.Load(cfg.DataRoot, session),
+			renderLocationText(cfg.DataRoot, s, locationHTTP, time.Now()), withArchives)
 		w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
 		w.Header().Set("Content-Disposition", "attachment; filename=\""+session+" (timeline).md\"")
 		_, _ = w.Write([]byte(md))
@@ -2905,8 +2927,12 @@ func runDistill(ctx context.Context, st *store.Store, client *http.Client, root 
 		})
 		if attempt == 2 {
 			if delta == "" {
+				p := writeDistillTmp(root, s, session, fresh, len(all)-len(fresh), len(all), "", "empty", movement, time.Now())
+				autoVectorize(root, s, session, p)
 				return "", fmt.Errorf("上游返回空增量")
 			}
+			p := writeDistillTmp(root, s, session, fresh, len(all)-len(fresh), len(all), delta, "parse-failed", movement, time.Now())
+			autoVectorize(root, s, session, p)
 			return "", fmt.Errorf("蒸馏输出无法解析（保留旧记录）")
 		}
 	}
@@ -2932,11 +2958,78 @@ func runDistill(ctx context.Context, st *store.Store, client *http.Client, root 
 	if msg, err := st.AppendChat(session, "distilled_memory", final); err == nil {
 		events.publish(session, msg)
 	}
+	// Auto vectorize: the audit file just written is read back verbatim and
+	// appended to the recall collection (same collection the chat reads).
+	// Thin client: failures only warn, the distillation itself already landed.
+	p := writeDistillTmp(root, s, session, fresh, len(all)-len(fresh), len(all), delta, "ok", movement, time.Now())
+	autoVectorize(root, s, session, p)
 	obs.Info("distill ok", map[string]any{
 		"session": session, "chars": len(final), "days": distill.DayCount(final),
 		"added": distill.DayCount(delta), "retain_days": retainDays, "runs": meta.Runs, "model": model,
 	})
 	return final, nil
+}
+
+// writeDistillTmp renders one auto vectorize file (raw window + delta +
+// movement/location) into distilled-tmp and prunes old files. It never
+// returns an error: failures only warn and the distillation itself is
+// unaffected. Returns the file path ("" when the write failed).
+func writeDistillTmp(root string, s settings.Settings, session string, msgs []store.ChatMessage, start, end int, delta, status, movement string, now time.Time) string {
+	loc := renderLocationText(root, s, locationHTTP, now)
+	content := vectorize.BuildIncremental(session, firstNonEmpty(s.UserName, "user"), msgs, start, end, delta, status, movement, loc, now)
+	keep := s.DistillTmpKeep
+	if keep <= 0 {
+		keep = 1000
+	}
+	p, err := vectorize.WriteTmp(root, session, vectorize.IncrementalName(now, start, end), content)
+	if err != nil {
+		obs.Warn("distill tmp write failed", map[string]any{"session": session, "error": err.Error()})
+		return ""
+	}
+	if err := vectorize.PruneTmp(root, session, keep); err != nil {
+		obs.Warn("distill tmp prune failed", map[string]any{"session": session, "error": err.Error()})
+	}
+	return p
+}
+
+// autoVectorize reads back the audit file (what you see is what gets indexed)
+// and appends it to the recall collection via store_memory. Empty path or
+// disabled switch skips silently; any failure only warns and is recorded in
+// the distill meta. Same-collection append-only: never reindex a mixed
+// collection, a rebuild would wipe distilled lines.
+func autoVectorize(root string, s settings.Settings, session, path string) {
+	if !s.DistillVectorizeEnabled || strings.TrimSpace(path) == "" {
+		return
+	}
+	stamp := func(ok bool, errMsg string) {
+		meta := distill.LoadMeta(root, session)
+		meta.LastVectorize = time.Now().Format(time.RFC3339)
+		if !ok {
+			meta.LastVectorizeErr = errMsg
+		} else {
+			meta.LastVectorizeErr = ""
+		}
+		_ = distill.SaveMeta(root, session, meta)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		obs.Warn("vectorize read failed", map[string]any{"session": session, "error": err.Error()})
+		stamp(false, err.Error())
+		return
+	}
+	timeout := mcpTimeout(s)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(context.Background()), timeout)
+	defer cancel()
+	col := firstNonEmpty(s.DistillVectorizeCollection, s.MCPCollection)
+	_, err = mcp.NewWithTimeout(firstNonEmpty(s.MCPURL, "http://192.168.10.2:8199"), timeout).
+		Store(ctx, string(b), col, map[string]string{"type": "distill-auto", "session": session})
+	if err != nil {
+		obs.Warn("vectorize store failed", map[string]any{"session": session, "error": err.Error()})
+		stamp(false, err.Error())
+		return
+	}
+	stamp(true, "")
+	obs.Info("vectorize ok", map[string]any{"session": session, "collection": col, "file": filepath.Base(path)})
 }
 
 func excerpt(s string, n int) string {

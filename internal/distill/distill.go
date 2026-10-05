@@ -75,11 +75,13 @@ Omit [STATE] if it did not change. Omit [LOG] if there is no new event.`
 
 // Meta is distillation bookkeeping for one character.
 type Meta struct {
-	LastRun    string `json:"last_run,omitempty"`
-	LastIndex  int    `json:"last_index"` // messages already distilled
-	UserTurns  int    `json:"user_turns"` // user turns since last run
-	Runs       int    `json:"runs"`
-	LastStatus string `json:"last_status,omitempty"`
+	LastRun          string `json:"last_run,omitempty"`
+	LastIndex        int    `json:"last_index"` // messages already distilled
+	UserTurns        int    `json:"user_turns"` // user turns since last run
+	Runs             int    `json:"runs"`
+	LastStatus       string `json:"last_status,omitempty"`
+	LastVectorize    string `json:"last_vectorize,omitempty"`
+	LastVectorizeErr string `json:"last_vectorize_error,omitempty"`
 }
 
 func dir(root, char string) string {

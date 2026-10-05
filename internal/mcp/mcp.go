@@ -146,6 +146,29 @@ func (c *Client) Search(ctx context.Context, query, collection string, topK int,
 	return splitResults(text), nil
 }
 
+// Store calls store_memory. Empty collection = server default (the caller
+// passes the recall collection so distilled lines share the vector space).
+// metadata may be nil. Thin client: the error is returned verbatim and the
+// caller decides (fail-open). Never retries or health-checks here; one-api
+// owns channel failover.
+func (c *Client) Store(ctx context.Context, text, collection string, metadata map[string]string) (string, error) {
+	if strings.TrimSpace(text) == "" {
+		return "", fmt.Errorf("empty text")
+	}
+	args := map[string]any{"text": text}
+	if id := strings.TrimSpace(collection); id != "" {
+		args["collection_id"] = id
+	}
+	if len(metadata) > 0 {
+		m := make(map[string]any, len(metadata))
+		for k, v := range metadata {
+			m[k] = v
+		}
+		args["metadata"] = m
+	}
+	return c.CallTool(ctx, "store_memory", args)
+}
+
 // splitCollectionCSV turns "a, b, a" into ["a", "b"] (trim + dedupe).
 func splitCollectionCSV(s string) []string {
 	var ids []string

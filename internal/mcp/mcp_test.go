@@ -95,3 +95,35 @@ func TestSearchSendsCollectionIDs(t *testing.T) {
 		t.Fatalf("CSV should send deduped collection_ids only: %s", gotBody)
 	}
 }
+
+func TestStoreSendsCollectionAndMetadata(t *testing.T) {
+	var gotBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"stored"}]}}`)
+	}))
+	defer srv.Close()
+
+	client := NewWithTimeout(srv.URL, 120*time.Second)
+	out, err := client.Store(context.Background(), "hello", "col", map[string]string{"type": "distill-auto"})
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	if !strings.Contains(out, "stored") {
+		t.Fatalf("expected stored text, got %q", out)
+	}
+	for _, want := range []string{`"store_memory"`, `"collection_id":"col"`, `"type":"distill-auto"`} {
+		if !strings.Contains(gotBody, want) {
+			t.Fatalf("missing %s in %s", want, gotBody)
+		}
+	}
+}
+
+func TestStoreRejectsEmptyText(t *testing.T) {
+	client := NewWithTimeout("http://127.0.0.1:0", time.Second)
+	if _, err := client.Store(context.Background(), "  ", "col", nil); err == nil {
+		t.Fatal("expected empty text error")
+	}
+}
