@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -171,6 +172,76 @@ func TestFindTurnReportsStoredReply(t *testing.T) {
 	}
 	if msgs[2].ID == "bad id/with slash" {
 		t.Fatal("unsanitised client id was stored verbatim")
+	}
+}
+
+func TestAppendChatIDCreatedReportsCreation(t *testing.T) {
+	root := t.TempDir()
+	st := store.New(root)
+	first, created, err := st.AppendChatIDCreated("阿离", "turn-x", "user", "hi")
+	if err != nil || !created {
+		t.Fatalf("first append: created=%v err=%v", created, err)
+	}
+	again, created, err := st.AppendChatIDCreated("阿离", "turn-x", "user", "hi")
+	if err != nil || created {
+		t.Fatalf("second append must not create: created=%v err=%v", created, err)
+	}
+	if again.ID != first.ID || again.Time != first.Time {
+		t.Fatalf("dedup returned a different row: %+v vs %+v", first, again)
+	}
+	if msgs, _ := st.LoadAll("阿离"); len(msgs) != 1 {
+		t.Fatalf("want 1 row, got %d", len(msgs))
+	}
+}
+
+func TestAssistantReplyID(t *testing.T) {
+	if got := assistantReplyID(""); got != "" {
+		t.Fatalf("empty key must map to empty, got %q", got)
+	}
+	const id = "0331909f-f2a7-45b2-a0d1-b178ff2bea07"
+	if got := assistantReplyID(id); got != id+"-r" {
+		t.Fatalf("bad reply id: %q", got)
+	}
+	// Too long to suffix within the store's 64-char id cap: fall back to random.
+	if got := assistantReplyID(strings.Repeat("a", 61)); got != "" {
+		t.Fatalf("overlong key must fall back, got %q", got)
+	}
+}
+
+// TestAssistantReplyAppendIdempotentOnRace models the reported double reply: a
+// retried phone turn races the original generation. Both may finish and append,
+// but the reply-side idempotency key must settle exactly one assistant row, and
+// FindTurn must still pair the user turn with that single reply.
+func TestAssistantReplyAppendIdempotentOnRace(t *testing.T) {
+	root := t.TempDir()
+	st := store.New(root)
+	const turn = "0331909f-f2a7-45b2-a0d1-b178ff2bea07"
+	if _, err := st.AppendChatID("Leer", turn, "user", "hi"); err != nil {
+		t.Fatal(err)
+	}
+	replyID := assistantReplyID(turn)
+	var wg sync.WaitGroup
+	for _, text := range []string{"reply A", "reply B"} {
+		wg.Add(1)
+		go func(t string) {
+			defer wg.Done()
+			_, _, _ = st.AppendChatIDCreated("Leer", replyID, "assistant", t)
+		}(text)
+	}
+	wg.Wait()
+
+	msgs, _ := st.LoadAll("Leer")
+	assistants := 0
+	for _, m := range msgs {
+		if m.Role == "assistant" {
+			assistants++
+		}
+	}
+	if assistants != 1 {
+		t.Fatalf("racing retry persisted %d assistant rows, want 1", assistants)
+	}
+	if _, _, hasRow, hasReply := st.FindTurn("Leer", turn); !hasRow || !hasReply {
+		t.Fatalf("FindTurn must pair the user turn with the single reply: row=%v reply=%v", hasRow, hasReply)
 	}
 }
 

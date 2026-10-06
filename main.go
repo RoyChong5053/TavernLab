@@ -1493,6 +1493,24 @@ func main() {
 		_ = json.Unmarshal(b, &in)
 		model := firstNonEmpty(in.Model, defaultChatModel(s))
 		session := store.CleanSession(firstNonEmpty(s.CurrentChar, "tavernlab"))
+		// Reply-side idempotency: derive a stable id from the phone's turn key so
+		// a retried turn that races the original generation persists exactly one
+		// assistant row. The second append is a no-op and returns the first row;
+		// we reuse its text and skip the duplicate SSE broadcast.
+		replyID := assistantReplyID(in.ClientMsgID)
+		saveReply := func(text string) string {
+			if strings.TrimSpace(text) == "" {
+				return text
+			}
+			msg, created, err := st.AppendChatIDCreated(session, replyID, "assistant", text)
+			if err != nil {
+				return text
+			}
+			if created {
+				events.publish(session, msg)
+			}
+			return msg.Text
+		}
 		// The app mirrors the server: only the newest user message matters;
 		// full context is slid server-side out of the character's JSONL.
 		var upImages []string
@@ -1601,10 +1619,7 @@ func main() {
 				_ = st.SaveAudit(a2note)
 				logTurn("app.request", status, model, session, res, strings.TrimSpace(reply), memInfo, usagePromptTokens(usage))
 				updateCalibration(cfg.DataRoot, fmt.Sprint(model), res.TotalTok, usagePromptTokens(usage))
-				if strings.TrimSpace(reply) != "" {
-					msg, _ := st.AppendChat(session, "assistant", reply)
-					events.publish(session, msg)
-				}
+				reply = saveReply(reply)
 				maybeDistill(st, client, cfg.DataRoot, s, session)
 				doneReason := replyFinish(respBody)
 				if status >= 400 {
@@ -1626,10 +1641,7 @@ func main() {
 			if status >= 400 {
 				obs.Warn("upstream error", map[string]any{"path": "/api/chat", "status": status, "body": excerpt(string(respBody), 300)})
 			}
-			if strings.TrimSpace(reply) != "" {
-				msg, _ := st.AppendChat(session, "assistant", reply)
-				events.publish(session, msg)
-			}
+			reply = saveReply(reply)
 			maybeDistill(st, client, cfg.DataRoot, s, session)
 			doneReason := replyFinish(respBody)
 			if status >= 400 {
@@ -1704,20 +1716,14 @@ func main() {
 			_ = st.SaveAudit(a2note)
 			logTurn("app.stream", status, model, session, res, strings.TrimSpace(full), memInfo, usagePromptTokens(usage))
 			updateCalibration(cfg.DataRoot, fmt.Sprint(model), res.TotalTok, usagePromptTokens(usage))
-			if strings.TrimSpace(full) != "" {
-				msg, _ := st.AppendChat(session, "assistant", full)
-				events.publish(session, msg)
-			}
+			full = saveReply(full)
 			maybeDistill(st, client, cfg.DataRoot, s, session)
 			return
 		}
 		_ = st.SaveAudit(toAudit(auditID, model, res, upBody, rebuilt, usage, memInfo))
 		logTurn("app.stream", status, model, session, res, strings.TrimSpace(full), memInfo, usagePromptTokens(usage))
 		updateCalibration(cfg.DataRoot, fmt.Sprint(model), res.TotalTok, usagePromptTokens(usage))
-		if strings.TrimSpace(full) != "" {
-			msg, _ := st.AppendChat(session, "assistant", full)
-			events.publish(session, msg)
-		}
+		full = saveReply(full)
 		maybeDistill(st, client, cfg.DataRoot, s, session)
 	})
 
@@ -3056,6 +3062,20 @@ func replyText(respBody []byte) string {
 		}
 	}
 	return ""
+}
+
+// assistantReplyID derives the reply-side idempotency key for a phone turn.
+// It is distinct from the user row's id so FindTurn (which matches the user id
+// and returns the following assistant row) keeps working, while a racing retry
+// appends under the same key and is deduplicated. Empty when the caller supplies
+// no usable key, which preserves the original random-id behaviour.
+func assistantReplyID(clientMsgID string) string {
+	id := strings.TrimSpace(clientMsgID)
+	// sanitizeMessageID caps ids at 64 chars; keep room for the "-r" suffix.
+	if id == "" || len(id) > 60 {
+		return ""
+	}
+	return id + "-r"
 }
 
 // rebuiltText extracts assistant text from the stream-rebuilt audit body.

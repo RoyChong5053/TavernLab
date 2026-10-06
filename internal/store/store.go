@@ -146,22 +146,32 @@ func (s *Store) AppendChat(session, role, text string, images ...string) (ChatMe
 // the tail window is also long since confirmed by the client's own poller, and
 // the scan stays cheap enough to run on every request.
 func (s *Store) AppendChatID(session, id, role, text string, images ...string) (ChatMessage, error) {
+	msg, _, err := s.AppendChatIDCreated(session, id, role, text, images...)
+	return msg, err
+}
+
+// AppendChatIDCreated is AppendChatID plus whether a new row was written.
+// created=false means a row with the same id already existed in the tail and is
+// returned unchanged. Callers use this to avoid re-broadcasting a reply that a
+// racing retry already persisted, so a duplicated client turn can never settle
+// as two replies. See main.go assistantReplyID for the reply-side key.
+func (s *Store) AppendChatIDCreated(session, id, role, text string, images ...string) (msg ChatMessage, created bool, err error) {
 	session = CleanSession(session)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	p := s.chatPath(session)
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-		return ChatMessage{}, err
+		return ChatMessage{}, false, err
 	}
 	if id = sanitizeMessageID(id); id != "" {
 		if existing, ok := s.tailHasID(session, id); ok {
-			return existing, nil
+			return existing, false, nil
 		}
 	} else {
 		id = NewID()
 	}
 
-	msg := ChatMessage{
+	msg = ChatMessage{
 		ID:     id,
 		Role:   role,
 		Text:   text,
@@ -170,14 +180,14 @@ func (s *Store) AppendChatID(session, id, role, text string, images ...string) (
 	}
 	f, err := os.OpenFile(p, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
-		return ChatMessage{}, err
+		return ChatMessage{}, false, err
 	}
 	defer f.Close()
 	b, _ := json.Marshal(msg)
 	if _, err := f.Write(append(b, '\n')); err != nil {
-		return ChatMessage{}, err
+		return ChatMessage{}, false, err
 	}
-	return msg, nil
+	return msg, true, nil
 }
 
 // chatTailWindow is how many trailing rows the idempotency scan considers.
