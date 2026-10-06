@@ -83,6 +83,37 @@ func TestDropTrailingAssistantMultipleAndEmpty(t *testing.T) {
 	}
 }
 
+func TestDeleteMessage(t *testing.T) {
+	s := New(t.TempDir())
+	writeChat(t, s, "test",
+		`{"id":"u1","role":"user","text":"hi","time":"t"}`,
+		`{"id":"a1","role":"assistant","text":"hello","time":"t"}`,
+		`{"id":"u2","role":"user","text":"again","time":"t"}`,
+	)
+	ok, err := s.DeleteMessage("test", "a1")
+	if err != nil || !ok {
+		t.Fatalf("delete a1: ok=%v err=%v", ok, err)
+	}
+	all, _ := s.LoadAll("test")
+	if len(all) != 2 || all[0].ID != "u1" || all[1].ID != "u2" {
+		t.Fatalf("after delete: %+v", all)
+	}
+	// Missing id and bad id shapes report false without touching the file.
+	if ok, err := s.DeleteMessage("test", "nope"); err != nil || ok {
+		t.Fatalf("missing id: ok=%v err=%v", ok, err)
+	}
+	if ok, err := s.DeleteMessage("test", "../x"); err != nil || ok {
+		t.Fatalf("bad id: ok=%v err=%v", ok, err)
+	}
+	if ok, err := s.DeleteMessage("missing", "u1"); err != nil || ok {
+		t.Fatalf("missing file: ok=%v err=%v", ok, err)
+	}
+	all, _ = s.LoadAll("test")
+	if len(all) != 2 {
+		t.Fatalf("file changed on no-op delete: %+v", all)
+	}
+}
+
 func TestDropTrailingAssistantNoUser(t *testing.T) {
 	s := New(t.TempDir())
 	if _, _, hasUser, err := s.DropTrailingAssistant("missing"); err != nil || hasUser {

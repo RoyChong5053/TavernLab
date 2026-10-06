@@ -246,15 +246,47 @@ function renderMath(el) {
 // highlighting is sync CPU work and re-running per chunk is what made long
 // replies stutter in the App (markdown_widgets.dart). Final render only.
 function highlightCode(el) {
-  if (!el || typeof window.hljs === 'undefined' || !window.hljs.highlightElement) return;
+  if (!el) return;
   try {
-    el.querySelectorAll('pre code').forEach((c) => {
-      if (c.dataset.hljs) return;
-      c.dataset.hljs = '1';
-      window.hljs.highlightElement(c);
-    });
+    if (typeof window.hljs !== 'undefined' && window.hljs.highlightElement) {
+      el.querySelectorAll('pre code').forEach((c) => {
+        if (c.dataset.hljs) return;
+        c.dataset.hljs = '1';
+        window.hljs.highlightElement(c);
+      });
+    }
   } catch (e) {
     console.warn('[TavernLab] hljs error:', e);
+  }
+  // Header row (language label + copy button) for every code block. Runs even
+  // when hljs is missing so copy always works; streaming frames skip this
+  // whole function by design (final render only).
+  try {
+    el.querySelectorAll('pre').forEach((pre) => {
+      if (pre.querySelector(':scope > .code-head')) return;
+      const code = pre.querySelector(':scope > code');
+      if (!code) return;
+      const head = document.createElement('div');
+      head.className = 'code-head';
+      const lang = document.createElement('span');
+      lang.textContent = pre.dataset.lang || 'code';
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'code-copy';
+      btn.textContent = '复制';
+      btn.title = '复制代码';
+      btn.onclick = (ev) => {
+        ev.stopPropagation();
+        copyText(code.innerText).then((ok) => {
+          btn.textContent = ok ? '已复制' : '失败';
+          setTimeout(() => { btn.textContent = '复制'; }, 1500);
+        });
+      };
+      head.append(lang, btn);
+      pre.prepend(head);
+    });
+  } catch (e) {
+    console.warn('[TavernLab] code-head error:', e);
   }
 }
 
@@ -276,6 +308,20 @@ function protectMoneyOutsideCode(text) {
 function renderRichBody(el, text, isUser) {
   el.dataset.raw = text || '';
   el.innerHTML = formatMessage(text, isUser, false);
+  // Tables need a scroll wrapper: styling overflow on the <table> itself would
+  // require display:block, which breaks table layout.
+  el.querySelectorAll('table').forEach((t) => {
+    if (t.parentElement && t.parentElement.classList.contains('table-wrap')) return;
+    const wrap = document.createElement('div');
+    wrap.className = 'table-wrap';
+    t.replaceWith(wrap);
+    wrap.appendChild(t);
+  });
+  // External links leave the chat: open in a new tab with opener protection.
+  el.querySelectorAll('a[href]').forEach((a) => {
+    const h = a.getAttribute('href') || '';
+    if (/^https?:/i.test(h)) { a.target = '_blank'; a.rel = 'noopener'; }
+  });
   renderMath(el);
   highlightCode(el);
   if (el.innerHTML.indexOf(MONEY_PH) >= 0) {
@@ -419,11 +465,88 @@ function applyUiScale() {
 function toast(msg, kind = 'ok', ms = 2600) {
   const w = document.getElementById('toast-wrap');
   if (!w) return;
+  // Cap stacking at 3 and dedupe identical messages (prevents toast floods).
+  const dup = [...w.children].find((x) => x.textContent === msg);
+  if (dup) dup.remove();
+  while (w.children.length >= 3) w.firstChild.remove();
   const d = document.createElement('div');
   d.className = 'toast ' + kind;
+  d.setAttribute('role', 'status');
   d.textContent = msg;
   w.appendChild(d);
   setTimeout(() => { d.style.opacity = '0'; d.style.transition = 'opacity .2s'; setTimeout(() => d.remove(), 220); }, ms);
+}
+// Clipboard with a non-secure-context fallback (plain http over LAN has no
+// navigator.clipboard). Returns true on success.
+async function copyText(t) {
+  try {
+    await navigator.clipboard.writeText(t);
+    return true;
+  } catch {
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = t;
+      ta.style.cssText = 'position:fixed;opacity:0;top:0;left:0';
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand('copy');
+      ta.remove();
+      return !!ok;
+    } catch { return false; }
+  }
+}
+// Styled confirm/prompt replacing native dialogs (themeable, Esc-aware).
+function uiConfirm(msg) {
+  return new Promise((resolve) => {
+    const ov = document.createElement('div');
+    ov.className = 'modal';
+    ov.setAttribute('role', 'dialog');
+    ov.setAttribute('aria-modal', 'true');
+    ov.innerHTML = '<div class="modal-box glass" style="max-width:420px">' +
+      '<div class="row" style="justify-content:space-between"><b>请确认</b></div>' +
+      '<p style="font-size:14px;margin:8px 0"></p>' +
+      '<div class="row" style="justify-content:flex-end"><button data-x="0">取消</button><button data-x="1" class="primary">确定</button></div></div>';
+    ov.querySelector('p').textContent = msg;
+    const onKey = (e) => { if (e.key === 'Escape') done(false); };
+    const done = (v) => { document.removeEventListener('keydown', onKey, true); ov.remove(); resolve(v); };
+    document.addEventListener('keydown', onKey, true);
+    ov.addEventListener('click', (e) => {
+      if (e.target === ov) done(false);
+      const b = e.target.closest ? e.target.closest('[data-x]') : null;
+      if (b) done(b.dataset.x === '1');
+    });
+    document.body.appendChild(ov);
+    const okBtn = ov.querySelector('[data-x="1"]');
+    if (okBtn) okBtn.focus();
+  });
+}
+function uiPrompt(title, placeholder) {
+  return new Promise((resolve) => {
+    const ov = document.createElement('div');
+    ov.className = 'modal';
+    ov.setAttribute('role', 'dialog');
+    ov.setAttribute('aria-modal', 'true');
+    ov.innerHTML = '<div class="modal-box glass" style="max-width:420px">' +
+      '<div class="row" style="justify-content:space-between"><b></b></div>' +
+      '<input style="width:100%;margin:8px 0" placeholder="">' +
+      '<div class="row" style="justify-content:flex-end"><button data-x="0">取消</button><button data-x="1" class="primary">确定</button></div></div>';
+    ov.querySelector('b').textContent = title;
+    const inp = ov.querySelector('input');
+    inp.placeholder = placeholder || '';
+    const onKey = (e) => {
+      if (e.key === 'Escape') done(null);
+      else if (e.key === 'Enter') done(inp.value.trim());
+    };
+    const done = (v) => { document.removeEventListener('keydown', onKey, true); ov.remove(); resolve(v); };
+    document.addEventListener('keydown', onKey, true);
+    ov.addEventListener('click', (e) => {
+      if (e.target === ov) done(null);
+      const b = e.target.closest ? e.target.closest('[data-x]') : null;
+      if (b) done(b.dataset.x === '1' ? inp.value.trim() : null);
+    });
+    document.body.appendChild(ov);
+    inp.focus();
+  });
 }
 async function asyncAction(btn, fn) {
   if (btn) { btn.disabled = true; btn.classList.add('loading'); }
@@ -466,13 +589,23 @@ document.querySelectorAll('.nav button').forEach((b) => {
     document.querySelectorAll('.page').forEach((p) => p.classList.remove('on'));
     document.getElementById('page-' + b.dataset.page).classList.add('on');
     document.body.classList.remove('nav-open');
+    syncHamburger();
     if (b.dataset.page === 'audit') refreshAudit();
     if (b.dataset.page === 'chars') refreshChars();
     if (b.dataset.page === 'logs') openLogs(); else stopLogStream();
     if (b.dataset.page === 'gps') refreshGPS();
   };
+  syncHamburger();
 });
-$('#hamburger').onclick = () => document.body.classList.toggle('nav-open');
+function syncHamburger() {
+  const open = document.body.classList.contains('nav-open');
+  const h = $('#hamburger');
+  if (h) h.setAttribute('aria-expanded', open ? 'true' : 'false');
+  const bd = $('#nav-backdrop');
+  if (bd) bd.classList.toggle('hidden', !open);
+}
+$('#hamburger').onclick = () => { document.body.classList.toggle('nav-open'); syncHamburger(); };
+{ const bd = $('#nav-backdrop'); if (bd) bd.onclick = () => { document.body.classList.remove('nav-open'); syncHamburger(); }; }
 
 /* ---------- health ---------- */
 fetch('/api/health').then((r) => r.json()).then((h) => {
@@ -564,9 +697,9 @@ function renderBlocks() {
     };
   });
   el.querySelectorAll('[data-del]').forEach((btn) => {
-    btn.onclick = () => {
+    btn.onclick = async () => {
       const id = btn.dataset.del;
-      if (!confirm(`删除 block「${id}」？`)) return;
+      if (!(await uiConfirm(`删除 block「${id}」？`))) return;
       blocks = blocks.filter((x) => x.id !== id);
       renderBlocks();
       scheduleBlockSave();
@@ -667,6 +800,17 @@ function scrollToBottom(box) {
   if (!box) return;
   box.scrollTop = box.scrollHeight;
 }
+// Unread pill: while the user is reading history, incoming messages bump a
+// counter on the floating back-to-bottom button instead of yanking scroll.
+let newMsgCount = 0;
+function setNewCount(n) {
+  newMsgCount = n;
+  const s = $('#btn-bottom-n');
+  if (s) {
+    s.textContent = n > 0 ? (n > 99 ? '99+' : String(n)) : '';
+    s.classList.toggle('hidden', !(n > 0));
+  }
+}
 document.addEventListener('DOMContentLoaded', () => {
   const box = chatBox();
   if (box) {
@@ -674,10 +818,43 @@ document.addEventListener('DOMContentLoaded', () => {
       userPinned = isNearBottom(box);
       const b = $('#btn-bottom');
       if (b) b.classList.toggle('hidden', userPinned);
+      if (userPinned) setNewCount(0);
     });
   }
   const bb = $('#btn-bottom');
-  if (bb) bb.onclick = () => { const b2 = chatBox(); if (b2) { scrollToBottom(b2); userPinned = true; bb.classList.add('hidden'); } };
+  if (bb) bb.onclick = () => { const b2 = chatBox(); if (b2) { scrollToBottom(b2); userPinned = true; bb.classList.add('hidden'); } setNewCount(0); };
+});
+// Image lightbox: tap any chat image for fullscreen, click/Esc to close.
+function openLightbox(src) {
+  const ov = $('#img-lightbox');
+  const im = $('#img-lightbox-img');
+  if (!ov || !im || !src) return;
+  im.src = src;
+  ov.classList.remove('hidden');
+}
+function closeLightbox() {
+  const ov = $('#img-lightbox');
+  if (ov) ov.classList.add('hidden');
+  const im = $('#img-lightbox-img');
+  if (im) im.removeAttribute('src');
+}
+document.addEventListener('click', (e) => {
+  const t = e.target;
+  if (t && t.id === 'img-lightbox') { closeLightbox(); return; }
+  if (t && t.closest && t.closest('.img-preview')) return; // composer draft, not a message
+  const img = t && t.closest ? t.closest('.msg-img, .msg .body img') : null;
+  if (img && img.src) openLightbox(img.src);
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') {
+    closeLightbox();
+    const pm = $('#preview-modal');
+    if (pm && !pm.classList.contains('hidden')) pm.classList.add('hidden');
+    if (document.body.classList.contains('nav-open')) {
+      document.body.classList.remove('nav-open');
+      syncHamburger();
+    }
+  }
 });
 function renderMsg(role, text, who, prepend, images, id, time, mood) {
   const d = document.createElement('div');
@@ -718,6 +895,36 @@ function renderMsg(role, text, who, prepend, images, id, time, mood) {
     tEl.textContent = tt;
     w.appendChild(tEl);
   }
+  // Per-message actions: copy raw source, regenerate (assistant), delete.
+  // Desktop reveals on hover, touch always shows (see .msg-actions CSS).
+  if (role === 'user' || role === 'assistant') {
+    const acts = document.createElement('div');
+    acts.className = 'msg-actions';
+    const btnCopy = document.createElement('button');
+    btnCopy.type = 'button';
+    btnCopy.textContent = '复制';
+    btnCopy.title = '复制原文';
+    btnCopy.onclick = () => {
+      copyText(text || '').then((ok) => toast(ok ? '已复制' : '复制失败', ok ? 'ok' : 'err'));
+    };
+    acts.appendChild(btnCopy);
+    if (role === 'assistant') {
+      const btnRe = document.createElement('button');
+      btnRe.type = 'button';
+      btnRe.textContent = '重发';
+      btnRe.title = '重新生成上一条（/regenerate）';
+      btnRe.onclick = () => { send(true); };
+      acts.appendChild(btnRe);
+    }
+    const btnDel = document.createElement('button');
+    btnDel.type = 'button';
+    btnDel.textContent = '删除';
+    btnDel.title = '删除这条消息';
+    btnDel.className = 'danger';
+    btnDel.onclick = () => deleteMsg(d, id);
+    acts.appendChild(btnDel);
+    w.appendChild(acts);
+  }
   const b = document.createElement('div');
   b.className = 'body';
   const isUser = role === 'user';
@@ -750,6 +957,20 @@ function renderMsg(role, text, who, prepend, images, id, time, mood) {
   return d;
 }
 function addMsg(role, text, who, images) { return renderMsg(role, text, who, false, images); }
+// Delete one bubble persistently (server rewrites chat.jsonl) or DOM-only for
+// local optimistic bubbles that carry no id yet.
+async function deleteMsg(node, id) {
+  if (!id) { node.remove(); return; }
+  if (!(await uiConfirm('删除这条消息？服务端同步删除，刷新后也不恢复。'))) return;
+  try {
+    const r = await api('/api/history?session=' + encodeURIComponent(settings.char) + '&id=' + encodeURIComponent(id), { method: 'DELETE' });
+    if (!r.ok) throw new Error('HTTP ' + r.status + ' ' + (await r.text()).slice(0, 120));
+    if (node.isConnected) node.remove();
+    seenMsgIds.delete(id);
+    historyShown = Math.max(0, historyShown - 1);
+    toast('已删除');
+  } catch (e) { toast('删除失败：' + (e.message || e), 'err', 4200); }
+}
 async function loadHistory() {
   historyShown = 0;
   seenMsgIds.clear();
@@ -759,23 +980,38 @@ async function loadHistory() {
   if (box) { scrollToBottom(box); userPinned = true; }
 }
 async function loadEarlier() {
-  const q = new URLSearchParams({ session: settings.char, limit: settings.visible_turns, before: historyShown });
-  const j = await (await api('/api/history?' + q)).json();
-  const msgs = j.messages || [];
-  if (!msgs.length) { $('#btn-earlier').textContent = '没有更早了'; return; }
-  const chat = $('#chat');
-  const cbox = chatBox();
-  // Anchor preservation: keep the first visible message stable.
-  const anchor = chat.firstChild;
-  const oldTop = anchor ? anchor.getBoundingClientRect().top : 0;
-  const oldScroll = cbox ? cbox.scrollTop : 0;
-  [...msgs].reverse().forEach((m) => renderMsg(m.role, m.text, null, true, m.images, m.id, m.time));
-  historyShown += msgs.length;
-  if (cbox && anchor) {
-    const newTop = anchor.getBoundingClientRect().top;
-    cbox.scrollTop = oldScroll + (newTop - oldTop);
+  if (loadEarlier.busy) return;
+  loadEarlier.busy = true;
+  const btn = $('#btn-earlier');
+  const oldLabel = btn ? btn.textContent : '';
+  if (btn) { btn.disabled = true; btn.textContent = '加载中…'; }
+  try {
+    const q = new URLSearchParams({ session: settings.char, limit: settings.visible_turns, before: historyShown });
+    const r = await api('/api/history?' + q);
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const j = await r.json();
+    const msgs = j.messages || [];
+    if (!msgs.length) { if (btn) btn.textContent = '没有更早了'; return; }
+    const chat = $('#chat');
+    const cbox = chatBox();
+    // Anchor preservation: keep the first visible message stable.
+    const anchor = chat.firstChild;
+    const oldTop = anchor ? anchor.getBoundingClientRect().top : 0;
+    const oldScroll = cbox ? cbox.scrollTop : 0;
+    [...msgs].reverse().forEach((m) => renderMsg(m.role, m.text, null, true, m.images, m.id, m.time));
+    historyShown += msgs.length;
+    if (cbox && anchor) {
+      const newTop = anchor.getBoundingClientRect().top;
+      cbox.scrollTop = oldScroll + (newTop - oldTop);
+    }
+    if (btn) btn.textContent = j.has_more ? '↑ 加载更早' : '没有更早了';
+  } catch (e) {
+    if (btn) btn.textContent = oldLabel || '↑ 加载更早（重试）';
+    toast('加载历史失败：' + (e.message || e), 'err', 4200);
+  } finally {
+    loadEarlier.busy = false;
+    if (btn) btn.disabled = false;
   }
-  $('#btn-earlier').textContent = j.has_more ? '↑ 加载更早' : '没有更早了';
 }
 $('#btn-earlier').onclick = loadEarlier;
 // Live updates from the server hub (other tabs / the app / background jobs).
@@ -817,6 +1053,8 @@ function subscribeChat() {
       return;
     }
     renderMsg(m.role, m.text, null, false, m.images, m.id, m.time);
+    // History readers stay put: bump the pill instead of scrolling.
+    if (!userPinned) setNewCount(newMsgCount + 1);
     if (m.role === 'assistant') assistantSseSeq++;
     if (m.role === 'assistant' && m.text) {
       const boxes = [...document.querySelectorAll('#chat .msg.ai')];
@@ -924,6 +1162,7 @@ async function send(regen = false) {
     addMsg('user', text || '(图片)', null, imgs);
   }
   ta.value = '';
+  growComposer();
   if (!regen) { pendingImages = []; renderImgPreview(); }
   setPending(true);
   userPinned = true;
@@ -946,6 +1185,17 @@ async function send(regen = false) {
       pendingAssistant = box;
       const belly = box.querySelector('.body');
       belly.classList.add('cursor');
+      // Throttled paint: DOM writes at most ~11fps so long streams don't
+      // stutter; the final rich render below still shows the full text.
+      let lastPaint = 0;
+      const paintStream = (force) => {
+        const now = performance.now();
+        if (!force && now - lastPaint < 90) return;
+        lastPaint = now;
+        belly.textContent = full;
+        belly.dataset.raw = full;
+        if (userPinned) { const cb = chatBox(); if (cb) scrollToBottom(cb); }
+      };
       for (;;) {
         const { done, value } = await reader.read();
         if (done) break;
@@ -963,10 +1213,11 @@ async function send(regen = false) {
             const fr = j.choices?.[0]?.finish_reason || '';
             if (fr) finishReason = fr;
             const delta = j.choices?.[0]?.delta?.content || '';
-            if (delta) { full += delta; belly.textContent = full; belly.dataset.raw = full; }
+            if (delta) { full += delta; paintStream(false); }
           } catch (err) { console.warn('sse parse', err, payload); }
         }
       }
+      paintStream(true);
       belly.classList.remove('cursor');
       // Stream complete: full rich render (markdown+LaTeX+hljs)
       if (full.trim()) {
@@ -1023,6 +1274,14 @@ async function send(regen = false) {
   }
 }
 $('#btn-send').onclick = () => asyncAction($('#btn-send'), send);
+// Composer auto-grow (max ~200px, then inner scroll). Reset after send.
+function growComposer() {
+  const ta = $('#input');
+  if (!ta) return;
+  ta.style.height = 'auto';
+  ta.style.height = Math.min(200, ta.scrollHeight) + 'px';
+}
+$('#input').addEventListener('input', growComposer);
 $('#input').addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); asyncAction($('#btn-send'), send); }
 });
@@ -1057,9 +1316,11 @@ $('#btn-preview-close').onclick = () => $('#preview-modal').classList.add('hidde
 $('#preview-modal').addEventListener('click', (e) => { if (e.target.id === 'preview-modal') e.target.classList.add('hidden'); });
 $('#btn-save-blocks').onclick = () => asyncAction($('#btn-save-blocks'), async () => { await saveBlocks(false); assemble(); });
 $('#btn-reload-blocks').onclick = () => asyncAction($('#btn-reload-blocks'), async () => { await loadBlocks(); toast('已重载'); });
-$('#btn-add-block').onclick = () => {
-  const id = (prompt('新 block 的名字（英文/数字，唯一）') || '').trim();
+$('#btn-add-block').onclick = async () => {
+  const raw = await uiPrompt('新 block 的名字（英文/数字/下划线，唯一）', 'my_block');
+  const id = (raw || '').trim();
   if (!id) return;
+  if (!/^[A-Za-z0-9_-]+$/.test(id)) { toast('名字只能用英文、数字、下划线、中划线', 'err'); return; }
   if (blocks.some((b) => b.id === id)) { toast('名字已存在', 'err'); return; }
   const maxOrder = blocks.reduce((m, b) => Math.max(m, b.order || 0), 0);
   blocks.push({
@@ -1080,7 +1341,7 @@ $('#btn-export-all').onclick = () => {
   window.open(withToken('/api/export?' + q), '_blank');
 };
 $('#btn-archive').onclick = async () => {
-  if (!confirm(`归档「${settings.char}」当前楼并另起新楼？归档进该角色数据包，聊天数据不会丢。`)) return;
+  if (!(await uiConfirm(`归档「${settings.char}」当前楼并另起新楼？归档进该角色数据包，聊天数据不会丢。`))) return;
   const j = await (await api('/api/archive', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ session: settings.char }),
@@ -1330,7 +1591,7 @@ $('#btn-char-save').onclick = async () => {
 $('#btn-char-delete').onclick = async () => {
   const name = $('#char-name').value.trim();
   if (!name) return;
-  if (!confirm(`删除角色「${name}」？默认保留聊天数据（只删角色卡与头像）。`)) return;
+  if (!(await uiConfirm(`删除角色「${name}」？默认保留聊天数据（只删角色卡与头像）。`))) return;
   await api('/api/characters/' + encodeURIComponent(name), { method: 'DELETE' });
   $('#char-editor').classList.add('hidden');
   refreshChars();
@@ -1523,7 +1784,7 @@ $('#btn-dmem-prompt-reset').onclick = () => {
 };
 $('#btn-dmem-prompt-view').onclick = () => loadDistill();
 $('#btn-dmem-rebuild').onclick = () => asyncAction($('#btn-dmem-rebuild'), async () => {
-  if (!confirm('从 chat.jsonl 的所有 distilled_memory 记录重建事实表？会先备份为 distilled.md.bak，不调用 LLM。')) return;
+  if (!(await uiConfirm('从 chat.jsonl 的所有 distilled_memory 记录重建事实表？会先备份为 distilled.md.bak，不调用 LLM。'))) return;
   const r = await api('/api/distilled/rebuild', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ session: settings.char }) });
   const j = await r.json();
   if (!j.ok) throw new Error(j.error || ('HTTP ' + r.status));

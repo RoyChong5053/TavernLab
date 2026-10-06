@@ -17,7 +17,8 @@
 <script src="vendor/highlight.min.js"></script>
 </head>
 <body>
-<button id="hamburger" aria-label="菜单">☰</button>
+<button id="hamburger" aria-label="菜单" aria-expanded="false">☰</button>
+<div id="nav-backdrop" class="nav-backdrop hidden" aria-hidden="true"></div>
 <div id="app">
 <div class="shell">
   <aside class="sidebar glass" id="sidebar">
@@ -52,11 +53,11 @@
       <div class="glass chat-box">
         <div class="row" style="justify-content:center"><button id="btn-earlier" class="meta">↑ 加载更早</button></div>
         <div id="chat"></div>
-        <button id="btn-bottom" class="meta hidden" title="回到最新">↓ 回到底部</button>
+        <button id="btn-bottom" class="meta hidden" title="回到最新">↓ 回到底部 <span id="btn-bottom-n" class="newcount hidden"></span></button>
       </div>
       <div class="composer glass">
-        <button id="btn-attach" class="icon-btn" title="上传图片">＋</button>
-        <input type="file" id="img-file" accept="image/*" multiple hidden>
+        <button id="btn-attach" class="icon-btn" title="上传图片（仅单图）">＋</button>
+        <input type="file" id="img-file" accept="image/*" hidden>
         <div class="composer-main">
           <div id="img-preview" class="img-preview hidden"></div>
           <textarea id="input" rows="2" placeholder="输入消息…（Enter发送 / Shift+Enter换行；/regenerate 重新生成上一条）"></textarea>
@@ -288,7 +289,10 @@
   </main>
 </div>
 </div>
-<div id="toast-wrap"></div>
+<div id="img-lightbox" class="modal img-lightbox hidden" role="dialog" aria-modal="true" aria-label="图片预览">
+  <img id="img-lightbox-img" alt="图片预览">
+</div>
+<div id="toast-wrap" aria-live="polite"></div>
 <div id="login-overlay" class="login-overlay hidden">
   <form id="login-form" class="login-card glass" autocomplete="on">
     <div class="login-brand"><img src="/icon.png" alt="" class="brand-logo"> TavernLab <span class="sub">IDE</span></div>

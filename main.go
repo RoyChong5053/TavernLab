@@ -1248,6 +1248,33 @@ func main() {
 	// `before` = messages already shown (for "load earlier").
 	mux.HandleFunc("/api/history", func(w http.ResponseWriter, r *http.Request) {
 		session := store.CleanSession(firstNonEmpty(r.URL.Query().Get("session"), rt.get().CurrentChar))
+		// DELETE /api/history?session=<char>&id=<msgId>: remove one bubble
+		// persistently (chat.jsonl rewrite, temp+rename). Powers the per-message
+		// delete button in the WebUI; local-only bubbles have no id and are
+		// removed DOM-side without calling this.
+		if r.Method == http.MethodDelete {
+			id := strings.TrimSpace(r.URL.Query().Get("id"))
+			if id == "" {
+				http.Error(w, "missing id", 400)
+				return
+			}
+			ok, err := st.DeleteMessage(session, id)
+			if err != nil {
+				http.Error(w, "delete failed", 500)
+				return
+			}
+			if !ok {
+				http.Error(w, "message not found", 404)
+				return
+			}
+			obs.Info("chat delete", map[string]any{"session": session, "id": id})
+			writeJSON(w, map[string]any{"ok": true, "id": id})
+			return
+		}
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", 405)
+			return
+		}
 		limit := atoiDefault(r.URL.Query().Get("limit"), 10)
 		before := atoiDefault(r.URL.Query().Get("before"), 0)
 		msgs, total, err := st.Tail(session, limit, before)

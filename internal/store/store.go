@@ -362,6 +362,69 @@ func (s *Store) DropTrailingAssistant(session string) (lastUser ChatMessage, rem
 	return lastUser, removed, hasUser, nil
 }
 
+// DeleteMessage removes the single row with id from the session and
+// atomically rewrites chat.jsonl (temp+rename, same crash-safety as
+// DropTrailingAssistant). Reports whether a row was actually removed.
+// Only rows carrying a stable ID can be deleted; local-only optimistic
+// bubbles have no ID and are simply never sent here.
+func (s *Store) DeleteMessage(session, id string) (bool, error) {
+	session = CleanSession(session)
+	if sanitizeMessageID(id) == "" {
+		return false, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p := s.chatPath(session)
+	all, err := loadJSONL(p)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	kept := all[:0]
+	removed := false
+	for _, m := range all {
+		if !removed && m.ID == id {
+			removed = true
+			continue
+		}
+		kept = append(kept, m)
+	}
+	if !removed {
+		return false, nil
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(p), ".chat-*.tmp")
+	if err != nil {
+		return false, err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	w := bufio.NewWriter(tmp)
+	for i := range kept {
+		b, _ := json.Marshal(kept[i])
+		if _, werr := w.Write(append(b, '\n')); werr != nil {
+			_ = tmp.Close()
+			return false, werr
+		}
+	}
+	if ferr := w.Flush(); ferr != nil {
+		_ = tmp.Close()
+		return false, ferr
+	}
+	if serr := tmp.Sync(); serr != nil {
+		_ = tmp.Close()
+		return false, serr
+	}
+	if cerr := tmp.Close(); cerr != nil {
+		return false, cerr
+	}
+	if rerr := os.Rename(tmpName, p); rerr != nil {
+		return false, rerr
+	}
+	return true, nil
+}
+
 // SaveMedia writes an image under the character package media/ dir and
 // returns its package-relative path ("media/<id>.<ext>").
 func (s *Store) SaveMedia(session, ext string, data []byte) (string, error) {
