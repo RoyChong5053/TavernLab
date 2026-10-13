@@ -19,7 +19,7 @@ const settings = Object.assign(
     context_window: 16384, reply_reserve: 4096, history_min_turns: 4,
     rerank_url: 'http://127.0.0.1:11437', char: 'Leer乐儿', model: '',
     stream: false, visible_turns: 10, user_name: 'RoyChong', avatar_px: 88,
-    ui_scale: 100, theme: 'st-dark', theme_custom: {},
+    ui_scale: 100, theme: 'st-dark', theme_custom: {}, nav_collapsed: false,
   },
   store.get('settings', {}),
 );
@@ -606,6 +606,25 @@ function syncHamburger() {
 }
 $('#hamburger').onclick = () => { document.body.classList.toggle('nav-open'); syncHamburger(); };
 { const bd = $('#nav-backdrop'); if (bd) bd.onclick = () => { document.body.classList.remove('nav-open'); syncHamburger(); }; }
+/* ---------- collapsible sidebar (desktop icon rail; state persists locally) ---------- */
+function applyNavCollapsed() {
+  const c = !!settings.nav_collapsed;
+  document.body.classList.toggle('nav-collapsed', c);
+  const b = $('#btn-nav-collapse');
+  if (b) {
+    b.title = c ? '展开侧栏' : '收起侧栏';
+    b.setAttribute('aria-label', b.title);
+    b.setAttribute('aria-expanded', c ? 'false' : 'true');
+  }
+}
+{
+  const b = $('#btn-nav-collapse');
+  if (b) b.onclick = () => {
+    settings.nav_collapsed = !settings.nav_collapsed;
+    store.set('settings', settings);
+    applyNavCollapsed();
+  };
+}
 
 /* ---------- health ---------- */
 fetch('/api/health').then((r) => r.json()).then((h) => {
@@ -2167,8 +2186,10 @@ if (_loginForm) _loginForm.addEventListener('submit', (e) => { e.preventDefault(
 if ($('#btn-logout')) $('#btn-logout').onclick = doLogout;
 async function init() {
   applyTheme(); // before auth gate so the login screen already wears it
+  applyNavCollapsed();
   if (!(await bootAuth())) return; // gate: stop booting until logged in
   applyTheme();
+  applyNavCollapsed();
   fillSettingsForm();
   applyUiScale();
   await loadServerSettings();

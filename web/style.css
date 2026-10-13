@@ -1,9 +1,9 @@
-:root{--bg:#0b0e14;--bg2:#111827;--glass:rgba(255,255,255,.07);--card:rgba(255,255,255,.05);--line:rgba(255,255,255,.12);--txt:#e8ecf3;--mut:#9aa4b2;--acc:#7dd3fc;--acc2:#a78bfa;--avatar-px:88px;--msg-font:15px}
+:root{--bg:#0b0e14;--bg2:#111827;--glass:rgba(255,255,255,.07);--card:rgba(255,255,255,.05);--line:rgba(255,255,255,.12);--txt:#e8ecf3;--mut:#9aa4b2;--acc:#7dd3fc;--acc2:#a78bfa;--avatar-px:88px;--msg-font:15px;--glass-hi:rgba(255,255,255,.07);--radius:14px;--sidebar-w:200px}
 .hidden{display:none!important}
-/* ST 暗灰（默认）：哑光平色，无渐变无模糊，对标 SillyTavern 截图质感 */
-body[data-theme="st-dark"]{--bg:#23262d;--bg2:#23262d;--glass:#2e3138;--card:#2e3138;--line:rgba(255,255,255,.07);--txt:#e6e8eb;--mut:#8b909c;--acc:#7dd3fc;--acc2:#a78bfa;background:var(--bg)}
-body[data-theme="st-dark"] .glass{background:var(--card);backdrop-filter:none;-webkit-backdrop-filter:none;border:1px solid var(--line);border-radius:10px}
-body[data-theme="st-dark"] .msg{box-shadow:0 1px 2px rgba(0,0,0,.3)}
+/* ST 暗灰（默认）：中性灰底 + 克制玻璃（哑光半透明、发丝边、内高光），不放蓝渐变 */
+body[data-theme="st-dark"]{--bg:#23262d;--bg2:#23262d;--glass:rgba(255,255,255,.045);--card:rgba(255,255,255,.04);--line:rgba(255,255,255,.09);--txt:#e6e8eb;--mut:#8b909c;--acc:#7dd3fc;--acc2:#a78bfa;--glass-hi:rgba(255,255,255,.06);background:radial-gradient(1100px 700px at 78% -12%,rgba(255,255,255,.04),transparent 62%),var(--bg)}
+body[data-theme="st-dark"] .glass{background:linear-gradient(180deg,rgba(255,255,255,.055),rgba(255,255,255,.026));backdrop-filter:blur(14px) saturate(1.2);-webkit-backdrop-filter:blur(14px) saturate(1.2);border:1px solid var(--line);border-radius:var(--radius);box-shadow:inset 0 1px 0 var(--glass-hi),0 1px 2px rgba(0,0,0,.3)}
+body[data-theme="st-dark"] .msg{box-shadow:inset 0 1px 0 rgba(255,255,255,.035),0 1px 2px rgba(0,0,0,.3)}
 body[data-theme="st-dark"] .msg .body code{background:#1a1c22;border:1px solid rgba(255,255,255,.06)}
 /* 旧版玻璃（保留）：沿用 :root 默认值 */
 body[data-theme="tavern-glass"]{background:radial-gradient(1200px 600px at 20% -10%,#1e293b,transparent),linear-gradient(180deg,var(--bg),var(--bg2))}
@@ -25,21 +25,34 @@ body[data-theme="paper"] .code-head .code-copy:hover{background:rgba(0,0,0,.08);
 *{box-sizing:border-box}
 html,body{height:100%}
 body{margin:0;background:radial-gradient(1200px 600px at 20% -10%,#1e293b,transparent),linear-gradient(180deg,var(--bg),var(--bg2));color:var(--txt);font:14px/1.6 system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;overflow:hidden;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
+/* 颗粒噪点：全屏 SVG feTurbulence overlay，克制不喧哗；pointer-events:none 不挡交互 */
+body::before{content:'';position:fixed;inset:0;z-index:9998;pointer-events:none;opacity:.04;mix-blend-mode:soft-light;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='180' height='180'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");background-size:180px 180px}
+body.no-noise::before{display:none}
 ::-webkit-scrollbar{width:10px;height:10px}::-webkit-scrollbar-thumb{background:rgba(255,255,255,.16);border-radius:8px;border:2px solid transparent;background-clip:content-box}::-webkit-scrollbar-track{background:transparent}
-.glass{background:var(--glass);backdrop-filter:blur(18px) saturate(1.4);-webkit-backdrop-filter:blur(18px) saturate(1.4);border:1px solid var(--line);border-radius:16px}
+.glass{background:var(--glass);backdrop-filter:blur(16px) saturate(1.35);-webkit-backdrop-filter:blur(16px) saturate(1.35);border:1px solid var(--line);border-radius:var(--radius);box-shadow:inset 0 1px 0 var(--glass-hi),0 1px 2px rgba(0,0,0,.25)}
 #hamburger{display:none;position:fixed;top:10px;left:10px;z-index:50}
 .nav-backdrop{position:fixed;inset:0;z-index:39;background:rgba(0,0,0,.5)}
 .nav-backdrop.hidden{display:none}
 .shell{display:flex;gap:10px;padding:10px;height:100vh;height:100dvh}
 #app{width:100%;height:100%}
 #app .shell{height:100%}
-.sidebar{width:200px;flex:none;display:flex;flex-direction:column;padding:14px;gap:10px}
-.brand{font-weight:700;display:flex;align-items:center;gap:8px}.brand .sub{color:var(--mut);font-weight:400;font-size:12px}
-.brand-logo{width:22px;height:22px;border-radius:6px;display:block}
+.sidebar{width:var(--sidebar-w);flex:none;display:flex;flex-direction:column;padding:14px;gap:10px;transition:width .18s ease,padding .18s ease}
+.brand{font-weight:700;display:flex;align-items:center;gap:8px;white-space:nowrap;overflow:hidden}
+.brand .sub{color:var(--mut);font-weight:400;font-size:12px}
+.brand-logo{width:22px;height:22px;border-radius:6px;display:block;flex:none}
 .nav{display:flex;flex-direction:column;gap:6px}
-.nav button{text-align:left;padding:9px 12px;font-size:14px}
+.nav button{display:flex;align-items:center;gap:10px;text-align:left;padding:9px 12px;font-size:14px;white-space:nowrap;overflow:hidden}
 .nav button.on{background:var(--acc);color:#06222e;border:none;font-weight:700}
+.ni{width:20px;height:20px;flex:none;fill:none;stroke:currentColor;stroke-width:1.75;stroke-linecap:round;stroke-linejoin:round}
+.nav-toggle{display:flex;align-items:center;gap:10px;justify-content:flex-start;font-size:13px;color:var(--mut);padding:8px 12px}
+.nav-toggle .ni{transition:transform .18s ease}
 .side-foot{margin-top:auto;display:flex;flex-direction:column;gap:4px}
+/* 收起态：图标轨道（仅桌面；移动端抽屉在 @media 里还原） */
+body.nav-collapsed .sidebar{width:56px;padding:10px 8px}
+body.nav-collapsed .brand{justify-content:center}
+body.nav-collapsed .brand-name,body.nav-collapsed .brand .sub,body.nav-collapsed .nav-label,body.nav-collapsed .side-foot{display:none}
+body.nav-collapsed .nav button,body.nav-collapsed .nav-toggle{justify-content:center;padding:9px 0}
+body.nav-collapsed .nav-toggle .ni{transform:rotate(180deg)}
 .health{font-size:12px;color:var(--mut)}.health.ok{color:#86efac}
 .hint{font-size:11px;color:var(--mut)}
 .content{flex:1;min-width:0;overflow:auto;padding:2px}
@@ -219,6 +232,14 @@ body[data-theme="tavern-glass"] .msg.user{background:linear-gradient(180deg,rgba
   .shell{padding:8px}
   .sidebar{position:fixed;z-index:40;top:0;left:0;bottom:0;border-radius:0;transform:translateX(-110%);transition:.2s;background:rgba(11,14,20,.96)}
   body.nav-open .sidebar{transform:none}
+  /* 移动端抽屉忽略桌面收起态：始终完整显示 */
+  body.nav-collapsed .sidebar{width:var(--sidebar-w);padding:14px}
+  body.nav-collapsed .brand-name{display:inline}
+  body.nav-collapsed .brand .sub{display:inline}
+  body.nav-collapsed .nav-label{display:inline}
+  body.nav-collapsed .side-foot{display:flex}
+  body.nav-collapsed .nav button{justify-content:flex-start;padding:9px 12px}
+  .nav-toggle{display:none}
   .content{width:100%}
   .chat-head{margin-top:52px;flex-wrap:nowrap;padding:8px 10px}
   .chat-head .avatar{width:48px;height:48px;border-radius:12px}

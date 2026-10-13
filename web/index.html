@@ -17,27 +17,41 @@
 <script src="vendor/highlight.min.js"></script>
 </head>
 <body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+  <defs>
+    <symbol id="i-chat" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></symbol>
+    <symbol id="i-char" viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M20 21a8 8 0 0 0-16 0"/></symbol>
+    <symbol id="i-blocks" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></symbol>
+    <symbol id="i-audit" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></symbol>
+    <symbol id="i-memory" viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="8" ry="2.8"/><path d="M4 5v14c0 1.55 3.58 2.8 8 2.8s8-1.25 8-2.8V5"/><path d="M4 12c0 1.55 3.58 2.8 8 2.8s8-1.25 8-2.8"/></symbol>
+    <symbol id="i-gps" viewBox="0 0 24 24"><path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0"/><circle cx="12" cy="10" r="2.6"/></symbol>
+    <symbol id="i-logs" viewBox="0 0 24 24"><path d="M15 12h-5"/><path d="M15 8h-5"/><path d="M19 17V5a2 2 0 0 0-2-2H4"/><path d="M8 21h12a2 2 0 0 0 2-2v-1a1 1 0 0 0-1-1H11a1 1 0 0 0-1 1v1a2 2 0 1 1-4 0V5a2 2 0 1 0-4 0v2a1 1 0 0 0 1 1h3"/></symbol>
+    <symbol id="i-settings" viewBox="0 0 24 24"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></symbol>
+    <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m15 18-6-6 6-6"/></symbol>
+  </defs>
+</svg>
 <button id="hamburger" aria-label="菜单" aria-expanded="false">☰</button>
 <div id="nav-backdrop" class="nav-backdrop hidden" aria-hidden="true"></div>
 <div id="app">
 <div class="shell">
   <aside class="sidebar glass" id="sidebar">
-    <div class="brand"><img src="/icon.png" alt="" class="brand-logo"> TavernLab <span class="sub">IDE</span></div>
+    <div class="brand"><img src="/icon.png" alt="" class="brand-logo"> <span class="brand-name">TavernLab</span> <span class="sub">IDE</span></div>
     <nav class="nav">
-      <button data-page="chat" class="on">💬 聊天</button>
-      <button data-page="chars">👤 角色</button>
-      <button data-page="blocks">🧱 Blocks</button>
-      <button data-page="audit">🔍 Audit</button>
-      <button data-page="memory">🧠 Memory</button>
-      <button data-page="gps">📍 GPS-Logger</button>
-      <button data-page="logs">🪵 Logs</button>
-      <button data-page="settings">⚙️ 设置</button>
+      <button data-page="chat" class="on" title="聊天" aria-label="聊天"><svg class="ni" aria-hidden="true"><use href="#i-chat"/></svg><span class="nav-label">聊天</span></button>
+      <button data-page="chars" title="角色" aria-label="角色"><svg class="ni" aria-hidden="true"><use href="#i-char"/></svg><span class="nav-label">角色</span></button>
+      <button data-page="blocks" title="Blocks" aria-label="Blocks"><svg class="ni" aria-hidden="true"><use href="#i-blocks"/></svg><span class="nav-label">Blocks</span></button>
+      <button data-page="audit" title="Audit" aria-label="Audit"><svg class="ni" aria-hidden="true"><use href="#i-audit"/></svg><span class="nav-label">Audit</span></button>
+      <button data-page="memory" title="Memory" aria-label="Memory"><svg class="ni" aria-hidden="true"><use href="#i-memory"/></svg><span class="nav-label">Memory</span></button>
+      <button data-page="gps" title="GPS-Logger" aria-label="GPS-Logger"><svg class="ni" aria-hidden="true"><use href="#i-gps"/></svg><span class="nav-label">GPS-Logger</span></button>
+      <button data-page="logs" title="Logs" aria-label="Logs"><svg class="ni" aria-hidden="true"><use href="#i-logs"/></svg><span class="nav-label">Logs</span></button>
+      <button data-page="settings" title="设置" aria-label="设置"><svg class="ni" aria-hidden="true"><use href="#i-settings"/></svg><span class="nav-label">设置</span></button>
     </nav>
     <div class="side-foot">
       <div id="health" class="health">…</div>
       <div class="hint">Go thin core · data/可rclone</div>
       <button id="btn-logout" class="meta hidden" title="退出登录">退出登录</button>
     </div>
+    <button id="btn-nav-collapse" class="nav-toggle" type="button" aria-label="收起侧栏" title="收起侧栏"><svg class="ni" aria-hidden="true"><use href="#i-chevron"/></svg><span class="nav-label">收起</span></button>
   </aside>
   <main class="content">
     <div id="model-banner" class="model-banner hidden"></div>
