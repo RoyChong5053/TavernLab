@@ -119,9 +119,10 @@ push_to_phone() {
   local short
   short=$(tr -s '[:space:]' ' ' <<<"$txt" | cut -c1-140)
   # body 走 stdin，避免引号/换行转义地狱；tl-push 从 stdin 读正文。
+  # 注意用手机侧绝对路径：ssh 非交互会话的 PATH 没有 ~/bin。
   if printf %s "$short" | timeout "$SSH_TIMEOUT" ssh -o BatchMode=yes \
       -o ConnectTimeout="$SSH_TIMEOUT" -p "$PORT" "$PHONE" \
-      "tl-push '$id' '${TL_TITLE:-TavernLab}'" 2>>"$LOG"; then
+      "/data/data/com.termux/files/home/bin/tl-push '$id' '${TL_TITLE:-TavernLab}'" 2>>"$LOG"; then
     log "PUSH id=$id len=${#txt} head=${short:0:60}"
   else
     # 手机离线/Tailscale断：last_id 已推进，下次只推更新的（高水位语义，
