@@ -1571,14 +1571,12 @@ async function selectChar(name) {
   syncChatHead();
   loadHistory();
   subscribeChat();
-  loadDistill();
-  loadCharCollection();
+  loadMemoryProfile();
 }
 function openEditor(name, isNew) {
   editingNew = !!isNew;
   $('#char-editor').classList.remove('hidden');
   $('#char-editor-title').textContent = isNew ? '新建角色' : '编辑角色';
-  const collEl = $('#char-collection');
   if (isNew) {
     $('#char-name').value = '';
     $('#char-desc').value = '';
@@ -1586,17 +1584,12 @@ function openEditor(name, isNew) {
     $('#char-expr').textContent = '';
     $('#char-name').readOnly = false;
     $('#btn-char-delete').style.display = 'none';
-    if (collEl) collEl.value = '';
   } else {
     api('/api/characters/' + encodeURIComponent(name)).then((r) => r.json()).then((j) => {
       $('#char-name').value = j.name || name;
       $('#char-desc').value = j.description || '';
       $('#char-avatar').src = imgURL(j.avatar_url) || EMPTY_AVATAR;
       $('#char-expr').textContent = (j.expressions || []).length ? '表情：' + j.expressions.join(', ') : '';
-      if (collEl) {
-        collEl.value = j.mcp_collection || '';
-        collEl.placeholder = '留空=跟随全局；生效：' + (j.effective_mcp_collection || '(server default)');
-      }
     });
     $('#char-name').readOnly = true;
     $('#btn-char-delete').style.display = 'inline-block';
@@ -1627,19 +1620,11 @@ $('#btn-char-save').onclick = async () => {
       body: JSON.stringify({ description: desc }),
     });
   }
-  // Per-character RAG binding (empty clears the override -> follow global).
-  const collEl = $('#char-collection');
-  if (collEl) {
-    await api('/api/characters/' + encodeURIComponent(name) + '/meta', {
-      method: 'PUT', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ mcp_collection: collEl.value.trim() }),
-    });
-  }
   $('#char-editor').classList.add('hidden');
   refreshChars();
   // A brand-new character should become the active one so the user lands on it.
   if (editingNew) selectChar($('#char-name').value.trim());
-  else if (name === settings.char) { syncChatHead(); loadCharCollection(); }
+  else if (name === settings.char) { syncChatHead(); loadMemoryProfile(); }
 };
 $('#btn-char-delete').onclick = async () => {
   const name = $('#char-name').value.trim();
@@ -1666,13 +1651,32 @@ $('#char-file').onchange = async (e) => {
   e.target.value = '';
 };
 
-/* ---------- memory (server-backed) ---------- */
-// The collection picker is a list of checkbox rows (the native multiple
-// select needs ctrl on desktop and is unusable on touch); settings keep one
-// CSV string. memCollectionWanted holds the ids that should be ticked once
-// the async list from rag-mcp-server arrives (load and refresh can race).
-let memCollectionWanted = [];
-function collectionRow({ name, meta, checked, disabled }) {
+/* ---------- memory: per-character profile ---------- */
+// Every character owns a profile (characters/<name>/profile.json): the set of
+// collections it RECALLS from (multi-select) and the SINGLE collection the
+// distiller WRITES into. Switching characters switches the whole setup, so this
+// page always shows the ACTIVE character's values — never a hidden global.
+let distillDefaultPrompt = '';
+let memAvailable = null; // cached /api/mcp/collections
+
+async function ensureCollections() {
+  if (memAvailable) return memAvailable;
+  try {
+    const list = await (await api('/api/mcp/collections')).json();
+    memAvailable = Array.isArray(list) ? list : [];
+  } catch { memAvailable = []; }
+  return memAvailable;
+}
+
+function collLabel(c) {
+  const notes = [];
+  if (!c.enabled) notes.push('disabled');
+  if (c.exists === false) notes.push('missing');
+  const chunks = Number.isFinite(c.chunk_count) ? c.chunk_count.toLocaleString() : '?';
+  return `${chunks} chunks${notes.length ? ' · ' + notes.join(', ') : ''}`;
+}
+
+function collectionRow({ name, meta, checked, disabled, group }) {
   const row = document.createElement('label');
   row.className = 'coll-item' + (disabled ? ' off' : '');
   const text = document.createElement('span');
@@ -1689,54 +1693,171 @@ function collectionRow({ name, meta, checked, disabled }) {
   box.value = name;
   box.checked = !!checked;
   box.disabled = !!disabled;
+  if (group) box.dataset.group = group;
   row.append(text, box);
   return row;
 }
-function selectedCollections() {
-  const wrap = $('#mem-collection');
+
+function renderRecall(list, want) {
+  const wrap = $('#mem-recall');
+  if (!wrap) return;
+  wrap.innerHTML = '';
+  const available = [];
+  for (const c of (list || [])) {
+    available.push(c.name);
+    wrap.appendChild(collectionRow({
+      name: c.name, meta: collLabel(c), group: 'recall',
+      checked: want.includes(c.name), disabled: !c.enabled || c.exists === false,
+    }));
+  }
+  // A stored id the server did not return stays visible and ticked so a stale
+  // selection is never silently dropped (e.g. rag-mcp unreachable).
+  for (const id of want) {
+    if (!available.includes(id)) {
+      wrap.appendChild(collectionRow({ name: id, meta: 'not returned by the server', group: 'recall', checked: true }));
+    }
+  }
+}
+
+function renderWrite(list, value) {
+  const sel = $('#mem-write');
+  if (!sel) return;
+  const names = (list || []).map((c) => c.name);
+  if (value && !names.includes(value)) names.unshift(value);
+  sel.innerHTML = '<option value="">（不写入）</option>' + names.map((n) => `<option value="${esc(n)}">${esc(n)}</option>`).join('');
+  sel.value = value || '';
+}
+
+function renderSections(sections) {
+  const wrap = $('#mem-sections');
+  if (!wrap) return;
+  wrap.textContent = '';
+  if (!sections || !sections.length) {
+    const s = document.createElement('span');
+    s.className = 'meta';
+    s.textContent = '还没有记忆，先聊几轮或按 Distill now。';
+    wrap.appendChild(s);
+    return;
+  }
+  for (const sec of sections) {
+    const box = document.createElement('div');
+    box.className = 'mem-section';
+    const head = document.createElement('div');
+    head.className = 'mem-section-head';
+    const t = document.createElement('b');
+    t.textContent = sec.tag;
+    const c = document.createElement('span');
+    c.className = 'meta';
+    c.textContent = (sec.entries || []).length + ' 条';
+    head.append(t, c);
+    box.appendChild(head);
+    const body = document.createElement('div');
+    body.className = 'mem-section-body';
+    for (const e of (sec.entries || [])) {
+      const line = document.createElement('div');
+      line.className = 'mem-line';
+      const when = document.createElement('span');
+      when.className = 'mem-when';
+      when.textContent = e.time ? `${e.date} ${e.time}` : e.date;
+      const txt = document.createElement('span');
+      txt.className = 'mem-text';
+      txt.textContent = e.text;
+      line.append(when, txt);
+      body.appendChild(line);
+    }
+    box.appendChild(body);
+    wrap.appendChild(box);
+  }
+}
+
+async function loadMemoryProfile() {
+  const char = settings.char;
+  const title = $('#mem-char-title');
+  if (title) title.textContent = '当前角色档案：' + char;
+  try {
+    const [prof, dist] = await Promise.all([
+      (await api('/api/characters/' + encodeURIComponent(char))).json(),
+      (await api('/api/distilled?session=' + encodeURIComponent(char))).json(),
+    ]);
+    const list = await ensureCollections();
+    const recall = prof.recall_collections || [];
+    const write = prof.write_collection || '';
+    renderRecall(list, recall);
+    renderWrite(list, write);
+    const badges = $('#mem-char-badges');
+    if (badges) {
+      badges.textContent = '';
+      const b = (txt, cls) => {
+        const s = document.createElement('span');
+        s.className = 'membadge ' + (cls || '');
+        s.textContent = txt;
+        badges.appendChild(s);
+      };
+      b('召回 ' + (recall.length ? '[' + recall.join(', ') + ']' : '（不召回）'), recall.length ? 'on' : 'off');
+      b('写入 ' + (write || '（不写入）'), write ? 'on' : 'off');
+      if (prof.profile_source === 'migrated') b('已从旧全局迁移', 'warn');
+    }
+    const warn = $('#mem-char-warn');
+    if (warn) {
+      if (prof.profile_source === 'migrated') {
+        warn.classList.remove('hidden');
+        warn.textContent = '这个角色还没有自己的档案，当前值是从旧的全局设置迁移来的；保存一次即可固化。';
+      } else { warn.classList.add('hidden'); }
+    }
+    if ($('#mem-distill-enabled')) $('#mem-distill-enabled').checked = !!dist.enabled;
+    if ($('#mem-distill-interval')) $('#mem-distill-interval').value = dist.interval || 8;
+    if ($('#mem-distill-prompt')) {
+      $('#mem-distill-prompt').value = (dist.prompt && dist.prompt !== dist.default_prompt) ? dist.prompt : '';
+    }
+    distillDefaultPrompt = dist.default_prompt || '';
+    if ($('#mem-distill-meta')) {
+      const state = dist.enabled
+        ? (dist.need_turns > 0 ? `还需约 ${dist.need_turns} 个用户轮触发自动蒸馏` : '已就绪')
+        : '自动蒸馏已关闭';
+      $('#mem-distill-meta').textContent = state + ` · ${dist.days || 0} 天记录`;
+    }
+    if ($('#mem-maxchars')) $('#mem-maxchars').value = dist.max_chars || 5000;
+    if ($('#dmem-vec-enabled')) $('#dmem-vec-enabled').checked = !!dist.vectorize_enabled;
+    renderSections(dist.sections || []);
+  } catch (e) { toast('加载角色档案失败：' + e.message, 'err'); }
+}
+
+function selectedRecall() {
+  const wrap = $('#mem-recall');
   if (!wrap) return [];
   return Array.from(wrap.querySelectorAll('input[type=checkbox]:checked')).map((b) => b.value);
 }
-function applyCollectionSelection() {
-  const wrap = $('#mem-collection');
-  if (!wrap) return;
-  const want = new Set(memCollectionWanted);
-  const seen = new Set();
-  for (const box of wrap.querySelectorAll('input[type=checkbox]')) {
-    box.checked = want.has(box.value);
-    seen.add(box.value);
-  }
-  // A stored id missing from the fetched list must stay visible and ticked so
-  // a stale setting is never silently dropped (e.g. rag-mcp unreachable).
-  for (const id of memCollectionWanted) {
-    if (seen.has(id)) continue;
-    wrap.appendChild(collectionRow({ name: id, meta: 'not returned by the server', checked: true }));
-    seen.add(id);
-  }
+
+async function saveMemoryGlobal() {
+  const r = await api('/api/settings', {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      mcp_url: $('#mem-url').value.trim(),
+      mcp_timeout: +$('#mem-timeout').value || 180,
+      mcp_enabled: $('#mem-enabled').checked,
+      distill_vectorize_enabled: $('#dmem-vec-enabled') ? $('#dmem-vec-enabled').checked : false,
+      distill_max_chars: $('#mem-maxchars') ? (+$('#mem-maxchars').value || 0) : 0,
+    }),
+  });
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  toast('全局连接设置已保存');
 }
-async function refreshCollections() {
-  try {
-    const list = await (await api('/api/mcp/collections')).json();
-    const wrap = $('#mem-collection');
-    if (!Array.isArray(list) || !wrap) return;
-    if (!memCollectionWanted.length) {
-      memCollectionWanted = selectedCollections();
-    }
-    wrap.innerHTML = '';
-    for (const c of list) {
-      const notes = [];
-      if (!c.enabled) notes.push('disabled');
-      if (c.exists === false) notes.push('missing');
-      const chunks = Number.isFinite(c.chunk_count) ? c.chunk_count.toLocaleString() : '?';
-      wrap.appendChild(collectionRow({
-        name: c.name,
-        meta: `${chunks} chunks${notes.length ? ' · ' + notes.join(', ') : ''}`,
-        checked: memCollectionWanted.includes(c.name),
-        disabled: !c.enabled || c.exists === false,
-      }));
-    }
-    applyCollectionSelection();
-  } catch { /* rag-mcp unreachable: keep whatever selection exists readable */ }
+
+async function saveMemoryProfile() {
+  const body = {
+    collections: selectedRecall(),
+    write_collection: $('#mem-write') ? $('#mem-write').value : '',
+    enabled: $('#mem-distill-enabled') ? $('#mem-distill-enabled').checked : true,
+    interval: $('#mem-distill-interval') ? (+$('#mem-distill-interval').value || 8) : 8,
+    prompt: $('#mem-distill-prompt') ? $('#mem-distill-prompt').value : '',
+  };
+  const r = await api('/api/characters/' + encodeURIComponent(settings.char) + '/profile', {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  });
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  if ($('#mem-profile-saved')) $('#mem-profile-saved').textContent = '已保存 ' + new Date().toLocaleTimeString();
+  toast(`已保存「${settings.char}」的记忆档案`);
+  await loadMemoryProfile();
 }
 async function loadServerSettings() {
   try {
@@ -1749,8 +1870,6 @@ async function loadServerSettings() {
     store.set('settings', settings);
     $('#set-key-state').textContent = s.api_key_set ? ('API Key 已设置 ' + (s.api_key_hint || '')) : 'API Key 未设置';
     $('#mem-url').value = s.mcp_url || '';
-    memCollectionWanted = (s.mcp_collection || '').split(',').map((x) => x.trim()).filter(Boolean);
-    applyCollectionSelection();
     $('#mem-timeout').value = s.mcp_timeout ?? 180;
     $('#mem-enabled').checked = !!s.mcp_enabled;
     if (s.current_char && s.current_char !== settings.char) { settings.char = s.current_char; store.set('settings', settings); }
@@ -1763,66 +1882,30 @@ async function loadServerSettings() {
     return s;
   } catch { return null; }
 }
-async function saveMemory(silent) {
-  const r = await api('/api/settings', {
-    method: 'PUT', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      mcp_url: $('#mem-url').value.trim(),
-      mcp_collection: selectedCollections().join(','),
-      mcp_timeout: +$('#mem-timeout').value || 180,
-      mcp_enabled: $('#mem-enabled').checked,
-    }),
-  });
-  $('#mem-test-out').textContent = 'Saved. With “Retrieve every turn” enabled, the next message injects this memory verbatim.';
-  if (!silent) toast('Memory settings saved');
-}
-$('#btn-mem-save').onclick = () => asyncAction($('#btn-mem-save'), () => saveMemory(false));
-['mem-url', 'mem-collection', 'mem-timeout', 'mem-enabled'].forEach((id) => {
-  const el = document.getElementById(id); if (el) el.addEventListener('change', () => saveMemory(true).catch((e) => toast('Failed to save memory settings: ' + e.message, 'err')));
+$('#btn-mem-save') && ($('#btn-mem-save').onclick = () => asyncAction($('#btn-mem-save'), () => saveMemoryGlobal()));
+$('#btn-mem-profile-save') && ($('#btn-mem-profile-save').onclick = () => asyncAction($('#btn-mem-profile-save'), () => saveMemoryProfile()));
+$('#btn-mem-prompt-default') && ($('#btn-mem-prompt-default').onclick = () => {
+  if ($('#mem-distill-prompt')) $('#mem-distill-prompt').value = distillDefaultPrompt;
 });
-
-/* ---------- per-character RAG binding ---------- */
-// Each character may point recall + auto-index at its own collection. The
-// binding lives in that character's meta.json, so switching characters
-// switches the library with no extra step; empty follows the global setting.
-async function loadCharCollection() {
-  const info = $('#mem-char-info');
-  const inp = $('#mem-char-collection');
-  if (!inp) return;
-  try {
-    const j = await (await api('/api/characters/' + encodeURIComponent(settings.char))).json();
-    inp.value = j.mcp_collection || '';
-    if (info) {
-      const src = j.mcp_collection ? '角色专用' : '跟随全局';
-      info.textContent = `当前角色「${settings.char}」生效 collection：${j.effective_mcp_collection || '(server default)'}（${src}）`;
-    }
-  } catch {
-    if (info) info.textContent = `当前角色「${settings.char}」`;
-  }
-}
-async function saveCharCollection(value) {
-  await api('/api/characters/' + encodeURIComponent(settings.char) + '/meta', {
-    method: 'PUT', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ mcp_collection: value }),
-  });
-  await loadCharCollection();
-}
-const btnMemCharSave = $('#btn-mem-char-save');
-if (btnMemCharSave) btnMemCharSave.onclick = () => asyncAction(btnMemCharSave, async () => {
-  const v = $('#mem-char-collection').value.trim();
-  await saveCharCollection(v);
-  toast(v ? `已把「${settings.char}」绑定到 ${v}` : `「${settings.char}」已改为跟随全局`);
+$('#btn-mem-prompt-restore') && ($('#btn-mem-prompt-restore').onclick = () => {
+  if ($('#mem-distill-prompt')) $('#mem-distill-prompt').value = '';
 });
-const btnMemCharClear = $('#btn-mem-char-clear');
-if (btnMemCharClear) btnMemCharClear.onclick = () => asyncAction(btnMemCharClear, async () => {
-  $('#mem-char-collection').value = '';
-  await saveCharCollection('');
-  toast(`「${settings.char}」已改为跟随全局`);
-});
-['mem-char-collection'].forEach((id) => {
-  const el = document.getElementById(id);
-  if (el) el.addEventListener('change', () => saveCharCollection(el.value.trim()).catch((e) => toast('保存角色绑定失败：' + e.message, 'err')));
-});
+$('#btn-mem-distill-run') && ($('#btn-mem-distill-run').onclick = () => asyncAction($('#btn-mem-distill-run'), async () => {
+  if ($('#mem-distill-meta')) $('#mem-distill-meta').textContent = '蒸馏中…（可能几十秒，请保持页面打开）';
+  const r = await api('/api/distilled/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ session: settings.char }) });
+  const j = await r.json();
+  if (!j.ok) throw new Error(j.error || ('HTTP ' + r.status));
+  toast('蒸馏完成');
+  await loadMemoryProfile();
+}));
+$('#btn-mem-rebuild') && ($('#btn-mem-rebuild').onclick = () => asyncAction($('#btn-mem-rebuild'), async () => {
+  if (!(await uiConfirm('从 chat.jsonl 的每条 distilled_memory 记录重建事实表？会先写 distilled.md.bak 备份，不调用 LLM。'))) return;
+  const r = await api('/api/distilled/rebuild', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ session: settings.char }) });
+  const j = await r.json();
+  if (!j.ok) throw new Error(j.error || ('HTTP ' + r.status));
+  toast(`回填完成：${j.sheets} 条记录 → ${j.days} 天`);
+  await loadMemoryProfile();
+}));
 
 /* ---------- memory test search: card view ---------- */
 // The cards render exactly the chunks that would be injected into the prompt.
@@ -1918,90 +2001,10 @@ $('#btn-ntfy-save').onclick = () => asyncAction($('#btn-ntfy-save'), () => saveN
 });
 
 /* ---------- distilled memory ---------- */
-let distillDefaultPrompt = '';
-async function loadDistill() {
-  try {
-    const j = await (await api('/api/distilled?session=' + encodeURIComponent(settings.char))).json();
-    distillDefaultPrompt = j.default_prompt || '';
-    $('#dmem-enabled').checked = !!j.enabled;
-    $('#dmem-interval').value = j.interval || 8;
-    $('#dmem-maxchars').value = j.max_chars || 4000;
-    $('#dmem-retain').value = j.retain_days || 3;
-    $('#dmem-state-days').value = j.state_max_days || 30;
-    $('#dmem-perday').value = j.max_log_per_day || 40;
-    $('#dmem-entry').value = j.max_entry_chars || 300;
-    $('#dmem-model').value = j.model || '';
-    $('#dmem-vec-enabled').checked = !!j.vectorize_enabled;
-    $('#dmem-vec-collection').value = (j.vectorize_collection || '') === '(server default)' ? '' : (j.vectorize_collection || '');
-    // Open editable prompt: always show the effective template, not a blank box.
-    $('#dmem-prompt').value = j.prompt || distillDefaultPrompt;
-    $('#dmem-prompt').placeholder = 'Distillation prompt (editable; “Restore default prompt” resets it)';
-    const m = j.meta || {};
-    const days = j.days || 0;
-    let metaTxt = (m.runs ? `${m.runs} run${m.runs === 1 ? '' : 's'} · last ${(m.last_run || '').replace('T', ' ').replace(/\+.*$/, '')}` : 'not run yet') + (days ? ` · ${days} days of log` : '') + (m.last_vectorize ? ` · indexed ${(m.last_vectorize || '').replace('T', ' ').replace(/\+.*$/, '')}${m.last_vectorize_error ? '⚠' : ''}` : '');
-    // Fresh characters accumulate user turns before the first run; say so
-    // instead of looking broken when the sheet is empty.
-    if (j.enabled && !(j.sheet && j.sheet.trim()) && (j.need_turns || 0) > 0) {
-      metaTxt += ` · 还需 ${j.need_turns} 个用户轮触发首次蒸馏`;
-    } else if (j.enabled && !(j.sheet && j.sheet.trim()) && (j.need_turns || 0) === 0 && m.runs) {
-      metaTxt += ' · 即将蒸馏';
-    }
-    $('#dmem-meta').textContent = metaTxt;
-    const outEl = $('#dmem-out');
-    if (outEl) {
-      outEl.textContent = (j.sheet && j.sheet.trim())
-        ? j.sheet
-        : ((j.enabled && (j.need_turns || 0) > 0)
-          ? `(no entries yet — 还需约 ${j.need_turns} 个用户轮才会自动蒸馏；也可按 “Distill now” 立即运行)`
-          : '(no entries yet — reach the turn threshold or press “Distill now”)');
-    }
-  } catch (e) { toast('Failed to load distillation info: ' + e.message, 'err'); }
-}
-async function saveDistill(silent) {
-  await api('/api/settings', {
-    method: 'PUT', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      distill_enabled: $('#dmem-enabled').checked,
-      distill_interval: +$('#dmem-interval').value || 8,
-      distill_max_chars: +$('#dmem-maxchars').value || 4000,
-      distill_retain_days: +$('#dmem-retain').value || 3,
-      distill_state_max_days: +$('#dmem-state-days').value || 30,
-      distill_max_log_per_day: +$('#dmem-perday').value || 40,
-      distill_max_entry_chars: +$('#dmem-entry').value || 300,
-      distill_model: $('#dmem-model').value.trim(),
-      distill_prompt: $('#dmem-prompt').value,
-      distill_vectorize_enabled: $('#dmem-vec-enabled').checked,
-      distill_vectorize_collection: $('#dmem-vec-collection').value.trim(),
-    }),
-  });
-  if (!silent) toast('Distillation settings saved');
-}
-$('#btn-dmem-save').onclick = () => asyncAction($('#btn-dmem-save'), () => saveDistill(false));
-['dmem-enabled', 'dmem-interval', 'dmem-maxchars', 'dmem-retain', 'dmem-state-days', 'dmem-perday', 'dmem-entry', 'dmem-model', 'dmem-prompt', 'dmem-vec-enabled', 'dmem-vec-collection'].forEach((id) => {
-  const el = document.getElementById(id); if (el) el.addEventListener('change', () => saveDistill(true).catch((e) => toast('保存失败：' + e.message, 'err')));
-});
-$('#btn-dmem-run').onclick = () => asyncAction($('#btn-dmem-run'), async () => {
-  $('#dmem-meta').textContent = 'Distilling… (can take tens of seconds — keep this page open)';
-  const r = await api('/api/distilled/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ session: settings.char }) });
-  const j = await r.json();
-  if (!j.ok) throw new Error(j.error || ('HTTP ' + r.status));
-  toast('Distillation finished');
-  await loadDistill();
-});
-$('#btn-dmem-prompt-reset').onclick = () => {
-  $('#dmem-prompt').value = distillDefaultPrompt;
-  $('#dmem-out').textContent = distillDefaultPrompt;
-  toast('已恢复内置默认提示词（点保存生效）');
-};
-$('#btn-dmem-prompt-view').onclick = () => loadDistill();
-$('#btn-dmem-rebuild').onclick = () => asyncAction($('#btn-dmem-rebuild'), async () => {
-  if (!(await uiConfirm('Rebuild the fact sheet from every distilled_memory record in chat.jsonl? A distilled.md.bak backup is written first and no LLM is called.'))) return;
-  const r = await api('/api/distilled/rebuild', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ session: settings.char }) });
-  const j = await r.json();
-  if (!j.ok) throw new Error(j.error || ('HTTP ' + r.status));
-  toast(`Backfill complete: ${j.sheets} records → ${j.days} days`);
-  await loadDistill();
-});
+// The distilled-memory UI (prompt, interval, enable, section boxes) and its
+// handlers live in the per-character profile section above (loadMemoryProfile /
+// saveMemoryProfile), because distill settings are now part of the character's
+// profile rather than a global setting.
 
 /* ---------- models ---------- */
 // The main chat model is shared with the Flutter app: it lives server-side as
@@ -2169,7 +2172,6 @@ async function init() {
   fillSettingsForm();
   applyUiScale();
   await loadServerSettings();
-  refreshCollections();
   fillSettingsForm();
   applyUiScale();
   $('#chat-char-name').textContent = settings.char;
@@ -2181,7 +2183,6 @@ async function init() {
   syncChatHead();
   loadHistory();
   subscribeChat();
-  loadDistill();
-  loadCharCollection();
+  loadMemoryProfile();
 }
 init();

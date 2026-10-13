@@ -30,6 +30,131 @@ func charBase(root, name string) string {
 	return filepath.Join(root, "characters", store.CleanSession(name))
 }
 
+// CharProfile is a character's self-contained memory / context-engineering
+// profile. It lives in characters/<name>/profile.json so it travels with the
+// character's data package (rclone-friendly) and switching characters switches
+// the whole memory setup. There is no global memory default layer: a fresh
+// character starts from DefaultProfile().
+type CharProfile struct {
+	RAG     RAGProfile     `json:"rag"`
+	Distill DistillProfile `json:"distill"`
+}
+
+// RAGProfile separates what a character READS from what it WRITES. Recall is a
+// multi-select set (empty = recall nothing, e.g. a brand-new character kept
+// clean until its card is proven); auto-vectorize is a SINGLE explicit target
+// — knowledge collections are recall-only so the diary only ever flows into the
+// character's own chat-memory collection.
+type RAGProfile struct {
+	Collections     []string `json:"collections,omitempty"`      // recall (multi); empty = no recall
+	WriteCollection string   `json:"write_collection,omitempty"` // auto-vectorize target (single); empty = no write
+}
+
+// DistillProfile is how this character distills its chat into memory. Prompt is
+// the personality-specific extractor; empty = the built-in DefaultPrompt.
+type DistillProfile struct {
+	Enabled  bool   `json:"enabled"`
+	Interval int    `json:"interval,omitempty"`
+	Prompt   string `json:"prompt,omitempty"`
+}
+
+// DefaultProfile is what a new character starts with: no recall (clean slate),
+// no auto-vectorize target, auto-distill on with the built-in STATE/LOG memory.
+func DefaultProfile() CharProfile {
+	return CharProfile{
+		RAG:     RAGProfile{Collections: []string{}},
+		Distill: DistillProfile{Enabled: true, Interval: 8},
+	}
+}
+
+func profilePath(base string) string { return filepath.Join(base, "profile.json") }
+
+// loadCharProfile reads profile.json. Reports whether the file existed (false
+// means "never configured", which triggers a one-time migration).
+func loadCharProfile(base string) (CharProfile, bool) {
+	b, err := os.ReadFile(profilePath(base))
+	if err != nil {
+		return CharProfile{}, false
+	}
+	var p CharProfile
+	if json.Unmarshal(b, &p) != nil {
+		return CharProfile{}, false
+	}
+	if p.Distill.Interval <= 0 {
+		p.Distill.Interval = 8
+	}
+	return p, true
+}
+
+func saveCharProfile(base string, p CharProfile) error {
+	if err := os.MkdirAll(base, 0o755); err != nil {
+		return err
+	}
+	if p.Distill.Interval <= 0 {
+		p.Distill.Interval = 8
+	}
+	b, _ := json.MarshalIndent(p, "", "  ")
+	return os.WriteFile(profilePath(base), b, 0o644)
+}
+
+// profileFor resolves the effective profile for a session. A character with no
+// profile.json yet is migrated once from the legacy global mcp_collection (and
+// any old per-character meta.json override, which wins), so nothing silently
+// stops recalling/writing after the upgrade.
+func profileFor(root string, s settings.Settings, session string) CharProfile {
+	base := charBase(root, session)
+	if p, ok := loadCharProfile(base); ok {
+		return p
+	}
+	p := DefaultProfile()
+	p.Distill.Enabled = s.DistillEnabled
+	if s.DistillInterval > 0 {
+		p.Distill.Interval = s.DistillInterval
+	}
+	p.Distill.Prompt = s.DistillPrompt
+	seed := s.MCPCollection
+	if m := loadCharMeta(base); m != nil {
+		if v, ok := m["mcp_collection"].(string); ok && strings.TrimSpace(v) != "" {
+			seed = v
+		}
+	}
+	if cols := splitCSV(seed); len(cols) > 0 {
+		p.RAG.Collections = cols
+		p.RAG.WriteCollection = cols[0]
+	}
+	return p
+}
+
+// splitCSV trims and de-duplicates a comma-separated collection list.
+func splitCSV(s string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" || seen[part] {
+			continue
+		}
+		seen[part] = true
+		out = append(out, part)
+	}
+	return out
+}
+
+// cleanList trims and de-duplicates a recall collection list from JSON.
+func cleanList(in []string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, v := range in {
+		v = strings.TrimSpace(v)
+		if v == "" || seen[v] {
+			continue
+		}
+		seen[v] = true
+		out = append(out, v)
+	}
+	return out
+}
+
 // hasCharCard reports whether a character directory holds a real card.
 func hasCharCard(base string) bool {
 	if _, err := os.Stat(filepath.Join(base, "card.json")); err != nil {

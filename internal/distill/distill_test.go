@@ -1,7 +1,6 @@
 package distill
 
 import (
-	"fmt"
 	"strings"
 	"testing"
 )
@@ -98,64 +97,73 @@ func TestApplyDeltaAppendsAndReplacesState(t *testing.T) {
 	}
 }
 
-func TestRetainKeepsFloor(t *testing.T) {
+func TestRetainDropsOldestOverBudget(t *testing.T) {
 	var b strings.Builder
 	b.WriteString("[USER STATE]\n")
 	for _, d := range []string{"18-09-2026", "19-09-2026", "20-09-2026", "21-09-2026", "22-09-2026"} {
-		b.WriteString("[" + d + "] " + strings.Repeat("x", 200) + "\n")
+		b.WriteString("[" + d + "] mood ok\n")
 	}
 	b.WriteString("\n[LOG]\n")
 	for _, d := range []string{"18-09-2026", "19-09-2026", "20-09-2026", "21-09-2026", "22-09-2026"} {
 		b.WriteString("[" + d + " 10:00] " + strings.Repeat("y", 200) + "\n")
 	}
-	got := Retain(b.String(), 100, 3, 0, 0, 0)
-	if n := DayCount(got); n != 3 {
-		t.Fatalf("want floor of 3 days, got %d\n%s", n, got)
+	got := Retain(b.String(), 500, 0)
+	// The oldest dated log entries must be evicted first; the L1 STATE snapshot
+	// is never dropped to satisfy the budget.
+	if strings.Contains(got, "18-09-2026 10:00") {
+		t.Fatalf("oldest log entries should be evicted:\n%s", got)
 	}
-	if strings.Contains(got, "18-09-2026") || strings.Contains(got, "19-09-2026") {
-		t.Fatalf("oldest days should be evicted:\n%s", got)
+	if !strings.Contains(got, "22-09-2026 10:00") {
+		t.Fatalf("newest log entry must survive:\n%s", got)
 	}
-	if !strings.Contains(got, "22-09-2026") || !strings.Contains(got, "20-09-2026") {
-		t.Fatalf("newest 3 days must survive:\n%s", got)
+	if !strings.Contains(got, "18-09-2026] mood ok") {
+		t.Fatalf("STATE lines must never be evicted by the budget:\n%s", got)
+	}
+	if len([]rune(got)) > 500 {
+		t.Fatalf("budget exceeded: %d runes", len([]rune(got)))
 	}
 }
 
 func TestRetainKeepsAllWhenUnderBudget(t *testing.T) {
-	got := Retain(prevSheet, 100000, 3, 0, 0, 0)
+	got := Retain(prevSheet, 100000, 0)
 	if n := DayCount(got); n != 3 {
 		t.Fatalf("want 3 days preserved, got %d", n)
 	}
 }
 
-func TestRetainStateCapKeepsLogs(t *testing.T) {
-	sheet := "[USER STATE]\n[01-09-2026] a\n[02-09-2026] b\n[03-09-2026] c\n\n[LOG]\n[01-09-2026 10:00] x"
-	got := Retain(sheet, 0, 3, 2, 0, 0)
-	if strings.Contains(got, "[01-09-2026] a") {
-		t.Fatalf("oldest state must be dropped:\n%s", got)
+func TestRetainCapsEntryChars(t *testing.T) {
+	sheet := "[LOG]\n[25-09-2026 05:00] " + strings.Repeat("z", 40)
+	got := Retain(sheet, 0, 10)
+	if strings.Contains(got, strings.Repeat("z", 11)) {
+		t.Fatalf("entry text must be capped at 10 runes:\n%s", got)
 	}
-	if !strings.Contains(got, "[02-09-2026] b") || !strings.Contains(got, "[03-09-2026] c") {
-		t.Fatalf("newest 2 states must survive:\n%s", got)
-	}
-	if !strings.Contains(got, "[01-09-2026 10:00] x") {
-		t.Fatalf("log of a state-capped day must survive:\n%s", got)
+	if !strings.HasPrefix(got, "[LOG]\n[25-09-2026 05:00] zzzzzzzzzz") {
+		t.Fatalf("cap must keep the prefix and the dated header:\n%s", got)
 	}
 }
 
-func TestRetainPerDayCaps(t *testing.T) {
-	var b strings.Builder
-	b.WriteString("[LOG]\n")
-	for i := 0; i < 5; i++ {
-		b.WriteString(fmt.Sprintf("[25-09-2026 0%d:00] %s\n", i+1, strings.Repeat("z", 20)))
+// TestGenericSections covers the v3 schema: any [TAG] section is parsed,
+// merged and preserved round-trip, not just STATE/LOG.
+func TestGenericSections(t *testing.T) {
+	a := "[LOG]\n[20-09-2026 08:00] ate breakfast\n\n[INSIGHT]\n[20-09-2026] compass one\n\n[MONEY]\n[20-09-2026 09:30] spent 12 on lunch"
+	b := "[INSIGHT]\n[21-09-2026] compass two\n\n[MONEY]\n[21-09-2026 10:00] earned 300"
+	got := Merge(a, b)
+	for _, want := range []string{
+		"[LOG]", "[INSIGHT]", "[MONEY]",
+		"[20-09-2026] compass one", "[21-09-2026] compass two",
+		"[20-09-2026 09:30] spent 12 on lunch", "[21-09-2026 10:00] earned 300",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("custom section lost %q\n---\n%s", want, got)
+		}
 	}
-	got := Retain(b.String(), 0, 3, 0, 2, 5)
-	if n := strings.Count(got, "[25-09-2026 "); n != 2 {
-		t.Fatalf("want 2 newest entries per day, got %d:\n%s", n, got)
+	if !IsValid(got) {
+		t.Fatalf("a sheet with only custom sections must be valid:\n%s", got)
 	}
-	if !strings.Contains(got, "[25-09-2026 05:00]") || strings.Contains(got, "[25-09-2026 01:00]") {
-		t.Fatalf("per-day cap must keep the newest:\n%s", got)
-	}
-	if strings.Contains(got, strings.Repeat("z", 6)) {
-		t.Fatalf("entry text must be capped:\n%s", got)
+	// A free-form insight line (no time) stays in its own section, not STATE.
+	sh := parseSheet(got)
+	if len(sh.entries("INSIGHT")) != 2 || len(sh.entries("STATE")) != 0 {
+		t.Fatalf("INSIGHT must keep its own entries, got %d insight / %d state", len(sh.entries("INSIGHT")), len(sh.entries("STATE")))
 	}
 }
 

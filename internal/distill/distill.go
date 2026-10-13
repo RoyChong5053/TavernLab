@@ -4,15 +4,18 @@
 // into the prompt as two blocks: `distilled_state` (L1, always present) and
 // `distilled_log` (L2, oldest whole days evicted by the engine under budget).
 //
-// Design (2026-09-26 v2 — read/write separation): the LLM is a pure *extractor*
-// of deltas. It never sees or rewrites the whole record, so it can neither
-// delete history nor make the output grow without bound. The application owns
-// the database: it appends the delta, then deterministically trims the oldest
-// whole days down to the retention floor.
+// Design (2026-10-13 v3 — generic sections): the record is a set of named
+// sections, each holding dated lines. `[STATE]` is the only L1 (constant)
+// section; every other section is dated, append-only and evicted oldest-first.
+// Section names are free-form ([LOG], [INSIGHT], [MONEY], [ITEM], ...): the
+// per-character prompt tells the model which to emit, and the WebUI renders one
+// box per section. The LLM stays a pure *extractor* of deltas; the application
+// owns the database (append + deterministic retention), so it can neither
+// delete history nor grow without bound.
 //
 // Storage is per-character and file-based so data/ stays rclone-friendly:
 //
-//	characters/<name>/distilled.md        [USER STATE] + [LOG] sections
+//	characters/<name>/distilled.md        [USER STATE] + named sections
 //	characters/<name>/distilled.meta.json last-run bookkeeping
 package distill
 
@@ -157,15 +160,43 @@ func FormatTimeline(char, userName string, msgs []store.ChatMessage) string {
 	return strings.TrimSpace(sb.String())
 }
 
-// ---- parsing --------------------------------------------------------------
+// ---- generic sections ------------------------------------------------------
 //
-// Dates are accepted in either DD-MM-YYYY (canonical) or YYYY-MM-DD (ISO, what
-// models sometimes echo from the raw message timestamps). Everything is
-// normalised to DD-MM-YYYY on parse, so a format slip can no longer silently
-// drop entries.
+// The record is a set of named sections, each holding dated lines. A line
+// `[DD-MM-YYYY] text` is a per-day "state" line (within its section a newer
+// line for the same day replaces the older one); a line
+// `[DD-MM-YYYY HH:MM] text` is a timestamped log line (deduped by date+time).
+// Section names are free-form ([STATE], [LOG], [INSIGHT], [MONEY], ...); the
+// prompt decides which the model emits and the app parses them generically.
+// Dates are accepted as DD-MM-YYYY (canonical) or ISO YYYY-MM-DD and normalised
+// to DD-MM-YYYY on parse, so a model's format slip cannot silently drop entries.
+
+// Entry is one parsed, dated line.
+type Entry struct {
+	Tag  string `json:"tag"`
+	Date string `json:"date"`           // canonical DD-MM-YYYY
+	Time string `json:"time,omitempty"` // HH:MM, empty for per-day state lines
+	Text string `json:"text"`
+}
+
+func (e Entry) key() string {
+	if e.Time == "" {
+		return e.Date
+	}
+	return e.Date + " " + e.Time
+}
+
+// Line renders the canonical "[date (time)] text" line.
+func (e Entry) Line() string {
+	if e.Time != "" {
+		return "[" + e.Date + " " + e.Time + "] " + e.Text
+	}
+	return "[" + e.Date + "] " + e.Text
+}
 
 var (
 	entryRe   = regexp.MustCompile(`^\[(\d{2}-\d{2}-\d{4}|\d{4}-\d{2}-\d{2})(?: (\d{2}:\d{2}))?\]\s*(.*)$`)
+	headerRe  = regexp.MustCompile(`^\[([A-Z][A-Z0-9_ ]*)\]\s*$`)
 	dateishRe = regexp.MustCompile(`^\[\d{2,4}[-/]\d{1,2}[-/]\d{2,4}`)
 )
 
@@ -188,25 +219,61 @@ func normalizeDate(d string) (string, bool) {
 	return "", false
 }
 
-type dayBlock struct {
-	date  string
-	state string   // full "[DD-MM-YYYY] ..." line
-	logs  []string // full "[DD-MM-YYYY HH:MM] ..." lines
+func dateOrder(d string) string {
+	if t, err := time.Parse("02-01-2006", d); err == nil {
+		return t.Format("2006-01-02")
+	}
+	return d
 }
 
-func parseSheet(s string) map[string]*dayBlock {
-	days := map[string]*dayBlock{}
-	get := func(d string) *dayBlock {
-		if b := days[d]; b != nil {
-			return b
-		}
-		b := &dayBlock{date: d}
-		days[d] = b
-		return b
+// normalizeTag canonicalises a section header ("USER STATE" -> "STATE").
+func normalizeTag(t string) string {
+	t = strings.ToUpper(strings.TrimSpace(t))
+	t = strings.Join(strings.Fields(t), " ")
+	if t == "USER STATE" {
+		return "STATE"
 	}
-	for _, raw := range strings.Split(s, "\n") {
+	return t
+}
+
+// sectionHeader renders a section's canonical header line (STATE keeps the
+// legacy "[USER STATE]" spelling).
+func sectionHeader(tag string) string {
+	if tag == "STATE" {
+		return "[USER STATE]"
+	}
+	return "[" + tag + "]"
+}
+
+// sheet is the parsed record: an insertion-ordered set of sections keyed by
+// (tag, entry key) so a newer line replaces the older one in place.
+type sheet struct {
+	order []string
+	byTag map[string]map[string]Entry
+}
+
+func newSheet() *sheet { return &sheet{byTag: map[string]map[string]Entry{}} }
+
+func (s *sheet) add(e Entry) {
+	m := s.byTag[e.Tag]
+	if m == nil {
+		m = map[string]Entry{}
+		s.byTag[e.Tag] = m
+		s.order = append(s.order, e.Tag)
+	}
+	m[e.key()] = e
+}
+
+func parseSheet(str string) *sheet {
+	sh := newSheet()
+	tag := ""
+	for _, raw := range strings.Split(str, "\n") {
 		t := strings.TrimSpace(raw)
-		if t == "" || t == "[USER STATE]" || t == "[LOG]" || strings.HasPrefix(t, "[End of") {
+		if t == "" || strings.HasPrefix(t, "[End of") {
+			continue
+		}
+		if h := headerRe.FindStringSubmatch(t); h != nil {
+			tag = normalizeTag(h[1])
 			continue
 		}
 		m := entryRe.FindStringSubmatch(t)
@@ -217,131 +284,136 @@ func parseSheet(s string) map[string]*dayBlock {
 		if !ok {
 			continue
 		}
-		b := get(d)
-		if m[2] != "" {
-			b.logs = append(b.logs, "["+d+" "+m[2]+"]"+tail(m[3]))
-		} else {
-			b.state = "[" + d + "]" + tail(m[3])
+		e := Entry{Date: d, Time: m[2], Text: strings.TrimSpace(m[3])}
+		switch {
+		case tag != "":
+			e.Tag = tag
+		case e.Time != "":
+			e.Tag = "LOG"
+		default:
+			e.Tag = "STATE"
+		}
+		sh.add(e)
+	}
+	return sh
+}
+
+// orderedTags puts STATE first, LOG second, then any other section in the
+// order it first appeared.
+func (s *sheet) orderedTags() []string {
+	out := make([]string, 0, len(s.order))
+	seen := map[string]bool{}
+	for _, t := range []string{"STATE", "LOG"} {
+		if _, ok := s.byTag[t]; ok {
+			out = append(out, t)
+			seen[t] = true
 		}
 	}
-	return days
-}
-
-func tail(s string) string {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return ""
+	for _, t := range s.order {
+		if !seen[t] {
+			out = append(out, t)
+			seen[t] = true
+		}
 	}
-	return " " + s
-}
-
-func dateOrder(d string) string {
-	if t, err := time.Parse("02-01-2006", d); err == nil {
-		return t.Format("2006-01-02")
-	}
-	return d
-}
-
-func logOrder(line string) string {
-	m := entryRe.FindStringSubmatch(line)
-	if m == nil || m[2] == "" {
-		return line
-	}
-	d, ok := normalizeDate(m[1])
-	if !ok {
-		return line
-	}
-	if t, err := time.Parse("02-01-2006 15:04", d+" "+m[2]); err == nil {
-		return t.Format("2006-01-02 15:04")
-	}
-	return d + " " + m[2]
-}
-
-func sortedDates(days map[string]*dayBlock) []string {
-	out := make([]string, 0, len(days))
-	for d := range days {
-		out = append(out, d)
-	}
-	sort.Slice(out, func(i, j int) bool { return dateOrder(out[i]) < dateOrder(out[j]) })
 	return out
 }
 
-func renderSheet(days map[string]*dayBlock, order []string) string {
-	var sb strings.Builder
-	wroteState := false
-	for _, d := range order {
-		if b := days[d]; b != nil && b.state != "" {
-			if !wroteState {
-				sb.WriteString("[USER STATE]\n")
-				wroteState = true
-			}
-			sb.WriteString(b.state + "\n")
+func (s *sheet) tagsExcept(skip ...string) []string {
+	skipSet := map[string]bool{}
+	for _, t := range skip {
+		skipSet[t] = true
+	}
+	var out []string
+	for _, t := range s.order {
+		if !skipSet[t] {
+			out = append(out, t)
 		}
 	}
-	if wroteState {
-		sb.WriteString("\n")
+	return out
+}
+
+func (s *sheet) entries(tag string) []Entry {
+	m := s.byTag[tag]
+	if len(m) == 0 {
+		return nil
 	}
-	wroteLog := false
-	for _, d := range order {
-		b := days[d]
-		if b == nil {
+	out := make([]Entry, 0, len(m))
+	for _, e := range m {
+		out = append(out, e)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		di, dj := dateOrder(out[i].Date), dateOrder(out[j].Date)
+		if di != dj {
+			return di < dj
+		}
+		return out[i].Time < out[j].Time
+	})
+	return out
+}
+
+func (s *sheet) render() string {
+	var sb strings.Builder
+	first := true
+	for _, tag := range s.orderedTags() {
+		es := s.entries(tag)
+		if len(es) == 0 {
 			continue
 		}
-		for _, l := range b.logs {
-			if !wroteLog {
-				sb.WriteString("[LOG]\n")
-				wroteLog = true
-			}
-			sb.WriteString(l + "\n")
+		if !first {
+			sb.WriteString("\n")
+		}
+		first = false
+		sb.WriteString(sectionHeader(tag) + "\n")
+		for _, e := range es {
+			sb.WriteString(e.Line() + "\n")
 		}
 	}
 	return strings.TrimRight(sb.String(), "\n")
 }
 
-func cloneBlock(b *dayBlock) *dayBlock {
-	nb := &dayBlock{date: b.date, state: b.state}
-	nb.logs = append(nb.logs, b.logs...)
-	return nb
-}
-
-// Merge unions the previous record with an incoming one so a model that drops
-// whole days (or individual entries) cannot lose history. For the same day a
-// newer entry wins on an identical timestamp; otherwise both are kept. The
-// result is re-rendered in canonical chronological order.
-func Merge(prev, next string) string {
-	pd, nd := parseSheet(prev), parseSheet(next)
-	out := map[string]*dayBlock{}
-	for d, b := range pd {
-		out[d] = cloneBlock(b)
-	}
-	for d, nb := range nd {
-		ob := out[d]
-		if ob == nil {
-			out[d] = cloneBlock(nb)
-			continue
-		}
-		if nb.state != "" {
-			ob.state = nb.state
-		}
-		seen := map[string]int{}
-		for i, l := range ob.logs {
-			seen[logOrder(l)] = i
-		}
-		for _, l := range nb.logs {
-			k := logOrder(l)
-			if i, ok := seen[k]; ok {
-				ob.logs[i] = l
-			} else {
-				seen[k] = len(ob.logs)
-				ob.logs = append(ob.logs, l)
+// dropOldest removes the single oldest entry among the given tags. On the same
+// date a timestamped row sorts before a per-day state row. Reports whether
+// anything was dropped.
+func (s *sheet) dropOldest(tags ...string) bool {
+	var best Entry
+	var bestTag, bestKey string
+	found := false
+	for _, tag := range tags {
+		for k, e := range s.byTag[tag] {
+			if !found || dateOrder(e.Date) < dateOrder(best.Date) ||
+				(dateOrder(e.Date) == dateOrder(best.Date) && e.Time < best.Time) {
+				best, bestTag, bestKey, found = e, tag, k, true
 			}
 		}
 	}
-	order := sortedDates(out)
-	for _, b := range out {
-		sort.SliceStable(b.logs, func(i, j int) bool { return logOrder(b.logs[i]) < logOrder(b.logs[j]) })
+	if !found {
+		return false
 	}
-	return renderSheet(out, order)
+	delete(s.byTag[bestTag], bestKey)
+	if len(s.byTag[bestTag]) == 0 {
+		delete(s.byTag, bestTag)
+		for i, t := range s.order {
+			if t == bestTag {
+				s.order = append(s.order[:i], s.order[i+1:]...)
+				break
+			}
+		}
+	}
+	return true
+}
+
+// Merge unions the previous record with an incoming one so a model that drops
+// whole days (or individual entries) cannot lose history. For the same
+// (section, date[, time]) the newer entry wins; otherwise both are kept. The
+// result is re-rendered in canonical chronological order.
+func Merge(prev, next string) string {
+	a, b := parseSheet(prev), parseSheet(next)
+	for _, tag := range b.orderedTags() {
+		for _, e := range b.entries(tag) {
+			a.add(e)
+		}
+	}
+	return a.render()
 }
 
 // ApplyDelta merges an extracted delta into the canonical record. It is the
@@ -349,150 +421,43 @@ func Merge(prev, next string) string {
 // appended and deduped by timestamp) — nothing already stored is ever lost.
 func ApplyDelta(prev, delta string) string { return Merge(prev, delta) }
 
-// Retain applies the deterministic code-side retention policy:
-//   - per-entry character cap (newest text kept, prefix preserved);
-//   - per-day log cap (keep the newest N entries of each day);
-//   - total character budget by dropping whole oldest days, but never below
-//     retainDays days;
-//   - state hard cap by dropping the oldest state lines, but never the logs.
-//
-// The LLM never deletes; this function is the only thing that does.
-func Retain(sheet string, maxChars, retainDays, stateMaxDays, maxLogPerDay, maxEntryChars int) string {
-	days := parseSheet(sheet)
+// Retain applies the deterministic code-side retention policy: a per-entry
+// character cap, then a total character budget that drops the oldest dated
+// entries first. The L1 [STATE] snapshot is never evicted to satisfy the
+// budget (it is tiny and is the character's current state); it is only
+// entry-capped. The LLM never deletes; this function is the only thing that
+// does.
+func Retain(str string, maxChars, maxEntryChars int) string {
+	sh := parseSheet(str)
 	if maxEntryChars > 0 {
-		for _, b := range days {
-			for i, l := range b.logs {
-				b.logs[i] = capEntry(l, maxEntryChars)
+		for _, m := range sh.byTag {
+			for k, e := range m {
+				e.Text = capText(e.Text, maxEntryChars)
+				m[k] = e
 			}
 		}
 	}
-	if maxLogPerDay > 0 {
-		for _, b := range days {
-			if len(b.logs) > maxLogPerDay {
-				b.logs = b.logs[len(b.logs)-maxLogPerDay:]
-			}
-		}
-	}
-	order := sortedDates(days)
-	canon := renderSheet(days, order)
 	if maxChars > 0 {
-		if retainDays < 1 {
-			retainDays = 1
-		}
-		for len(order) > retainDays && len([]rune(canon)) > maxChars {
-			delete(days, order[0])
-			order = order[1:]
-			canon = renderSheet(days, order)
-		}
-	}
-	if stateMaxDays > 0 {
-		var withState []string
-		for _, d := range order {
-			if b := days[d]; b != nil && b.state != "" {
-				withState = append(withState, d)
+		for len([]rune(sh.render())) > maxChars {
+			if !sh.dropOldest(sh.tagsExcept("STATE")...) {
+				break
 			}
 		}
-		if len(withState) > stateMaxDays {
-			for _, d := range withState[:len(withState)-stateMaxDays] {
-				days[d].state = ""
-			}
-			canon = renderSheet(days, order)
-		}
 	}
-	return canon
+	return sh.render()
 }
 
-// capEntry truncates the free text of a dated line to max runes, preserving
-// its "[date time] " prefix.
-func capEntry(line string, max int) string {
+// capText truncates free text to max runes.
+func capText(s string, max int) string {
+	s = strings.TrimSpace(s)
 	if max <= 0 {
-		return line
+		return s
 	}
-	m := entryRe.FindStringSubmatch(line)
-	if m == nil {
-		return line
-	}
-	rest := m[3]
-	r := []rune(rest)
+	r := []rune(s)
 	if len(r) <= max {
-		return line
+		return s
 	}
-	prefix := line[:len(line)-len(rest)]
-	return prefix + string(r[:max]) + "…"
-}
-
-// IsValid reports whether an LLM sheet is parseable (a section marker plus at
-// least one dated entry). Used to refuse overwriting a good record with prose.
-func IsValid(sheet string) bool {
-	if strings.TrimSpace(sheet) == "" {
-		return false
-	}
-	if !strings.Contains(sheet, "[USER STATE]") && !strings.Contains(sheet, "[LOG]") &&
-		!strings.Contains(sheet, "[STATE]") {
-		return false
-	}
-	return len(parseSheet(sheet)) > 0
-}
-
-// DayCount returns how many distinct dated days a record holds (for audit/logs).
-func DayCount(sheet string) int { return len(parseSheet(sheet)) }
-
-// UnparsedDatedLines returns lines that look like dated entries but were not
-// recognised by the tolerant parser (e.g. a model invented a third layout).
-// Used for observability so silent data loss becomes visible.
-func UnparsedDatedLines(sheet string) []string {
-	var out []string
-	for _, raw := range strings.Split(sheet, "\n") {
-		t := strings.TrimSpace(raw)
-		if t == "" || t == "[USER STATE]" || t == "[LOG]" || t == "[STATE]" {
-			continue
-		}
-		if entryRe.MatchString(t) {
-			continue
-		}
-		if dateishRe.MatchString(t) {
-			out = append(out, t)
-		}
-	}
-	return out
-}
-
-// LogDay is one day's diary block for the L2 evictable log list.
-type LogDay struct {
-	Date string // canonical DD-MM-YYYY
-	Text string // the day's "[DD-MM-YYYY HH:MM] ..." lines, newline-joined
-}
-
-// LoadState returns the current-state lines (canonical, oldest-first), capped
-// to the newest maxDays when maxDays > 0. This is the L1 constant.
-func LoadState(root, char string, maxDays int) string {
-	days := parseSheet(Load(root, char))
-	order := sortedDates(days)
-	var lines []string
-	for _, d := range order {
-		if b := days[d]; b != nil && b.state != "" {
-			lines = append(lines, b.state)
-		}
-	}
-	if maxDays > 0 && len(lines) > maxDays {
-		lines = lines[len(lines)-maxDays:]
-	}
-	return strings.Join(lines, "\n")
-}
-
-// LogDays returns one LogDay per day that has log entries, oldest-first.
-func LogDays(root, char string) []LogDay {
-	days := parseSheet(Load(root, char))
-	order := sortedDates(days)
-	var out []LogDay
-	for _, d := range order {
-		b := days[d]
-		if b == nil || len(b.logs) == 0 {
-			continue
-		}
-		out = append(out, LogDay{Date: d, Text: strings.Join(b.logs, "\n")})
-	}
-	return out
+	return string(r[:max]) + "…"
 }
 
 // Rebuild unions many historical sheets into one canonical record. Used by the
@@ -505,6 +470,109 @@ func Rebuild(sheets []string) string {
 			continue
 		}
 		out = Merge(out, s)
+	}
+	return out
+}
+
+// IsValid reports whether an LLM sheet is parseable (at least one dated entry
+// under some section). Used to refuse overwriting a good record with prose.
+func IsValid(str string) bool {
+	if strings.TrimSpace(str) == "" {
+		return false
+	}
+	sh := parseSheet(str)
+	for _, m := range sh.byTag {
+		if len(m) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// UnparsedDatedLines returns lines that look like dated entries but were not
+// recognised by the parser (e.g. a model invented a slash layout). Used for
+// observability so silent data loss becomes visible.
+func UnparsedDatedLines(str string) []string {
+	var out []string
+	for _, raw := range strings.Split(str, "\n") {
+		t := strings.TrimSpace(raw)
+		if t == "" || strings.HasPrefix(t, "[End of") || headerRe.MatchString(t) {
+			continue
+		}
+		if entryRe.MatchString(t) {
+			continue
+		}
+		if dateishRe.MatchString(t) {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// DayCount returns how many distinct dated days a record holds (for audit/logs).
+func DayCount(str string) int {
+	days := map[string]bool{}
+	for _, m := range parseSheet(str).byTag {
+		for _, e := range m {
+			days[e.Date] = true
+		}
+	}
+	return len(days)
+}
+
+// LoadState returns the [STATE] lines (canonical, oldest-first), capped to the
+// newest maxDays when maxDays > 0. This is the L1 constant.
+func LoadState(root, char string, maxDays int) string {
+	es := parseSheet(Load(root, char)).entries("STATE")
+	lines := make([]string, 0, len(es))
+	for _, e := range es {
+		lines = append(lines, e.Line())
+	}
+	if maxDays > 0 && len(lines) > maxDays {
+		lines = lines[len(lines)-maxDays:]
+	}
+	return strings.Join(lines, "\n")
+}
+
+// Entries returns every non-STATE (dated, evictable) entry, oldest-first. This
+// is the L2 list the engine evicts under budget pressure.
+func Entries(root, char string) []Entry {
+	sh := parseSheet(Load(root, char))
+	var out []Entry
+	for _, tag := range sh.orderedTags() {
+		if tag == "STATE" {
+			continue
+		}
+		out = append(out, sh.entries(tag)...)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		di, dj := dateOrder(out[i].Date), dateOrder(out[j].Date)
+		if di != dj {
+			return di < dj
+		}
+		return out[i].Time < out[j].Time
+	})
+	return out
+}
+
+// Section is one named group of entries, for the WebUI boxes.
+type Section struct {
+	Tag     string  `json:"tag"`
+	Entries []Entry `json:"entries"`
+}
+
+// Sections returns the parsed record grouped by section, in canonical order
+// (STATE, LOG, then first-seen). Used by the Memory page to render one box per
+// section.
+func Sections(root, char string) []Section {
+	sh := parseSheet(Load(root, char))
+	var out []Section
+	for _, tag := range sh.orderedTags() {
+		es := sh.entries(tag)
+		if len(es) == 0 {
+			continue
+		}
+		out = append(out, Section{Tag: tag, Entries: es})
 	}
 	return out
 }
@@ -542,11 +610,9 @@ func BuildUser(state, recentLog, movement, timeline string) string {
 	return sb.String()
 }
 
-// RecentLogEntries returns the newest n [LOG] lines of the record, oldest-first
-// among themselves, in the same "[DD-MM-YYYY HH:MM] ..." shape the model sees in
-// the rest of the input. This is what gives the extractor continuity: it can
-// see it already wrote "back home at 00:08" and therefore write "still awake
-// coding at 03:00" rather than restarting the story.
+// RecentLogEntries returns the newest n non-STATE entries, oldest-first among
+// themselves, in the same "[DD-MM-YYYY HH:MM] ..." shape the model sees in the
+// rest of the input. This is what gives the extractor continuity.
 //
 // The tail is hard-bounded on purpose. The extractor's safety property is that
 // it never sees the whole diary, so its output cannot grow with history; an
@@ -555,16 +621,13 @@ func RecentLogEntries(root, char string, n int) string {
 	if n <= 0 {
 		return ""
 	}
-	days := parseSheet(Load(root, char))
-	order := sortedDates(days)
-	var lines []string
-	for _, d := range order {
-		if b := days[d]; b != nil {
-			lines = append(lines, b.logs...)
-		}
+	es := Entries(root, char)
+	if len(es) > n {
+		es = es[len(es)-n:]
 	}
-	if len(lines) > n {
-		lines = lines[len(lines)-n:]
+	lines := make([]string, 0, len(es))
+	for _, e := range es {
+		lines = append(lines, e.Line())
 	}
 	return strings.Join(lines, "\n")
 }

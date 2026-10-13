@@ -411,9 +411,9 @@ func main() {
 				"upstream": s.Upstream, "api_key_set": s.APIKey != "",
 				"api_key_hint": settings.Mask(s.APIKey), "rerank_url": s.RerankURL,
 				"mcp_url": s.MCPURL, "mcp_collection": s.MCPCollection,
-				"effective_mcp_collection": firstNonEmpty(effectiveMCPCollection(cfg.DataRoot, s, s.CurrentChar), "(server default)"),
-				"collection_source":        collectionSource(cfg.DataRoot, s, s.CurrentChar),
-				"mcp_enabled": s.MCPEnabled, "mcp_timeout": s.MCPTimeout,
+				"effective_mcp_collection": firstNonEmpty(recallCSV(cfg.DataRoot, s, s.CurrentChar), "(none)"),
+				"collection_source":        profileSource(cfg.DataRoot, s.CurrentChar),
+				"mcp_enabled":              s.MCPEnabled, "mcp_timeout": s.MCPTimeout,
 				"context_window": s.ContextWindow, "reply_reserve": s.ReplyReserve, "history_min_turns": s.HistoryMinTurns,
 				"current_char": s.CurrentChar, "user_name": s.UserName,
 				"ntfy_url": s.NtfyURL, "ntfy_topic": s.NtfyTopic,
@@ -525,7 +525,8 @@ func main() {
 		s := rt.get()
 		session := store.CleanSession(firstNonEmpty(r.URL.Query().Get("session"), s.CurrentChar, "main"))
 		sheet := distill.Load(cfg.DataRoot, session)
-		prompt := s.DistillPrompt
+		prof := profileFor(cfg.DataRoot, s, session)
+		prompt := prof.Distill.Prompt
 		if prompt == "" {
 			prompt = distill.DefaultPrompt
 		}
@@ -533,11 +534,11 @@ func main() {
 		// Lets the Memory page tell a fresh character "还需 N 轮" instead of
 		// looking broken while the threshold accumulates.
 		needTurns, freshTurns := 0, 0
-		interval := s.DistillInterval
+		interval := prof.Distill.Interval
 		if interval <= 0 {
 			interval = 8
 		}
-		if s.DistillEnabled {
+		if prof.Distill.Enabled {
 			if all, err := st.LoadAll(session); err == nil {
 				meta := distill.LoadMeta(cfg.DataRoot, session)
 				start := meta.LastIndex
@@ -555,24 +556,25 @@ func main() {
 			}
 		}
 		writeJSON(w, map[string]any{
-			"session": session, "sheet": sheet, "meta": distill.LoadMeta(cfg.DataRoot, session),
-			"state": distill.LoadState(cfg.DataRoot, session, 0), "days": len(distill.LogDays(cfg.DataRoot, session)),
-			"enabled": s.DistillEnabled, "interval": s.DistillInterval,
-			"max_chars": s.DistillMaxChars, "retain_days": s.DistillRetainDays,
-			"state_max_days": s.DistillStateMaxDays, "max_log_per_day": s.DistillMaxLogPerDay,
+			"session": session, "sheet": sheet, "sections": distill.Sections(cfg.DataRoot, session),
+			"meta":    distill.LoadMeta(cfg.DataRoot, session),
+			"state":   distill.LoadState(cfg.DataRoot, session, 0),
+			"days":    distill.DayCount(sheet),
+			"enabled": prof.Distill.Enabled, "interval": prof.Distill.Interval,
+			"max_chars":       s.DistillMaxChars,
 			"max_entry_chars": s.DistillMaxEntryChars,
+			"recent_logs":     s.DistillRecentLogs,
 			"model":           s.DistillModel,
 			"prompt":          prompt, "default_prompt": distill.DefaultPrompt,
-			"vectorize_enabled":    s.DistillVectorizeEnabled,
-			// Empty explicit vectorize target follows the character's recall
-			// collection (which itself may be a per-character override), so
-			// auto-indexing can never leak one character's diary into
-			// another character's library.
-			"vectorize_collection":   firstNonEmpty(s.DistillVectorizeCollection, effectiveMCPCollection(cfg.DataRoot, s, session), "(server default)"),
-			"effective_collection":   firstNonEmpty(effectiveMCPCollection(cfg.DataRoot, s, session), "(server default)"),
-			"collection_source":      collectionSource(cfg.DataRoot, s, session),
-			"need_turns":             needTurns,
-			"fresh_user_turns":       freshTurns,
+			"vectorize_enabled": s.DistillVectorizeEnabled,
+			// The auto-vectorize target is the character's SINGLE write
+			// collection; knowledge/recall collections are never written.
+			"vectorize_collection": firstNonEmpty(writeCollection(cfg.DataRoot, s, session), "(none)"),
+			"recall_collections":   prof.RAG.Collections,
+			"write_collection":     prof.RAG.WriteCollection,
+			"profile_source":       profileSource(cfg.DataRoot, session),
+			"need_turns":           needTurns,
+			"fresh_user_turns":     freshTurns,
 		})
 	})
 	mux.HandleFunc("/api/distilled/run", func(w http.ResponseWriter, r *http.Request) {
@@ -629,8 +631,7 @@ func main() {
 		if cur := distill.Load(cfg.DataRoot, session); cur != "" {
 			_ = os.WriteFile(filepath.Join(base, "distilled.md.bak"), []byte(cur+"\n"), 0o644)
 		}
-		final := distill.Retain(distill.Rebuild(sheets), s.DistillMaxChars, s.DistillRetainDays,
-			s.DistillStateMaxDays, s.DistillMaxLogPerDay, s.DistillMaxEntryChars)
+		final := distill.Retain(distill.Rebuild(sheets), s.DistillMaxChars, s.DistillMaxEntryChars)
 		if err := distill.Save(cfg.DataRoot, session, final); err != nil {
 			http.Error(w, "save failed: "+err.Error(), 500)
 			return
@@ -667,9 +668,9 @@ func main() {
 			hits = []memoryHit{}
 		}
 		writeJSON(w, map[string]any{
-			"ok": true, "collection": firstNonEmpty(effectiveMCPCollection(cfg.DataRoot, s, session), "(server default)"),
+			"ok": true, "collection": firstNonEmpty(recallCSV(cfg.DataRoot, s, session), "(none)"),
 			"session": session,
-			"chars": utf8.RuneCountInString(text), "text": text, "hits": hits,
+			"chars":   utf8.RuneCountInString(text), "text": text, "hits": hits,
 		})
 	})
 
@@ -747,7 +748,7 @@ func main() {
 		}
 		blocks = renderBlocks(cfg.DataRoot, session, rt.get().UserName, blocks)
 		ragItems, memInfo := resolveMCP(r.Context(), rt.get(), cfg.DataRoot, session, turns)
-		res := engine.Assemble(engine.Input{Blocks: blocks, Cfg: ctx, Turns: turns, Lists: listInputs(blocks, ragItems, cfg.DataRoot, session, rt.get().DistillRetainDays)})
+		res := engine.Assemble(engine.Input{Blocks: blocks, Cfg: ctx, Turns: turns, Lists: listInputs(blocks, ragItems, cfg.DataRoot, session)})
 		out := map[string]any{
 			"messages": res.Messages, "blocks": res.Blocks, "total_tokens": res.TotalTok,
 			"budget_tokens": res.BudgetTok, "window": res.Window, "overflow": res.Overflow,
@@ -843,7 +844,7 @@ func main() {
 		}
 		setActiveModel(fmt.Sprint(model))
 		ragItems, memInfo := resolveMCP(r.Context(), s, cfg.DataRoot, session, turns)
-		res := engine.Assemble(engine.Input{Blocks: blocks, Cfg: ctx, Turns: turns, Lists: listInputs(blocks, ragItems, cfg.DataRoot, session, s.DistillRetainDays)})
+		res := engine.Assemble(engine.Input{Blocks: blocks, Cfg: ctx, Turns: turns, Lists: listInputs(blocks, ragItems, cfg.DataRoot, session)})
 
 		// Build upstream body from assembled messages (attach fresh images).
 		upMsgs := buildUpMessages(res.Messages, upImages)
@@ -1143,6 +1144,12 @@ func main() {
 				http.Error(w, "create failed", 500)
 				return
 			}
+			// A brand-new character gets a concrete default profile (empty
+			// recall, no write target, auto-distill on). A reclaimed legacy dir
+			// keeps migrating from the old global setting on first read.
+			if !reclaimed {
+				_ = saveCharProfile(base, DefaultProfile())
+			}
 			writeJSON(w, map[string]any{"ok": true, "name": name, "reclaimed": reclaimed})
 		default:
 			http.Error(w, "method not allowed", 405)
@@ -1217,12 +1224,17 @@ func main() {
 		case sub == "" && r.Method == "GET":
 			card := loadCharCard(base)
 			meta := loadCharMeta(base)
+			prof := profileFor(cfg.DataRoot, rt.get(), name)
 			writeJSON(w, map[string]any{
 				"name": name, "description": card.Description, "created": card.Created,
 				"avatar_url": charAvatarURL(cfg.DataRoot, name), "avatar_px": charAvatarPx(base),
-				"expressions": listExpressions(base),
+				"expressions":              listExpressions(base),
 				"mcp_collection":           meta["mcp_collection"],
-				"effective_mcp_collection": effectiveMCPCollection(cfg.DataRoot, rt.get(), name),
+				"profile":                  prof,
+				"recall_collections":       prof.RAG.Collections,
+				"write_collection":         prof.RAG.WriteCollection,
+				"profile_source":           profileSource(cfg.DataRoot, name),
+				"effective_mcp_collection": recallCSV(cfg.DataRoot, rt.get(), name),
 			})
 		case sub == "" && r.Method == "DELETE":
 			// Default: keep chat data. ?chats=1 explicitly removes chat too.
@@ -1344,6 +1356,54 @@ func main() {
 			mb, _ := json.MarshalIndent(cur, "", "  ")
 			_ = os.WriteFile(filepath.Join(base, "meta.json"), mb, 0o644)
 			writeJSON(w, map[string]any{"ok": true, "meta": cur})
+		case sub == "profile" && r.Method == "GET":
+			prof := profileFor(cfg.DataRoot, rt.get(), name)
+			writeJSON(w, map[string]any{
+				"ok": true, "name": name, "profile": prof,
+				"recall_collections": prof.RAG.Collections,
+				"write_collection":   prof.RAG.WriteCollection,
+				"profile_source":     profileSource(cfg.DataRoot, name),
+			})
+		case sub == "profile" && r.Method == "PUT":
+			b, _ := io.ReadAll(r.Body)
+			var in struct {
+				Collections     *[]string `json:"collections"`     // recall (multi)
+				CollectionsCSV  *string   `json:"collections_csv"` // alt: CSV string
+				WriteCollection *string   `json:"write_collection"`
+				Enabled         *bool     `json:"enabled"`
+				Interval        *int      `json:"interval"`
+				Prompt          *string   `json:"prompt"`
+			}
+			if err := json.Unmarshal(b, &in); err != nil {
+				http.Error(w, "bad profile json", 400)
+				return
+			}
+			// Start from the resolved profile so a partial patch keeps current
+			// values (and a legacy character becomes concrete on first edit).
+			prof := profileFor(cfg.DataRoot, rt.get(), name)
+			if in.Collections != nil {
+				prof.RAG.Collections = cleanList(*in.Collections)
+			}
+			if in.CollectionsCSV != nil {
+				prof.RAG.Collections = splitCSV(*in.CollectionsCSV)
+			}
+			if in.WriteCollection != nil {
+				prof.RAG.WriteCollection = strings.TrimSpace(*in.WriteCollection)
+			}
+			if in.Enabled != nil {
+				prof.Distill.Enabled = *in.Enabled
+			}
+			if in.Interval != nil && *in.Interval > 0 {
+				prof.Distill.Interval = *in.Interval
+			}
+			if in.Prompt != nil {
+				prof.Distill.Prompt = *in.Prompt
+			}
+			if err := saveCharProfile(base, prof); err != nil {
+				http.Error(w, "save failed", 500)
+				return
+			}
+			writeJSON(w, map[string]any{"ok": true, "profile": prof, "profile_source": "character"})
 		default:
 			http.Error(w, "not found", 404)
 		}
@@ -1771,7 +1831,7 @@ func main() {
 		blocks := renderBlocks(cfg.DataRoot, session, s.UserName, loadBlocks())
 		setActiveModel(model)
 		ragItems, memInfo := resolveMCP(r.Context(), s, cfg.DataRoot, session, turns)
-		res := engine.Assemble(engine.Input{Blocks: blocks, Cfg: ctxFromSettings(s), Turns: turns, Lists: listInputs(blocks, ragItems, cfg.DataRoot, session, s.DistillRetainDays)})
+		res := engine.Assemble(engine.Input{Blocks: blocks, Cfg: ctxFromSettings(s), Turns: turns, Lists: listInputs(blocks, ragItems, cfg.DataRoot, session)})
 		upMsgs := buildUpMessages(res.Messages, upImages)
 		mt := s.ReplyReserve
 		if mt <= 0 {
@@ -2728,59 +2788,55 @@ func searchMCP(ctx context.Context, s settings.Settings, root, session, query st
 	searchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
 	defer cancel()
 	text, err := mcp.NewWithTimeout(firstNonEmpty(s.MCPURL, "http://192.168.10.2:8199"), timeout).
-		Search(searchCtx, query, effectiveMCPCollection(root, s, session))
+		Search(searchCtx, query, recallCSV(root, s, session))
 	if err != nil && errors.Is(err, context.DeadlineExceeded) {
 		return "", fmt.Errorf("mcp search timeout (%s): %w", timeout, err)
 	}
 	return text, err
 }
 
-// effectiveMCPCollection resolves the recall collection for one character:
-// the character's meta.json override wins, then the global setting, then ""
-// (rag-mcp-server default). Switching characters therefore switches recall
-// with no extra client action; an empty override follows the global again.
-func effectiveMCPCollection(root string, s settings.Settings, session string) string {
-	session = store.CleanSession(session)
-	if session != "" {
-		if m := loadCharMeta(filepath.Join(root, "characters", session)); m != nil {
-			if v, ok := m["mcp_collection"].(string); ok && strings.TrimSpace(v) != "" {
-				return strings.TrimSpace(v)
-			}
-		}
-	}
-	return s.MCPCollection
+// recallCSV returns the character's recall collections as a CSV string (the
+// shape mcp.Client.Search expects: one id, "a,b", or "" for no recall).
+func recallCSV(root string, s settings.Settings, session string) string {
+	return strings.Join(profileFor(root, s, session).RAG.Collections, ",")
 }
 
-// collectionSource reports where a character's recall collection came from
-// for the Memory UI ("character" override vs "global" vs server default).
-func collectionSource(root string, s settings.Settings, session string) string {
-	session = store.CleanSession(session)
-	if session != "" {
-		if m := loadCharMeta(filepath.Join(root, "characters", session)); m != nil {
-			if v, ok := m["mcp_collection"].(string); ok && strings.TrimSpace(v) != "" {
-				return "character"
-			}
-		}
-	}
-	if strings.TrimSpace(s.MCPCollection) != "" {
-		return "global"
-	}
-	return "server-default"
+// writeCollection returns the single collection auto-vectorize writes into
+// ("" = do not write). Knowledge collections are recall-only by design, so the
+// diary only ever flows into the character's own chat-memory collection.
+func writeCollection(root string, s settings.Settings, session string) string {
+	return strings.TrimSpace(profileFor(root, s, session).RAG.WriteCollection)
 }
-// resolveMCP searches rag-mcp-server with the latest user utterance and
-// returns the response as one engine item, byte for byte. Retrieval knobs
-// (top-k, threshold, chunk size) belong to the server; TavernLab only owns
-// how long it waits. Fail-open: errors are recorded and the chat continues.
-// The engine then decides what still fits under budget pressure.
+
+// profileSource reports whether the character has its own saved profile or is
+// still on the one-time migrated defaults (for the Memory UI badge).
+func profileSource(root, session string) string {
+	if _, ok := loadCharProfile(charBase(root, session)); ok {
+		return "character"
+	}
+	return "migrated"
+}
+
+// resolveMCP searches rag-mcp-server with the latest user utterance and returns
+// the response as one engine item, byte for byte. Retrieval knobs (top-k,
+// threshold, chunk size) belong to the server; TavernLab only owns how long it
+// waits. Fail-open: errors are recorded and the chat continues. A character
+// with no recall collections gets NO memory — the empty set means "recall
+// nothing", not "use the server default".
 func resolveMCP(ctx context.Context, s settings.Settings, root, session string, chat []engine.Message) ([]engine.Item, map[string]any) {
 	info := map[string]any{"enabled": false}
 	if !s.MCPEnabled {
 		return nil, info
 	}
 	info["enabled"] = true
-	col := effectiveMCPCollection(root, s, session)
-	info["collection"] = firstNonEmpty(col, "(server default)")
+	col := recallCSV(root, s, session)
+	info["collection"] = firstNonEmpty(col, "(none)")
 	info["session"] = store.CleanSession(session)
+	info["recall"] = col != ""
+	if col == "" {
+		info["chars"] = 0
+		return nil, info
+	}
 	query := lastUserText(chat)
 	info["query"] = query
 	if query == "" {
@@ -2801,7 +2857,7 @@ func resolveMCP(ctx context.Context, s settings.Settings, root, session string, 
 // listInputs binds the RAG hits to every enabled mcp/vectra block and the
 // diary to every enabled distilled_log block, so the engine treats them as L2
 // evictable lists. Both work even when the other source is empty.
-func listInputs(blocks []engine.Block, rag []engine.Item, root, session string, retainDays int) []engine.ItemList {
+func listInputs(blocks []engine.Block, rag []engine.Item, root, session string) []engine.ItemList {
 	var out []engine.ItemList
 	for _, b := range blocks {
 		if !b.Enabled {
@@ -2815,27 +2871,27 @@ func listInputs(blocks []engine.Block, rag []engine.Item, root, session string, 
 		case "distilled_log":
 			items := distillItems(root, session)
 			if len(items) > 0 {
-				if retainDays < 1 {
-					retainDays = 1
-				}
-				out = append(out, engine.ItemList{BlockID: b.ID, Items: items, Floor: retainDays, FloorFromHead: false, Weight: 1})
+				// Retain already enforces the character budget; the engine may
+				// evict further under context pressure, oldest first, keeping
+				// the newest entry.
+				out = append(out, engine.ItemList{BlockID: b.ID, Items: items, Floor: 1, FloorFromHead: false, Weight: 1})
 			}
 		}
 	}
 	return out
 }
 
-// distillItems turns the diary into one evictable item per day, oldest first,
-// with EvictRank rising with recency, so the engine drops the oldest whole days
-// first and the list floor protects the newest retain_days.
+// distillItems turns the diary's non-STATE entries into one evictable item per
+// entry, oldest first, with EvictRank rising with recency, so the engine drops
+// the oldest entries first.
 func distillItems(root, session string) []engine.Item {
-	days := distill.LogDays(root, session)
-	if len(days) == 0 {
+	entries := distill.Entries(root, session)
+	if len(entries) == 0 {
 		return nil
 	}
-	items := make([]engine.Item, 0, len(days))
-	for i, d := range days {
-		items = append(items, engine.Item{Text: d.Text, EvictRank: float64(i)})
+	items := make([]engine.Item, 0, len(entries))
+	for i, e := range entries {
+		items = append(items, engine.Item{Text: e.Line(), EvictRank: float64(i)})
 	}
 	return items
 }
@@ -2972,10 +3028,11 @@ func loadReittiMovements(root string, limit int) []map[string]any {
 // maybeDistill fires a background distillation once enough fresh user turns
 // have accumulated. Never blocks the chat path.
 func maybeDistill(st *store.Store, client *http.Client, root string, s settings.Settings, session string) {
-	if !s.DistillEnabled {
+	prof := profileFor(root, s, session)
+	if !prof.Distill.Enabled {
 		return
 	}
-	interval := s.DistillInterval
+	interval := prof.Distill.Interval
 	if interval <= 0 {
 		interval = 8
 	}
@@ -3019,25 +3076,14 @@ func maybeDistill(st *store.Store, client *http.Client, root string, s settings.
 
 // runDistill performs one distillation pass and records the result.
 func runDistill(ctx context.Context, st *store.Store, client *http.Client, root string, s settings.Settings, session string, force bool) (string, error) {
-	interval := s.DistillInterval
+	prof := profileFor(root, s, session)
+	interval := prof.Distill.Interval
 	if interval <= 0 {
 		interval = 8
 	}
 	maxChars := s.DistillMaxChars
 	if maxChars <= 0 {
 		maxChars = 4000
-	}
-	retainDays := s.DistillRetainDays
-	if retainDays <= 0 {
-		retainDays = 3
-	}
-	stateMaxDays := s.DistillStateMaxDays
-	if stateMaxDays <= 0 {
-		stateMaxDays = 30
-	}
-	maxLogPerDay := s.DistillMaxLogPerDay
-	if maxLogPerDay <= 0 {
-		maxLogPerDay = 40
 	}
 	maxEntryChars := s.DistillMaxEntryChars
 	if maxEntryChars <= 0 {
@@ -3083,7 +3129,7 @@ func runDistill(ctx context.Context, st *store.Store, client *http.Client, root 
 	// failure, empty window, or disabled switch yields "" and the distillation
 	// runs exactly as it did before this feature existed.
 	movement := fetchReittiMovement(ctx, s, root, session, meta)
-	promptTpl := s.DistillPrompt
+	promptTpl := prof.Distill.Prompt
 	if promptTpl == "" {
 		promptTpl = distill.DefaultPrompt
 	}
@@ -3135,7 +3181,7 @@ func runDistill(ctx context.Context, st *store.Store, client *http.Client, root 
 	// restore anything it omitted, then trim by whole oldest days / per-day /
 	// per-entry caps, with the state and day floors. The LLM never deletes.
 	prev := distill.Load(root, session)
-	final := distill.Retain(distill.ApplyDelta(prev, delta), maxChars, retainDays, stateMaxDays, maxLogPerDay, maxEntryChars)
+	final := distill.Retain(distill.ApplyDelta(prev, delta), maxChars, maxEntryChars)
 	if err := distill.Save(root, session, final); err != nil {
 		return "", err
 	}
@@ -3157,7 +3203,7 @@ func runDistill(ctx context.Context, st *store.Store, client *http.Client, root 
 	autoVectorize(root, s, session, p)
 	obs.Info("distill ok", map[string]any{
 		"session": session, "chars": len(final), "days": distill.DayCount(final),
-		"added": distill.DayCount(delta), "retain_days": retainDays, "runs": meta.Runs, "model": model,
+		"added": distill.DayCount(delta), "runs": meta.Runs, "model": model,
 	})
 	return final, nil
 }
@@ -3212,10 +3258,13 @@ func autoVectorize(root string, s settings.Settings, session, path string) {
 	timeout := mcpTimeout(s)
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(context.Background()), timeout)
 	defer cancel()
-	// Follow the character's recall collection (per-character override wins):
-	// an explicit distill target still wins overall, but the default is the
-	// same library the character reads, never another character's.
-	col := firstNonEmpty(s.DistillVectorizeCollection, effectiveMCPCollection(root, s, session))
+	// The auto-vectorize target is the character's SINGLE write collection
+	// (knowledge/recall collections are read-only). No target = no write.
+	col := writeCollection(root, s, session)
+	if col == "" {
+		obs.Info("vectorize skipped", map[string]any{"session": session, "reason": "no write collection"})
+		return
+	}
 	_, err = mcp.NewWithTimeout(firstNonEmpty(s.MCPURL, "http://192.168.10.2:8199"), timeout).
 		Store(ctx, string(b), col, map[string]string{"type": "distill-auto", "session": session})
 	if err != nil {

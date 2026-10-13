@@ -85,7 +85,7 @@
           <div class="char-fields">
             <label>角色名 <input id="char-name" placeholder="如 Leer乐儿" size="24"></label>
             <label>角色描述<textarea id="char-desc" rows="6" placeholder="写下这个角色的设定、性格、说话方式…（不用宏，直接写自然语言）"></textarea></label>
-            <label>专用 RAG collection <input id="char-collection" placeholder="留空=跟随全局；也可在 Memory 页绑定" size="28"></label>
+            <p class="meta">记忆档案（召回库 / 回灌库 / 蒸馏 prompt）在 <b>Memory</b> 页按角色设置。</p>
           </div>
         </div>
         <div class="row">
@@ -135,56 +135,64 @@
     </section>
     <!-- MEMORY -->
     <section class="page" id="page-memory">
-      <h2>Memory <small>Retrieves relevant memory over MCP-RAG every turn and injects it into the rag_mcp block</small></h2>
+      <h2>Memory <small>每个角色一套记忆档案：召回库(多选) + 自动回灌库(单选) + 蒸馏 prompt；切换角色即切换整套</small></h2>
+
       <div class="glass pad form">
-        <label>MCP endpoint <input id="mem-url" size="28" placeholder="http://192.168.10.2:8199"></label>
-        <label>Collections <span class="meta">Tick one or more. Leave all unticked to use the server default.</span></label>
-        <div id="mem-collection" class="collist" role="group" aria-label="Collections"></div>
-        <div class="glass pad" style="margin:8px 0">
-          <b>Per-character binding <small class="meta">Each character can recall + auto-index its own collection; switching characters switches it automatically. Empty = follow the global Collections above.</small></b>
-          <div id="mem-char-info" class="meta">—</div>
-          <div class="row">
-            <input id="mem-char-collection" size="30" placeholder="character-specific collection (CSV); empty = follow global">
-            <button id="btn-mem-char-save" class="primary">Bind to this character</button>
-            <button id="btn-mem-char-clear">Follow global</button>
-          </div>
+        <div class="row"><b id="mem-char-title">当前角色档案</b><span id="mem-char-badges" class="membadges"></span></div>
+        <div id="mem-char-warn" class="meta hidden"></div>
+
+        <label>召回 collections <span class="meta">多选；一个都不选 = 本角色本轮不召回（新角色先保持干净）</span></label>
+        <div id="mem-recall" class="collist" role="group" aria-label="Recall collections"></div>
+
+        <label>自动回灌 collection <span class="meta">单选；蒸馏结果只写进这里（知识库只读、不回写）</span>
+          <select id="mem-write" style="max-width:260px"><option value="">（不写入）</option></select>
+        </label>
+
+        <div class="row">
+          <label class="meta"><input type="checkbox" id="mem-distill-enabled"> 本角色自动蒸馏</label>
+          <label>每 <input id="mem-distill-interval" type="number" min="1" value="8" style="width:56px"> 个 user 轮</label>
+          <button id="btn-mem-profile-save" class="primary">保存档案</button>
+          <span id="mem-profile-saved" class="meta"></span>
         </div>
+        <label>蒸馏 prompt（按角色人格；留空 = 内置 STATE/LOG 抽取器）
+          <textarea id="mem-distill-prompt" rows="5" placeholder="留空使用内置默认抽取器（STATE/LOG）"></textarea>
+        </label>
+        <div class="row">
+          <button id="btn-mem-prompt-default">载入内置默认</button>
+          <button id="btn-mem-prompt-restore">清空(用默认)</button>
+          <button id="btn-mem-distill-run" class="primary">Distill now</button>
+          <span id="mem-distill-meta" class="meta">—</span>
+        </div>
+      </div>
+
+      <div class="glass pad form">
+        <div class="row"><b>本角色记忆</b><span class="meta">每个 [TAG] 段一个框；[STATE] 常驻，其余按日期自动淘汰并回灌</span>
+          <button id="btn-mem-rebuild" class="meta" title="从 chat.jsonl 的 distilled_memory 记录重建事实表（不调用 LLM）">Backfill records</button>
+        </div>
+        <div id="mem-sections" class="memsections"><span class="meta">还没有记忆，先聊几轮或按 Distill now。</span></div>
+      </div>
+
+      <details class="glass pad form" id="mem-global">
+        <summary><b>全局连接设置</b> <span class="meta">所有角色共用（召回细节在 rag-mcp-server 的 WebUI 管理）</span></summary>
+        <label>MCP endpoint <input id="mem-url" size="28" placeholder="http://192.168.10.2:8199"></label>
         <div class="row">
           <label>Timeout (s) <input id="mem-timeout" type="number" min="1" value="180" style="width:64px"></label>
           <label><input type="checkbox" id="mem-enabled"> Retrieve every turn</label>
+          <label class="meta" title="每次蒸馏后把审计文件 append 进本角色的「自动回灌 collection」"><input type="checkbox" id="dmem-vec-enabled"> Auto-index to RAG</label>
         </div>
-        <p class="meta">Retrieval parameters (top-k, threshold, chunk size, token budget) belong to rag-mcp-server. TavernLab only owns the wait: it injects the response exactly as returned, with no re-ranking, truncation or client-side budget.</p>
         <div class="row">
-          <input id="mem-test-q" size="30" placeholder="Test query, e.g. how did I sleep last week">
-          <button id="btn-mem-test">Run test search</button>
-          <button id="btn-mem-save" class="primary">Save</button>
+          <label>记忆字数上限 max chars <input id="mem-maxchars" type="number" min="0" value="5000" style="width:88px"> <span class="meta">安全阀：超过就从最旧数据丢</span></label>
+          <button id="btn-mem-save" class="primary">保存全局</button>
         </div>
-        <div id="mem-test-out" class="mem-hits"><span class="meta">MCP test results appear here.</span></div>
-        <p class="meta">The toggle only controls automatic injection; the test button runs an ad-hoc query at any time. Every turn's response is recorded in Audit → memory.</p>
-      </div>
+      </details>
+
       <div class="glass pad form">
-        <b>Distilled Memory <small class="meta">(The LLM extracts deltas only; the code owns recording and retention: STATE stays in L1 permanently, LOG entries are evicted by day in L2, and every run is written back to chat.jsonl as distilled_memory)</small></b>
         <div class="row">
-          <label class="meta"><input type="checkbox" id="dmem-enabled"> Auto-distill</label>
-          <label>Every <input id="dmem-interval" type="number" min="1" value="8" style="width:56px"> user turns</label>
-          <label>Cap <input id="dmem-maxchars" type="number" min="200" value="4000" style="width:80px"> chars</label>
-          <label>Keep at least <input id="dmem-retain" type="number" min="1" value="3" style="width:56px"> days</label>
-          <label>Model <input id="dmem-model" size="14" placeholder="empty = main model"></label>
-          <button id="btn-dmem-run" class="primary">Distill now</button>
-          <button id="btn-dmem-save">Save</button>
-          <span id="dmem-meta" class="meta">—</span>
+          <input id="mem-test-q" size="30" placeholder="测试查询，如 how did I sleep last week">
+          <button id="btn-mem-test">Run test search</button>
         </div>
-        <div class="row">
-          <label>STATE retention <input id="dmem-state-days" type="number" min="1" value="30" style="width:64px"> days</label>
-          <label>Max per day <input id="dmem-perday" type="number" min="1" value="40" style="width:56px"> entries</label>
-          <label>Max per entry <input id="dmem-entry" type="number" min="20" value="300" style="width:64px"> chars</label>
-          <button id="btn-dmem-rebuild" title="Rebuilds the fact sheet from every distilled_memory record in chat.jsonl (recovers days dropped by older versions; no LLM call)">Backfill records</button>
-          <label class="meta" title="After each distillation the audit file (raw + delta + movement) is appended to the recall collection. Mixed collections may only append, never rebuild."><input type="checkbox" id="dmem-vec-enabled"> Auto-index to RAG</label>
-          <label title="Empty = follow the Memory collection">Collection <input id="dmem-vec-collection" size="14" placeholder="empty = follow recall"></label>
-        </div>
-        <textarea id="dmem-prompt" rows="6" placeholder="Distillation prompt (leave empty to use the built-in default)"></textarea>
-        <div class="row"><button id="btn-dmem-prompt-reset">Restore default prompt</button><button id="btn-dmem-prompt-view">View saved fact sheet</button></div>
-        <pre id="dmem-out" class="preview-text">The current fact sheet appears here.</pre>
+        <div id="mem-test-out" class="mem-hits"><span class="meta">测试结果会显示在这里（用当前角色的召回库）。</span></div>
+        <p class="meta">档案存在 characters/&lt;名&gt;/profile.json，随角色数据包走；切换角色即切换整套记忆设定。</p>
       </div>
     </section>
     <!-- LOGS -->

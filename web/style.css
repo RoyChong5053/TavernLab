@@ -312,3 +312,32 @@ body[data-theme="tavern-glass"] .msg.user{background:linear-gradient(180deg,rgba
   .msg .body table { font-size: 0.8em; }
   .msg .body blockquote { padding: 0.4em 0.8em; }
 }
+
+/* Memory: per-character profile badges + section boxes */
+.membadges{display:flex;gap:8px;flex-wrap:wrap;margin-left:8px}
+.membadge{font-size:11px;padding:2px 8px;border-radius:20px;border:1px solid var(--line);color:var(--mut);background:rgba(0,0,0,.25)}
+.membadge.on{color:#7ee787;border-color:rgba(126,231,135,.4);background:rgba(126,231,135,.12)}
+.membadge.off{color:var(--mut)}
+.membadge.warn{color:#ffd08a;border-color:rgba(255,208,138,.4);background:rgba(255,208,138,.12)}
+#mem-char-warn{color:#ffd08a;border:1px solid rgba(255,208,138,.35);background:rgba(255,208,138,.08);border-radius:10px;padding:8px 10px;margin:6px 0}
+.memsections{display:flex;flex-direction:column;gap:10px;width:100%}
+.mem-section{border:1px solid var(--line);border-left:3px solid var(--acc2);border-radius:10px;background:var(--card);padding:8px 12px}
+.mem-section-head{display:flex;justify-content:space-between;align-items:baseline;gap:8px;margin-bottom:6px}
+.mem-section-head b{font-size:13px;letter-spacing:.06em}
+.mem-section-body{display:flex;flex-direction:column;gap:2px}
+.mem-line{display:flex;gap:8px;align-items:baseline;font-size:13px;line-height:1.5}
+.mem-when{flex:0 0 auto;color:var(--mut);font-size:11px;font-variant-numeric:tabular-nums}
+.mem-text{flex:1 1 auto;word-break:break-word}
+#mem-global>summary{cursor:pointer;list-style:none}
+#mem-global>summary::-webkit-details-marker{display:none}
+#mem-global>summary::before{content:'▸ ';}
+#mem-global[open]>summary::before{content:'▾ ';}
+
+/* Memory form: stack each top-level label (text above its control) so the
+   prompt textarea and selects are full-width instead of inline-flowing. */
+#page-memory .form > label,
+#page-memory details.form label{display:flex;flex-direction:column;gap:6px;width:100%;align-items:flex-start}
+#page-memory .form .row{width:100%}
+#page-memory .form .row > label{display:flex;flex-direction:row;align-items:center;width:auto;gap:6px}
+#page-memory .form textarea{width:100%;resize:vertical}
+#page-memory .form select{width:auto;min-width:200px}

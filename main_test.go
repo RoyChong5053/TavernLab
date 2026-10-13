@@ -69,7 +69,7 @@ func TestListInputsBuildsDistilledLog(t *testing.T) {
 		ID: "distilled_log", Role: "system", Order: 40, Enabled: true, Level: engine.LevelTrim,
 		Source: engine.Source{Type: "distilled_log"}, Template: "<M>{{items}}</M>",
 	}}
-	lists := listInputs(blocks, nil, root, "阿离", 1)
+	lists := listInputs(blocks, nil, root, "阿离")
 	if len(lists) != 1 || len(lists[0].Items) != 2 {
 		t.Fatalf("want 2 day items, got %+v", lists)
 	}
@@ -315,9 +315,10 @@ func TestResolveMCPTimeoutCancelsRequest(t *testing.T) {
 	defer srv.Close()
 
 	s := settings.Settings{
-		MCPEnabled: true,
-		MCPURL:     srv.URL,
-		MCPTimeout: 1,
+		MCPEnabled:    true,
+		MCPURL:        srv.URL,
+		MCPTimeout:    1,
+		MCPCollection: "test_col",
 	}
 	started := time.Now()
 	_, info := resolveMCP(context.Background(), s, t.TempDir(), "test", []engine.Message{{Role: "user", Content: "query"}})
@@ -350,7 +351,7 @@ func TestResolveMCPInjectsResponseVerbatim(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	s := settings.Settings{MCPEnabled: true, MCPURL: srv.URL, MCPTimeout: 5}
+	s := settings.Settings{MCPEnabled: true, MCPURL: srv.URL, MCPTimeout: 5, MCPCollection: "test_col"}
 	items, info := resolveMCP(context.Background(), s, t.TempDir(), "test", []engine.Message{{Role: "user", Content: "我上周睡眠咋样"}})
 	if len(items) != 1 {
 		t.Fatalf("want a single verbatim item, got %d", len(items))
@@ -435,10 +436,10 @@ func TestChatModelSettingRoundTrips(t *testing.T) {
 	}
 }
 
-// A character's meta.json mcp_collection overrides the global setting, and
-// clearing it falls back to the global again. This is what makes switching
-// characters switch the recall collection with no extra client action.
-func TestEffectiveMCPCollectionFollowsCharacterThenGlobal(t *testing.T) {
+// A character's profile.json owns its recall (multi) and write (single)
+// collections; a legacy character with no profile migrates once from the old
+// global setting, and other characters never see its values (no cross-talk).
+func TestProfileForMigratesAndScopesPerCharacter(t *testing.T) {
 	root := t.TempDir()
 	if err := os.MkdirAll(charBase(root, "阿离"), 0o755); err != nil {
 		t.Fatal(err)
@@ -449,32 +450,61 @@ func TestEffectiveMCPCollectionFollowsCharacterThenGlobal(t *testing.T) {
 	}
 	glob := settings.Settings{MCPCollection: "global_recall"}
 
-	// No override -> global.
-	if got := effectiveMCPCollection(root, glob, "阿离"); got != "global_recall" {
-		t.Fatalf("no override: got %q, want global_recall", got)
+	// No profile.json -> one-time migration from the legacy global setting,
+	// seeding BOTH recall and write so nothing silently stops working.
+	if got := recallCSV(root, glob, "阿离"); got != "global_recall" {
+		t.Fatalf("migrated recall: got %q, want global_recall", got)
 	}
-	if src := collectionSource(root, glob, "阿离"); src != "global" {
-		t.Fatalf("source = %q, want global", src)
+	if got := writeCollection(root, glob, "阿离"); got != "global_recall" {
+		t.Fatalf("migrated write: got %q, want global_recall", got)
+	}
+	if src := profileSource(root, "阿离"); src != "migrated" {
+		t.Fatalf("source = %q, want migrated", src)
 	}
 
-	// Override wins.
-	if err := os.WriteFile(filepath.Join(base, "meta.json"),
-		[]byte(`{"avatar_px":88,"mcp_collection":"ali_recall"}`), 0o644); err != nil {
+	// A concrete profile wins: recall is multi, write is a single explicit id.
+	prof := DefaultProfile()
+	prof.RAG.Collections = []string{"ali_recall", "knowledge"}
+	prof.RAG.WriteCollection = "ali_recall"
+	if err := saveCharProfile(base, prof); err != nil {
 		t.Fatal(err)
 	}
-	if got := effectiveMCPCollection(root, glob, "阿离"); got != "ali_recall" {
-		t.Fatalf("override: got %q, want ali_recall", got)
+	if got := recallCSV(root, glob, "阿离"); got != "ali_recall,knowledge" {
+		t.Fatalf("explicit recall: got %q, want ali_recall,knowledge", got)
 	}
-	if src := collectionSource(root, glob, "阿离"); src != "character" {
+	if got := writeCollection(root, glob, "阿离"); got != "ali_recall" {
+		t.Fatalf("explicit write: got %q, want ali_recall", got)
+	}
+	if src := profileSource(root, "阿离"); src != "character" {
 		t.Fatalf("source = %q, want character", src)
 	}
 
-	// A different character still follows the global: no cross-talk.
+	// A different character still migrates from the global: no cross-talk.
 	if err := os.MkdirAll(charBase(root, "小北"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if got := effectiveMCPCollection(root, glob, "小北"); got != "global_recall" {
+	if got := recallCSV(root, glob, "小北"); got != "global_recall" {
 		t.Fatalf("other character: got %q, want global_recall", got)
+	}
+}
+
+// An empty recall set means "recall nothing", not "server default".
+func TestEmptyRecallMeansNoMemory(t *testing.T) {
+	root := t.TempDir()
+	base := charBase(root, "空空")
+	if err := saveCharCard(base, CharCard{Name: "空空", Description: "x"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveCharProfile(base, DefaultProfile()); err != nil {
+		t.Fatal(err)
+	}
+	s := settings.Settings{MCPEnabled: true, MCPCollection: "global_recall"}
+	items, info := resolveMCP(context.Background(), s, root, "空空", []engine.Message{{Role: "user", Content: "hi"}})
+	if items != nil {
+		t.Fatalf("empty recall must return no items, got %+v", items)
+	}
+	if info["recall"] != false {
+		t.Fatalf("info.recall = %v, want false", info["recall"])
 	}
 }
 
