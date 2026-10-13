@@ -12,17 +12,16 @@ import (
 
 // Settings is the runtime-tunable config. Empty APIKey on PUT means "keep".
 type Settings struct {
-	Upstream        string  `json:"upstream,omitempty"`
-	APIKey          string  `json:"api_key,omitempty"`
-	RerankURL       string  `json:"rerank_url,omitempty"`
-	MCPURL          string  `json:"mcp_url,omitempty"`
-	MCPCollection   string  `json:"mcp_collection,omitempty"`
-	MCPEnabled      bool    `json:"mcp_enabled"`
-	MCPTopK         int     `json:"mcp_topk,omitempty"`
-	MCPTimeout      int     `json:"mcp_timeout,omitempty"`
-	MCPThreshold    float64 `json:"mcp_threshold,omitempty"`     // <0 = omit (server default)
-	MCPBudgetTokens int     `json:"mcp_budget_tokens,omitempty"` // token budget for injected memory (default 2000)
-	MCPPerHitChars  int     `json:"mcp_per_hit_chars,omitempty"` // per-hit char cap (default 2000, backend chunks ~500char, jina cap 1024tok)
+	Upstream      string `json:"upstream,omitempty"`
+	APIKey        string `json:"api_key,omitempty"`
+	RerankURL     string `json:"rerank_url,omitempty"`
+	MCPURL        string `json:"mcp_url,omitempty"`
+	MCPCollection string `json:"mcp_collection,omitempty"`
+	MCPEnabled    bool   `json:"mcp_enabled"`
+	MCPTimeout    int    `json:"mcp_timeout,omitempty"` // wait budget for search/store; 0 = no wait
+	// Retrieval knobs (top-k, threshold, chunk size, budget) live on
+	// rag-mcp-server. TavernLab is a thin client: it injects whatever the
+	// server returns, verbatim, and only owns how long to wait for it.
 	// Context budget (SillyTavern-style): ContextWindow is the total
 	// (input + reply), ReplyReserve is held back for the answer. input =
 	// ContextWindow - ReplyReserve. ReplyReserve is also sent upstream as
@@ -91,11 +90,7 @@ func Defaults() Settings {
 		MCPURL:               "http://192.168.10.2:8199",
 		MCPCollection:        "",
 		MCPEnabled:           false,
-		MCPTopK:              10,
 		MCPTimeout:           180,
-		MCPThreshold:         -1,
-		MCPBudgetTokens:      2000,
-		MCPPerHitChars:       2000,
 		ContextWindow:        16384,
 		ReplyReserve:         4096,
 		HistoryMinTurns:      4,
@@ -148,20 +143,8 @@ func Load(root string) Settings {
 		s.MCPCollection = f.MCPCollection
 	}
 	s.MCPEnabled = f.MCPEnabled
-	if f.MCPTopK > 0 {
-		s.MCPTopK = f.MCPTopK
-	}
 	if f.MCPTimeout > 0 {
 		s.MCPTimeout = f.MCPTimeout
-	}
-	if f.MCPThreshold >= 0 {
-		s.MCPThreshold = f.MCPThreshold
-	}
-	if f.MCPBudgetTokens > 0 {
-		s.MCPBudgetTokens = f.MCPBudgetTokens
-	}
-	if f.MCPPerHitChars > 0 {
-		s.MCPPerHitChars = f.MCPPerHitChars
 	}
 	if f.ContextWindow > 0 {
 		s.ContextWindow = f.ContextWindow

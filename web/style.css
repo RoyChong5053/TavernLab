@@ -61,6 +61,19 @@ button.primary{background:var(--acc);color:#06222e;border:none;font-weight:700}
 .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 .meta{color:var(--mut);font-size:12px}
 .pad{padding:12px}.form{display:flex;flex-direction:column;gap:10px;align-items:flex-start}
+/* collection picker: one tickable row per collection — description on top,
+   checkbox underneath, whole row tappable (ctrl-click multi-select does not
+   work on touch) */
+.collist{display:flex;flex-direction:column;gap:6px;width:100%}
+.coll-item{display:flex;flex-direction:column;gap:6px;width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:10px;background:rgba(0,0,0,.25);cursor:pointer;transition:border-color .15s,background .15s}
+.coll-item:hover{background:rgba(255,255,255,.07)}
+.coll-item:has(input:checked){border-color:var(--acc);background:rgba(125,211,252,.12)}
+.coll-item:has(input:disabled){cursor:not-allowed;opacity:.5}
+.coll-text{display:flex;flex-direction:column;gap:2px;min-width:0}
+.coll-name{font-size:13px;font-weight:600;word-break:break-all}
+.coll-meta{font-size:11px;color:var(--mut)}
+.coll-item input[type=checkbox]{width:auto;height:18px;padding:0;margin:0;background:transparent;border:none;accent-color:var(--acc);align-self:flex-start}
+body[data-theme="paper"] .coll-item{background:rgba(255,255,255,.6)}
 /* chat */
 .page.on{width:100%}
 #page-chat{max-width:none}

@@ -132,53 +132,47 @@
     </section>
     <!-- MEMORY -->
     <section class="page" id="page-memory">
-      <h2>Memory <small>MCP-RAG 每轮自动检索你的发言注入 rag_mcp block</small></h2>
+      <h2>Memory <small>Retrieves relevant memory over MCP-RAG every turn and injects it into the rag_mcp block</small></h2>
       <div class="glass pad form">
-        <label>MCP 地址 <input id="mem-url" size="28" placeholder="http://192.168.10.2:8199"></label>
-        <label>Collection（可多选，空=服务端默认） <select id="mem-collection" multiple size="4"></select></label>
+        <label>MCP endpoint <input id="mem-url" size="28" placeholder="http://192.168.10.2:8199"></label>
+        <label>Collections <span class="meta">Tick one or more. Leave all unticked to use the server default.</span></label>
+        <div id="mem-collection" class="collist" role="group" aria-label="Collections"></div>
         <div class="row">
-          <label>top-k（仅服务端hint，数量由rag-mcp-server定） <input id="mem-topk" type="number" value="10" style="width:56px"></label>
-          <label>记忆预算 <input id="mem-budget" type="number" min="200" value="2000" style="width:80px"> tokens</label>
-          <label>单条上限 <input id="mem-perhit" type="number" min="200" value="2000" style="width:80px"> chars</label>
+          <label>Timeout (s) <input id="mem-timeout" type="number" min="1" value="180" style="width:64px"></label>
+          <label><input type="checkbox" id="mem-enabled"> Retrieve every turn</label>
         </div>
+        <p class="meta">Retrieval parameters (top-k, threshold, chunk size, token budget) belong to rag-mcp-server. TavernLab only owns the wait: it injects the response exactly as returned, with no re-ranking, truncation or client-side budget.</p>
         <div class="row">
-          <label>timeout（秒） <input id="mem-timeout" type="number" min="1" value="180" style="width:64px"></label>
-          <label>threshold（-1=服务端默认） <input id="mem-threshold" type="number" step="0.01" value="-1" style="width:64px"></label>
-          <label><input type="checkbox" id="mem-enabled"> 每轮自动检索</label>
+          <input id="mem-test-q" size="30" placeholder="Test query, e.g. how did I sleep last week">
+          <button id="btn-mem-test">Run test search</button>
+          <button id="btn-mem-save" class="primary">Save</button>
         </div>
-        <p class="meta">TavernLab 不决定拿几条 docs，只按“记忆预算 tokens”裁剪；后端 chunk 约 500char，jina reranker 上限 1024 tokens，超长单条会被截断并在 Audit 标注。</p>
-        <p class="meta">多选说明：每个 collection 各召回 30 候选 → 合并一次 rerank → 输出仍是全局 top-k（不是 top-k×N）。主力机（qdrant + RTX4060）多选无压力；若 qdrant 主机关机、改由 CPU 设备 fan-out 算 vectra 库，请少选（1–2 个），过慢可到 rag-mcp WebUI 把 rerank 预设调成 20 docs/库。平时建议只选角色记忆库，知识库检索留到后续 <code>/full-rag</code> 开关。</p>
-        <div class="row">
-          <input id="mem-test-q" size="30" placeholder="测试查询，如：我上周睡眠咋样">
-          <button id="btn-mem-test">测试检索</button>
-          <button id="btn-mem-save" class="primary">保存</button>
-        </div>
-        <pre id="mem-test-out" class="preview-text">MCP 直连测试结果显示在这里。</pre>
-        <p class="meta">开关只决定“自动注不注入”；测试按钮随时手查。命中明细每轮记进 Audit → memory 字段。</p>
+        <pre id="mem-test-out" class="preview-text">MCP test results appear here.</pre>
+        <p class="meta">The toggle only controls automatic injection; the test button runs an ad-hoc query at any time. Every turn's response is recorded in Audit → memory.</p>
       </div>
       <div class="glass pad form">
-        <b>Distilled Memory <small class="meta">（LLM 只提取增量，代码拥有记录与保留策略：STATE 常驻 L1，LOG 按天在 L2 被系统淘汰，并以 distilled_memory 记进 chat.jsonl）</small></b>
+        <b>Distilled Memory <small class="meta">(The LLM extracts deltas only; the code owns recording and retention: STATE stays in L1 permanently, LOG entries are evicted by day in L2, and every run is written back to chat.jsonl as distilled_memory)</small></b>
         <div class="row">
-          <label class="meta"><input type="checkbox" id="dmem-enabled"> 自动蒸馏</label>
-          <label>每 <input id="dmem-interval" type="number" min="1" value="8" style="width:56px"> 个用户轮</label>
-          <label>上限 <input id="dmem-maxchars" type="number" min="200" value="4000" style="width:80px"> 字</label>
-          <label>至少保留 <input id="dmem-retain" type="number" min="1" value="3" style="width:56px"> 天</label>
-          <label>模型 <input id="dmem-model" size="14" placeholder="空=主模型"></label>
-          <button id="btn-dmem-run" class="primary">立即蒸馏</button>
-          <button id="btn-dmem-save">保存</button>
+          <label class="meta"><input type="checkbox" id="dmem-enabled"> Auto-distill</label>
+          <label>Every <input id="dmem-interval" type="number" min="1" value="8" style="width:56px"> user turns</label>
+          <label>Cap <input id="dmem-maxchars" type="number" min="200" value="4000" style="width:80px"> chars</label>
+          <label>Keep at least <input id="dmem-retain" type="number" min="1" value="3" style="width:56px"> days</label>
+          <label>Model <input id="dmem-model" size="14" placeholder="empty = main model"></label>
+          <button id="btn-dmem-run" class="primary">Distill now</button>
+          <button id="btn-dmem-save">Save</button>
           <span id="dmem-meta" class="meta">—</span>
         </div>
         <div class="row">
-          <label>STATE 保留 <input id="dmem-state-days" type="number" min="1" value="30" style="width:64px"> 天</label>
-          <label>每天最多 <input id="dmem-perday" type="number" min="1" value="40" style="width:56px"> 条</label>
-          <label>单条最多 <input id="dmem-entry" type="number" min="20" value="300" style="width:64px"> 字</label>
-          <button id="btn-dmem-rebuild" title="从 chat.jsonl 里所有 distilled_memory 记录重建事实表（找回旧版被丢弃的天，不调用 LLM）">回填旧记录</button>
-          <label class="meta" title="每次蒸馏后把审计文件（raw+delta+movement）append 进召回同库。混库只许 append，禁 rebuild。"><input type="checkbox" id="dmem-vec-enabled"> 自动入库RAG</label>
-          <label title="空=跟随 Memory 的召回库">库 <input id="dmem-vec-collection" size="14" placeholder="空=跟随召回库"></label>
+          <label>STATE retention <input id="dmem-state-days" type="number" min="1" value="30" style="width:64px"> days</label>
+          <label>Max per day <input id="dmem-perday" type="number" min="1" value="40" style="width:56px"> entries</label>
+          <label>Max per entry <input id="dmem-entry" type="number" min="20" value="300" style="width:64px"> chars</label>
+          <button id="btn-dmem-rebuild" title="Rebuilds the fact sheet from every distilled_memory record in chat.jsonl (recovers days dropped by older versions; no LLM call)">Backfill records</button>
+          <label class="meta" title="After each distillation the audit file (raw + delta + movement) is appended to the recall collection. Mixed collections may only append, never rebuild."><input type="checkbox" id="dmem-vec-enabled"> Auto-index to RAG</label>
+          <label title="Empty = follow the Memory collection">Collection <input id="dmem-vec-collection" size="14" placeholder="empty = follow recall"></label>
         </div>
-        <textarea id="dmem-prompt" rows="6" placeholder="蒸馏提示词（留空用内置默认）"></textarea>
-        <div class="row"><button id="btn-dmem-prompt-reset">恢复默认提示词</button><button id="btn-dmem-prompt-view">查看已保存事实表</button></div>
-        <pre id="dmem-out" class="preview-text">当前事实表显示在这里。</pre>
+        <textarea id="dmem-prompt" rows="6" placeholder="Distillation prompt (leave empty to use the built-in default)"></textarea>
+        <div class="row"><button id="btn-dmem-prompt-reset">Restore default prompt</button><button id="btn-dmem-prompt-view">View saved fact sheet</button></div>
+        <pre id="dmem-out" class="preview-text">The current fact sheet appears here.</pre>
       </div>
     </section>
     <!-- LOGS -->

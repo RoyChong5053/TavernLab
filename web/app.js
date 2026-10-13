@@ -1306,8 +1306,8 @@ $('#btn-preview').onclick = async () => {
   if (!res) return;
   const m = res.memory || {};
   $('#preview-memory').textContent = m.enabled
-    ? `MCP: ${m.collection} · query=「${(m.query || '').slice(0, 60)}」 · hits=${m.hits ?? '?'} · 预算${m.budget_tokens ?? '?'}用了${m.used_tokens ?? '?'}${m.error ? ' · ⚠ ' + m.error : ''}`
-    : 'MCP 未启用：本轮无记忆注入';
+    ? `MCP: ${m.collection} · query=「${(m.query || '').slice(0, 60)}」 · ${m.chars ?? 0} chars${m.error ? ' · ⚠ ' + m.error : ''}`
+    : 'MCP disabled: no memory injected this turn';
   $('#preview-blocks').innerHTML = budgetLine(res);
   $('#preview-text').textContent = res.prompt_text || '(空)';
   $('#preview-modal').classList.remove('hidden');
@@ -1370,7 +1370,7 @@ async function viewAudit() {
   const truncWarn = fin === 'length' ? ' · <span style="color:#ffb4b4">⚠ 生成被截断（finish=length），调大“回复预留”</span>' : '';
   const overWarn = a.overflow ? ' · <span style="color:#ffb4b4">⚠ OVERFLOW（超过输入预算）</span>' : '';
   const memTxt = mem.enabled
-    ? `记忆：${esc(mem.collection || '')} · query=「${esc((mem.query || '').slice(0, 60))}」 · hits=${mem.hits ?? '?'} · 预算${mem.budget_tokens ?? '?'}用了${mem.used_tokens ?? '?'}${mem.error ? ' · ⚠ ' + esc(mem.error) : ''}`
+    ? `记忆：${esc(mem.collection || '')} · query=「${esc((mem.query || '').slice(0, 60))}」 · ${mem.chars ?? 0} chars${mem.error ? ' · ⚠ ' + esc(mem.error) : ''}`
     : '记忆：未启用';
   $('#audit-summary').innerHTML =
     `<b>${a.total_tokens}</b> / ${a.budget_tokens} 输入 tokens（估算${est} vs 实际${act || '?'}` +
@@ -1610,42 +1610,74 @@ $('#char-file').onchange = async (e) => {
 };
 
 /* ---------- memory (server-backed) ---------- */
-// The collection picker is a <select multiple>; settings keep one CSV string.
-// memCollectionWanted holds the ids that should be selected once the async
-// list from rag-mcp-server arrives (load and refresh can race).
+// The collection picker is a list of checkbox rows (the native multiple
+// select needs ctrl on desktop and is unusable on touch); settings keep one
+// CSV string. memCollectionWanted holds the ids that should be ticked once
+// the async list from rag-mcp-server arrives (load and refresh can race).
 let memCollectionWanted = [];
+function collectionRow({ name, meta, checked, disabled }) {
+  const row = document.createElement('label');
+  row.className = 'coll-item' + (disabled ? ' off' : '');
+  const text = document.createElement('span');
+  text.className = 'coll-text';
+  const n = document.createElement('span');
+  n.className = 'coll-name';
+  n.textContent = name;
+  const m = document.createElement('span');
+  m.className = 'coll-meta';
+  m.textContent = meta || '';
+  text.append(n, m);
+  const box = document.createElement('input');
+  box.type = 'checkbox';
+  box.value = name;
+  box.checked = !!checked;
+  box.disabled = !!disabled;
+  row.append(text, box);
+  return row;
+}
+function selectedCollections() {
+  const wrap = $('#mem-collection');
+  if (!wrap) return [];
+  return Array.from(wrap.querySelectorAll('input[type=checkbox]:checked')).map((b) => b.value);
+}
 function applyCollectionSelection() {
-  const sel = $('#mem-collection');
-  if (!sel) return;
+  const wrap = $('#mem-collection');
+  if (!wrap) return;
   const want = new Set(memCollectionWanted);
-  for (const o of sel.options) o.selected = want.has(o.value);
-  // A stored id missing from the fetched list must stay visible/selected so
+  const seen = new Set();
+  for (const box of wrap.querySelectorAll('input[type=checkbox]')) {
+    box.checked = want.has(box.value);
+    seen.add(box.value);
+  }
+  // A stored id missing from the fetched list must stay visible and ticked so
   // a stale setting is never silently dropped (e.g. rag-mcp unreachable).
-  const missing = memCollectionWanted.filter((id) => ![...sel.options].some((o) => o.value === id));
-  for (const id of missing) {
-    const o = document.createElement('option');
-    o.value = id;
-    o.textContent = id + '（不在列表）';
-    o.selected = true;
-    sel.appendChild(o);
+  for (const id of memCollectionWanted) {
+    if (seen.has(id)) continue;
+    wrap.appendChild(collectionRow({ name: id, meta: 'not returned by the server', checked: true }));
+    seen.add(id);
   }
 }
 async function refreshCollections() {
   try {
     const list = await (await api('/api/mcp/collections')).json();
-    const sel = $('#mem-collection');
-    if (!Array.isArray(list) || !sel) return;
+    const wrap = $('#mem-collection');
+    if (!Array.isArray(list) || !wrap) return;
     if (!memCollectionWanted.length) {
-      memCollectionWanted = Array.from(sel.selectedOptions).map((o) => o.value);
+      memCollectionWanted = selectedCollections();
     }
-    sel.innerHTML = list.map((c) => {
-      const tags = [];
-      if (!c.enabled) tags.push('disabled');
-      if (c.exists === false) tags.push('missing');
-      const label = `${c.name} · ${c.chunk_count ?? '?'} chunks${tags.length ? ' (' + tags.join(', ') + ')' : ''}`;
-      const disabled = (!c.enabled || c.exists === false) ? ' disabled' : '';
-      return `<option value="${c.name}"${disabled}>${label}</option>`;
-    }).join('');
+    wrap.innerHTML = '';
+    for (const c of list) {
+      const notes = [];
+      if (!c.enabled) notes.push('disabled');
+      if (c.exists === false) notes.push('missing');
+      const chunks = Number.isFinite(c.chunk_count) ? c.chunk_count.toLocaleString() : '?';
+      wrap.appendChild(collectionRow({
+        name: c.name,
+        meta: `${chunks} chunks${notes.length ? ' · ' + notes.join(', ') : ''}`,
+        checked: memCollectionWanted.includes(c.name),
+        disabled: !c.enabled || c.exists === false,
+      }));
+    }
     applyCollectionSelection();
   } catch { /* rag-mcp unreachable: keep whatever selection exists readable */ }
 }
@@ -1662,11 +1694,7 @@ async function loadServerSettings() {
     $('#mem-url').value = s.mcp_url || '';
     memCollectionWanted = (s.mcp_collection || '').split(',').map((x) => x.trim()).filter(Boolean);
     applyCollectionSelection();
-    $('#mem-topk').value = s.mcp_topk ?? 10;
-    $('#mem-budget').value = s.mcp_budget_tokens ?? 2000;
-    $('#mem-perhit').value = s.mcp_per_hit_chars ?? 2000;
     $('#mem-timeout').value = s.mcp_timeout ?? 180;
-    $('#mem-threshold').value = s.mcp_threshold ?? -1;
     $('#mem-enabled').checked = !!s.mcp_enabled;
     if (s.current_char && s.current_char !== settings.char) { settings.char = s.current_char; store.set('settings', settings); }
     // Seed the local model from the server-shared one when this browser has
@@ -1683,31 +1711,27 @@ async function saveMemory(silent) {
     method: 'PUT', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       mcp_url: $('#mem-url').value.trim(),
-      mcp_collection: Array.from($('#mem-collection').selectedOptions).map((o) => o.value).join(','),
-      mcp_topk: +$('#mem-topk').value || 10,
-      mcp_budget_tokens: +$('#mem-budget').value || 2000,
-      mcp_per_hit_chars: +$('#mem-perhit').value || 2000,
+      mcp_collection: selectedCollections().join(','),
       mcp_timeout: +$('#mem-timeout').value || 180,
-      mcp_threshold: +$('#mem-threshold').value,
       mcp_enabled: $('#mem-enabled').checked,
     }),
   });
-  $('#mem-test-out').textContent = '已保存。开“每轮自动检索”后，下次发送即注入。';
-  if (!silent) toast('Memory 设置已保存');
+  $('#mem-test-out').textContent = 'Saved. With “Retrieve every turn” enabled, the next message injects this memory verbatim.';
+  if (!silent) toast('Memory settings saved');
 }
 $('#btn-mem-save').onclick = () => asyncAction($('#btn-mem-save'), () => saveMemory(false));
-['mem-url', 'mem-collection', 'mem-topk', 'mem-budget', 'mem-perhit', 'mem-timeout', 'mem-threshold', 'mem-enabled'].forEach((id) => {
-  const el = document.getElementById(id); if (el) el.addEventListener('change', () => saveMemory(true).catch((e) => toast('Memory 保存失败：' + e.message, 'err')));
+['mem-url', 'mem-collection', 'mem-timeout', 'mem-enabled'].forEach((id) => {
+  const el = document.getElementById(id); if (el) el.addEventListener('change', () => saveMemory(true).catch((e) => toast('Failed to save memory settings: ' + e.message, 'err')));
 });
 $('#btn-mem-test').onclick = async () => {
-  const q = $('#mem-test-q').value.trim() || '测试';
-  $('#mem-test-out').textContent = '检索中…';
+  const q = $('#mem-test-q').value.trim() || 'test';
+  $('#mem-test-out').textContent = 'Searching…';
   try {
     const j = await (await api('/api/memory/search', {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ query: q }),
     })).json();
     $('#mem-test-out').textContent = JSON.stringify(j, null, 2).slice(0, 4000);
-  } catch (e) { $('#mem-test-out').textContent = '失败：' + e; }
+  } catch (e) { $('#mem-test-out').textContent = 'Failed: ' + e; }
 };
 async function saveNtfy(silent) {
   await api('/api/settings', {
@@ -1739,12 +1763,12 @@ async function loadDistill() {
     $('#dmem-vec-collection').value = (j.vectorize_collection || '') === '(server default)' ? '' : (j.vectorize_collection || '');
     // Open editable prompt: always show the effective template, not a blank box.
     $('#dmem-prompt').value = j.prompt || distillDefaultPrompt;
-    $('#dmem-prompt').placeholder = '蒸馏提示词（可直接编辑；点“恢复默认提示词”重置）';
+    $('#dmem-prompt').placeholder = 'Distillation prompt (editable; “Restore default prompt” resets it)';
     const m = j.meta || {};
     const days = j.days || 0;
-    $('#dmem-meta').textContent = (m.runs ? `已运行 ${m.runs} 次 · 上次 ${(m.last_run || '').replace('T', ' ').replace(/\+.*$/, '')}` : '尚未蒸馏') + (days ? ` · ${days} 天日志` : '') + (m.last_vectorize ? ` · 入库 ${(m.last_vectorize || '').replace('T', ' ').replace(/\+.*$/, '')}${m.last_vectorize_error ? '⚠' : ''}` : '');
-    $('#dmem-out').textContent = (j.sheet && j.sheet.trim()) ? j.sheet : '（还没有记录，攒够轮数或点“立即蒸馏”）';
-  } catch (e) { toast('蒸馏信息加载失败：' + e.message, 'err'); }
+    $('#dmem-meta').textContent = (m.runs ? `${m.runs} run${m.runs === 1 ? '' : 's'} · last ${(m.last_run || '').replace('T', ' ').replace(/\+.*$/, '')}` : 'not run yet') + (days ? ` · ${days} days of log` : '') + (m.last_vectorize ? ` · indexed ${(m.last_vectorize || '').replace('T', ' ').replace(/\+.*$/, '')}${m.last_vectorize_error ? '⚠' : ''}` : '');
+    $('#dmem-out').textContent = (j.sheet && j.sheet.trim()) ? j.sheet : '(no entries yet — reach the turn threshold or press “Distill now”)';
+  } catch (e) { toast('Failed to load distillation info: ' + e.message, 'err'); }
 }
 async function saveDistill(silent) {
   await api('/api/settings', {
@@ -1763,18 +1787,18 @@ async function saveDistill(silent) {
       distill_vectorize_collection: $('#dmem-vec-collection').value.trim(),
     }),
   });
-  if (!silent) toast('蒸馏设置已保存');
+  if (!silent) toast('Distillation settings saved');
 }
 $('#btn-dmem-save').onclick = () => asyncAction($('#btn-dmem-save'), () => saveDistill(false));
 ['dmem-enabled', 'dmem-interval', 'dmem-maxchars', 'dmem-retain', 'dmem-state-days', 'dmem-perday', 'dmem-entry', 'dmem-model', 'dmem-prompt', 'dmem-vec-enabled', 'dmem-vec-collection'].forEach((id) => {
   const el = document.getElementById(id); if (el) el.addEventListener('change', () => saveDistill(true).catch((e) => toast('保存失败：' + e.message, 'err')));
 });
 $('#btn-dmem-run').onclick = () => asyncAction($('#btn-dmem-run'), async () => {
-  $('#dmem-meta').textContent = '蒸馏中…（可能耗时数十秒，请勿关闭）';
+  $('#dmem-meta').textContent = 'Distilling… (can take tens of seconds — keep this page open)';
   const r = await api('/api/distilled/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ session: settings.char }) });
   const j = await r.json();
   if (!j.ok) throw new Error(j.error || ('HTTP ' + r.status));
-  toast('蒸馏完成');
+  toast('Distillation finished');
   await loadDistill();
 });
 $('#btn-dmem-prompt-reset').onclick = () => {
@@ -1784,11 +1808,11 @@ $('#btn-dmem-prompt-reset').onclick = () => {
 };
 $('#btn-dmem-prompt-view').onclick = () => loadDistill();
 $('#btn-dmem-rebuild').onclick = () => asyncAction($('#btn-dmem-rebuild'), async () => {
-  if (!(await uiConfirm('从 chat.jsonl 的所有 distilled_memory 记录重建事实表？会先备份为 distilled.md.bak，不调用 LLM。'))) return;
+  if (!(await uiConfirm('Rebuild the fact sheet from every distilled_memory record in chat.jsonl? A distilled.md.bak backup is written first and no LLM is called.'))) return;
   const r = await api('/api/distilled/rebuild', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ session: settings.char }) });
   const j = await r.json();
   if (!j.ok) throw new Error(j.error || ('HTTP ' + r.status));
-  toast(`回填完成：${j.sheets} 条记录 → ${j.days} 天`);
+  toast(`Backfill complete: ${j.sheets} records → ${j.days} days`);
   await loadDistill();
 });
 

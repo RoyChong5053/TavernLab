@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/RoyChong5053/TavernLab/internal/distill"
 	"github.com/RoyChong5053/TavernLab/internal/engine"
@@ -313,11 +315,9 @@ func TestResolveMCPTimeoutCancelsRequest(t *testing.T) {
 	defer srv.Close()
 
 	s := settings.Settings{
-		MCPEnabled:   true,
-		MCPURL:       srv.URL,
-		MCPTimeout:   1,
-		MCPTopK:      10,
-		MCPThreshold: -1,
+		MCPEnabled: true,
+		MCPURL:     srv.URL,
+		MCPTimeout: 1,
 	}
 	started := time.Now()
 	_, info := resolveMCP(context.Background(), s, []engine.Message{{Role: "user", Content: "query"}})
@@ -333,6 +333,33 @@ func TestResolveMCPTimeoutCancelsRequest(t *testing.T) {
 	case <-handlerDone:
 	case <-time.After(3 * time.Second):
 		t.Fatal("test server handler did not finish")
+	}
+}
+
+// The thin client's contract: whatever rag-mcp-server returns is injected
+// unchanged — no re-sorting, no per-hit truncation, no client-side budget.
+func TestResolveMCPInjectsResponseVerbatim(t *testing.T) {
+	payload := "Found 2 results:\n\n--- Result 1 (score: 0.931) ---\nID: 1\n记忆A\n\n--- Result 2 (score: 0.812) ---\nID: 2\n记忆B"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		body, _ := json.Marshal(map[string]any{
+			"jsonrpc": "2.0", "id": 1,
+			"result": map[string]any{"content": []map[string]any{{"type": "text", "text": payload}}},
+		})
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+
+	s := settings.Settings{MCPEnabled: true, MCPURL: srv.URL, MCPTimeout: 5}
+	items, info := resolveMCP(context.Background(), s, []engine.Message{{Role: "user", Content: "我上周睡眠咋样"}})
+	if len(items) != 1 {
+		t.Fatalf("want a single verbatim item, got %d", len(items))
+	}
+	if items[0].Text != payload {
+		t.Fatalf("injected text altered:\n got %q\nwant %q", items[0].Text, payload)
+	}
+	if c, ok := info["chars"].(int); !ok || c != utf8.RuneCountInString(payload) {
+		t.Fatalf("audit info must report the payload rune count, got %v", info["chars"])
 	}
 }
 

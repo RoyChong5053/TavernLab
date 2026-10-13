@@ -1,7 +1,9 @@
 // Package mcp is a minimal Streamable-HTTP client for rag-mcp-server.
 //
 // Only tools/call search_memory is needed: TavernLab passes the latest user
-// utterance as query and injects the returned chunks into mcp-source blocks.
+// utterance as query and injects the server's response, verbatim, into
+// mcp-source blocks. Retrieval parameters (top-k, threshold, chunk size) live
+// on the server, so there is nothing to parse or re-format here.
 // Fail-open by design: the caller records the error in audit and chats on.
 package mcp
 
@@ -12,12 +14,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
-	"strconv"
 	"strings"
 	"time"
-
-	"github.com/RoyChong5053/TavernLab/internal/memory"
 )
 
 const DefaultTimeout = 120 * time.Second
@@ -43,14 +41,11 @@ func NewWithTimeout(baseURL string, timeout time.Duration) *Client {
 	}
 }
 
-var resultHead = regexp.MustCompile(`(?m)^--- Result \d+ \(score: ([\d.]+)\) ---\n?`)
-
 // CallTool invokes any tool on the server and returns the concatenated text
-// content blocks verbatim. This is the generic escape hatch: Search() is a
-// specialised wrapper that also parses the RAG "--- Result N ---" format, but
-// a second MCP server (reitti-mcp) exposes tools whose text is meant to be read
-// as-is, so the raw form has to be reachable without re-implementing the
-// JSON-RPC / error plumbing.
+// content blocks verbatim. This is the generic escape hatch: a second MCP
+// server (reitti-mcp) exposes tools whose text is meant to be read as-is, so
+// the raw form has to be reachable without re-implementing the JSON-RPC /
+// error plumbing.
 func (c *Client) CallTool(ctx context.Context, name string, args map[string]any) (string, error) {
 	if strings.TrimSpace(name) == "" {
 		return "", fmt.Errorf("empty tool name")
@@ -119,13 +114,16 @@ func (c *Client) CallTool(ctx context.Context, name string, args map[string]any)
 	return out, nil
 }
 
-// Search calls search_memory. Empty collection = server default (global_memory).
-// collection may be a single id or a CSV list ("a,b"); multiple distinct ids are
-// sent as collection_ids so the server searches them in one call.
-// topK<=0 omits top_k (server default); threshold<0 omits threshold.
-func (c *Client) Search(ctx context.Context, query, collection string, topK int, threshold float64) ([]memory.Hit, error) {
+// Search calls search_memory and returns the server's response text exactly as
+// it arrives. Empty collection = server default. collection may be a single id
+// or a CSV list ("a,b"); multiple distinct ids are sent as collection_ids so the
+// server searches them in one call.
+//
+// Nothing is parsed or re-formatted: the same bytes the rag-mcp-server
+// dashboard shows for a query are the bytes that reach the prompt.
+func (c *Client) Search(ctx context.Context, query, collection string) (string, error) {
 	if strings.TrimSpace(query) == "" {
-		return nil, fmt.Errorf("empty query")
+		return "", fmt.Errorf("empty query")
 	}
 	args := map[string]any{"query": query}
 	if ids := splitCollectionCSV(collection); len(ids) > 1 {
@@ -133,17 +131,7 @@ func (c *Client) Search(ctx context.Context, query, collection string, topK int,
 	} else if len(ids) == 1 {
 		args["collection_id"] = ids[0]
 	}
-	if topK > 0 {
-		args["top_k"] = topK
-	}
-	if threshold >= 0 {
-		args["threshold"] = threshold
-	}
-	text, err := c.CallTool(ctx, "search_memory", args)
-	if err != nil {
-		return nil, err
-	}
-	return splitResults(text), nil
+	return c.CallTool(ctx, "search_memory", args)
 }
 
 // Store calls store_memory. Empty collection = server default (the caller
@@ -180,56 +168,4 @@ func splitCollectionCSV(s string) []string {
 		}
 	}
 	return ids
-}
-
-// splitResults chops the "--- Result N (score: X) ---" formatted text into hits.
-func splitResults(text string) []memory.Hit {
-	if strings.TrimSpace(text) == "" || strings.HasPrefix(strings.TrimSpace(text), "No results found") {
-		return nil
-	}
-	locs := resultHead.FindAllStringSubmatchIndex(text, -1)
-	if len(locs) == 0 {
-		return []memory.Hit{{ID: "mcp-1", Text: strings.TrimSpace(text), Source: "mcp"}}
-	}
-	var hits []memory.Hit
-	for i, loc := range locs {
-		start := loc[0]
-		end := len(text)
-		if i+1 < len(locs) {
-			end = locs[i+1][0]
-		}
-		score := 0.0
-		if s, err := strconv.ParseFloat(text[loc[2]:loc[3]], 64); err == nil {
-			score = s
-		}
-		body := strings.TrimSpace(text[loc[1]:end])
-		hit := memory.Hit{ID: fmt.Sprintf("mcp-%d", i+1), Text: body, Score: score, Source: "mcp"}
-		// Peel "Collection: x" / "Source: y" header lines when present.
-		lines := strings.SplitN(body, "\n", 4)
-		rest := body
-		for _, ln := range lines {
-			if v, ok := strings.CutPrefix(ln, "Collection: "); ok {
-				hit.Source = "mcp:" + strings.TrimSpace(v)
-				rest = strings.TrimPrefix(rest, ln+"\n")
-			} else if v, ok := strings.CutPrefix(ln, "Source: "); ok {
-				rest = strings.TrimPrefix(rest, ln+"\n")
-				_ = v
-			} else {
-				break
-			}
-		}
-		hit.Text = strings.TrimSpace(rest)
-		hits = append(hits, hit)
-		_ = start
-	}
-	return hits
-}
-
-// Format renders hits for injection into an mcp block template.
-func Format(hits []memory.Hit) string {
-	var sb strings.Builder
-	for i, h := range hits {
-		fmt.Fprintf(&sb, "--- [memory %d · score %.3f · %s] ---\n%s\n", i+1, h.Score, h.Source, h.Text)
-	}
-	return strings.TrimSpace(sb.String())
 }

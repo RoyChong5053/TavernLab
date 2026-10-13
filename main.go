@@ -31,12 +31,12 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/RoyChong5053/TavernLab/internal/distill"
 	"github.com/RoyChong5053/TavernLab/internal/engine"
 	"github.com/RoyChong5053/TavernLab/internal/expression"
 	"github.com/RoyChong5053/TavernLab/internal/mcp"
-	"github.com/RoyChong5053/TavernLab/internal/memory"
 	"github.com/RoyChong5053/TavernLab/internal/obs"
 	"github.com/RoyChong5053/TavernLab/internal/proxy"
 	"github.com/RoyChong5053/TavernLab/internal/reitti"
@@ -128,20 +128,11 @@ func (r *runtimeSettings) update(root string, patch map[string]any) settings.Set
 	if v, ok := patch["mcp_enabled"].(bool); ok {
 		r.cur.MCPEnabled = v
 	}
-	if v, ok := patch["mcp_topk"].(float64); ok && v > 0 {
-		r.cur.MCPTopK = int(v)
-	}
+	// mcp_topk / mcp_threshold / mcp_budget_tokens / mcp_per_hit_chars are
+	// gone: retrieval is owned by rag-mcp-server and its response is injected
+	// as returned. Unknown keys in a patch are ignored.
 	if v, ok := patch["mcp_timeout"].(float64); ok && v > 0 {
 		r.cur.MCPTimeout = int(v)
-	}
-	if v, ok := patch["mcp_threshold"].(float64); ok {
-		r.cur.MCPThreshold = v
-	}
-	if v, ok := patch["mcp_budget_tokens"].(float64); ok && v > 0 {
-		r.cur.MCPBudgetTokens = int(v)
-	}
-	if v, ok := patch["mcp_per_hit_chars"].(float64); ok && v > 0 {
-		r.cur.MCPPerHitChars = int(v)
 	}
 	if v, ok := patch["max_tokens"].(float64); ok && v > 0 {
 		r.cur.ReplyReserve = int(v)
@@ -420,8 +411,7 @@ func main() {
 				"upstream": s.Upstream, "api_key_set": s.APIKey != "",
 				"api_key_hint": settings.Mask(s.APIKey), "rerank_url": s.RerankURL,
 				"mcp_url": s.MCPURL, "mcp_collection": s.MCPCollection,
-				"mcp_enabled": s.MCPEnabled, "mcp_topk": s.MCPTopK, "mcp_timeout": s.MCPTimeout, "mcp_threshold": s.MCPThreshold,
-				"mcp_budget_tokens": s.MCPBudgetTokens, "mcp_per_hit_chars": s.MCPPerHitChars,
+				"mcp_enabled": s.MCPEnabled, "mcp_timeout": s.MCPTimeout,
 				"context_window": s.ContextWindow, "reply_reserve": s.ReplyReserve, "history_min_turns": s.HistoryMinTurns,
 				"current_char": s.CurrentChar, "user_name": s.UserName,
 				"ntfy_url": s.NtfyURL, "ntfy_topic": s.NtfyTopic,
@@ -614,7 +604,8 @@ func main() {
 		writeJSON(w, map[string]any{"ok": true, "sheets": len(sheets), "days": distill.DayCount(final), "sheet": final})
 	})
 
-	// Memory test probe: POST {"query":"..."} -> MCP chunks (for the Memory page button).
+	// Memory test probe: POST {"query":"..."} -> the raw MCP response, so the
+	// Memory page shows exactly the bytes that would reach the prompt.
 	mux.HandleFunc("/api/memory/search", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "POST" {
 			http.Error(w, "method not allowed", 405)
@@ -626,12 +617,15 @@ func main() {
 		b, _ := io.ReadAll(r.Body)
 		_ = json.Unmarshal(b, &in)
 		s := rt.get()
-		hits, err := searchMCP(r.Context(), s, in.Query)
+		text, err := searchMCP(r.Context(), s, in.Query)
 		if err != nil {
 			writeJSON(w, map[string]any{"ok": false, "error": err.Error()})
 			return
 		}
-		writeJSON(w, map[string]any{"ok": true, "collection": firstNonEmpty(s.MCPCollection, "(server default)"), "hits": hits})
+		writeJSON(w, map[string]any{
+			"ok": true, "collection": firstNonEmpty(s.MCPCollection, "(server default)"),
+			"chars": utf8.RuneCountInString(text), "text": text,
+		})
 	})
 
 	// Blocks CRUD (file-backed): data/presets/default.json
@@ -2562,27 +2556,28 @@ func mcpTimeout(s settings.Settings) time.Duration {
 	return time.Duration(seconds) * time.Second
 }
 
-func searchMCP(ctx context.Context, s settings.Settings, query string) ([]memory.Hit, error) {
+func searchMCP(ctx context.Context, s settings.Settings, query string) (string, error) {
 	timeout := mcpTimeout(s)
 	// Detach from the request context: a mid-search client disconnect (or any
-	// parent cancel) used to abort search_memory and zero out mcp_hits while
-	// the turn still completed. Bound only by mcp_timeout so slow vectra loads
-	// can finish; if the caller is already gone the write path fails later.
+	// parent cancel) used to abort search_memory and leave the turn with no
+	// memory while it still completed. Bound only by mcp_timeout so slow
+	// vectra loads can finish; if the caller is already gone the write path
+	// fails later.
 	searchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
 	defer cancel()
-	hits, err := mcp.NewWithTimeout(firstNonEmpty(s.MCPURL, "http://192.168.10.2:8199"), timeout).
-		Search(searchCtx, query, s.MCPCollection, s.MCPTopK, s.MCPThreshold)
+	text, err := mcp.NewWithTimeout(firstNonEmpty(s.MCPURL, "http://192.168.10.2:8199"), timeout).
+		Search(searchCtx, query, s.MCPCollection)
 	if err != nil && errors.Is(err, context.DeadlineExceeded) {
-		return nil, fmt.Errorf("mcp search timeout (%s): %w", timeout, err)
+		return "", fmt.Errorf("mcp search timeout (%s): %w", timeout, err)
 	}
-	return hits, err
+	return text, err
 }
 
 // resolveMCP searches rag-mcp-server with the latest user utterance and
-// returns the hits as engine list items (best-first, ranked by reranker
-// score) plus an audit-friendly summary. Fail-open: errors are recorded and
-// the chat continues. The engine then decides how many chunks survive under
-// budget pressure (lowest score evicted first).
+// returns the response as one engine item, byte for byte. Retrieval knobs
+// (top-k, threshold, chunk size) belong to the server; TavernLab only owns
+// how long it waits. Fail-open: errors are recorded and the chat continues.
+// The engine then decides what still fits under budget pressure.
 func resolveMCP(ctx context.Context, s settings.Settings, chat []engine.Message) ([]engine.Item, map[string]any) {
 	info := map[string]any{"enabled": false}
 	if !s.MCPEnabled {
@@ -2593,50 +2588,18 @@ func resolveMCP(ctx context.Context, s settings.Settings, chat []engine.Message)
 	query := lastUserText(chat)
 	info["query"] = query
 	if query == "" {
-		info["hits"] = 0
+		info["chars"] = 0
 		return nil, info
 	}
-	hits, err := searchMCP(ctx, s, query)
+	text, err := searchMCP(ctx, s, query)
 	if err != nil {
 		info["error"] = err.Error()
-		info["hits"] = 0
+		info["chars"] = 0
 		return nil, info
 	}
-	// Budget mode: doc count is decided by rag-mcp-server (top_k is only a hint).
-	// TavernLab enforces a coarse token/char cap here; the engine does the fine
-	// per-chunk eviction by score.
-	budget := s.MCPBudgetTokens
-	if budget <= 0 {
-		budget = 2000
-	}
-	perHit := s.MCPPerHitChars
-	if perHit <= 0 {
-		perHit = 2000
-	}
-	sort.SliceStable(hits, func(i, j int) bool { return hits[i].Score > hits[j].Score })
-	var items []engine.Item
-	used := 0
-	for _, h := range hits {
-		t := h.Text
-		if r := []rune(t); len(r) > perHit {
-			t = string(r[:perHit]) + "\n[…per-hit truncated…]"
-		}
-		cost := engine.EstimateTokens(t)
-		if used+cost > budget && len(items) > 0 {
-			break
-		}
-		items = append(items, engine.Item{Text: t, EvictRank: h.Score})
-		used += cost
-	}
-	info["hits"] = len(items)
-	info["budget_tokens"] = budget
-	info["used_tokens"] = used
-	info["per_hit_chars"] = perHit
-	info["note"] = "top_k仅为服务端hint；L2按reranker分数在引擎内淘汰最低分"
-	if len(items) > 0 {
-		info["top"] = map[string]any{"score": items[0].EvictRank, "excerpt": excerpt(items[0].Text, 160)}
-	}
-	return items, info
+	info["chars"] = utf8.RuneCountInString(text)
+	info["excerpt"] = excerpt(text, 160)
+	return []engine.Item{{Text: text}}, info
 }
 
 // listInputs binds the RAG hits to every enabled mcp/vectra block and the
@@ -2693,7 +2656,7 @@ func logTurn(kind string, status int, model any, session string, res engine.Asse
 		fields["actual"] = actual
 	}
 	if mem != nil {
-		fields["mcp_hits"] = mem["hits"]
+		fields["mcp_chars"] = mem["chars"]
 		if e, ok := mem["error"]; ok {
 			fields["mcp_error"] = e
 		}

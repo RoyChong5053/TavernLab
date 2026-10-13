@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -20,7 +21,7 @@ func TestSearchRejectsToolError(t *testing.T) {
 	defer srv.Close()
 
 	client := &Client{BaseURL: srv.URL, HTTP: srv.Client()}
-	_, err := client.Search(context.Background(), "query", "collection", 10, -1)
+	_, err := client.Search(context.Background(), "query", "collection")
 	if err == nil || !strings.Contains(err.Error(), "rerank failed") {
 		t.Fatalf("expected tool error, got %v", err)
 	}
@@ -34,7 +35,7 @@ func TestSearchRejectsHTTPError(t *testing.T) {
 	defer srv.Close()
 
 	client := &Client{BaseURL: srv.URL, HTTP: srv.Client()}
-	_, err := client.Search(context.Background(), "query", "", 10, -1)
+	_, err := client.Search(context.Background(), "query", "")
 	if err == nil || !strings.Contains(err.Error(), "mcp unavailable") {
 		t.Fatalf("expected HTTP error, got %v", err)
 	}
@@ -55,7 +56,7 @@ func TestSearchPropagatesContextCancellation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	started := time.Now()
-	_, err := client.Search(ctx, "query", "", 10, -1)
+	_, err := client.Search(ctx, "query", "")
 	if err == nil || !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("expected deadline error, got %v", err)
 	}
@@ -81,18 +82,50 @@ func TestSearchSendsCollectionIDs(t *testing.T) {
 	defer srv.Close()
 
 	client := NewWithTimeout(srv.URL, 120*time.Second)
-	if _, err := client.Search(context.Background(), "q", "col", 5, -1); err != nil {
+	if _, err := client.Search(context.Background(), "q", "col"); err != nil {
 		t.Fatalf("search: %v", err)
 	}
 	if !strings.Contains(gotBody, `"collection_id":"col"`) || strings.Contains(gotBody, "collection_ids") {
 		t.Fatalf("single id should send collection_id only: %s", gotBody)
 	}
 
-	if _, err := client.Search(context.Background(), "q", " a , b ,a", 5, -1); err != nil {
+	if _, err := client.Search(context.Background(), "q", " a , b ,a"); err != nil {
 		t.Fatalf("search: %v", err)
 	}
 	if !strings.Contains(gotBody, `"collection_ids":["a","b"]`) || strings.Contains(gotBody, `"collection_id"`) {
 		t.Fatalf("CSV should send deduped collection_ids only: %s", gotBody)
+	}
+}
+
+// TavernLab is a thin client: the response comes back byte for byte, and no
+// retrieval knob is sent — top-k / threshold / chunk size belong to
+// rag-mcp-server, so the chat prompt and the server dashboard agree.
+func TestSearchReturnsResponseVerbatim(t *testing.T) {
+	payload := "Found 1 results:\n\n--- Result 1 (score: 0.931) ---\nID: 6382896658568907739\n是昨天两餐米饭正餐，而前天则是咖啡沾薯片一整天"
+	var gotBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		w.Header().Set("Content-Type", "application/json")
+		body, _ := json.Marshal(map[string]any{
+			"jsonrpc": "2.0", "id": 1,
+			"result": map[string]any{"content": []map[string]any{{"type": "text", "text": payload}}},
+		})
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+
+	text, err := NewWithTimeout(srv.URL, time.Second).Search(context.Background(), "q", "col")
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	if text != payload {
+		t.Fatalf("response altered:\n got %q\nwant %q", text, payload)
+	}
+	for _, gone := range []string{"top_k", "threshold"} {
+		if strings.Contains(gotBody, gone) {
+			t.Fatalf("%s must not be sent by the thin client: %s", gone, gotBody)
+		}
 	}
 }
 
