@@ -258,16 +258,16 @@ func listExpressions(base string) []string {
 	return out
 }
 
-// renderBlocks fills code-level macros before assembly:
-//   - time macros ({{isodate}} {{date}} {{time}} {{weekday}} {{datetime}}
-//     {{timestamp}} {{timezone}} {{user}}) once per request;
-//   - {{character_card}} from the session's card.json for source.type=="character".
+// renderModules fills code-level placeholders before assembly:
+//   - time placeholders ({{isodate}} {{date}} {{time}} {{weekday}} …) once
+//     per request;
+//   - {{character_card}} from the session's card.json for Kind character.
 //
 // Returns a copy so the caller's editor state is untouched.
-func renderBlocks(root, session, userName string, blocks []engine.Block) []engine.Block {
+func renderModules(root, session, userName string, modules []engine.Module) []engine.Module {
 	now := time.Now()
-	out := make([]engine.Block, len(blocks))
-	copy(out, blocks)
+	out := make([]engine.Module, len(modules))
+	copy(out, modules)
 	desc := ""
 	if session != "" {
 		desc = loadCharCard(charBase(root, session)).Description
@@ -276,21 +276,21 @@ func renderBlocks(root, session, userName string, blocks []engine.Block) []engin
 	for i := range out {
 		rendered := applyMacros(out[i].Template, now, userName)
 		rendered = strings.ReplaceAll(rendered, "{{location}}", locText)
-		// 旧 preset 存的是不带 {{location}} 的模板: 只要 time_anchor 且有位置
-		// 就追加, 不依赖用户点"重置模板"。
-		if out[i].ID == "time_anchor" && locText != "" && !strings.Contains(rendered, locText) {
+		// A time_anchor template saved without {{location}} still gets the
+		// live location appended, so the anchor never silently loses it.
+		if out[i].Kind == engine.KindTimeAnchor && locText != "" && !strings.Contains(rendered, locText) {
 			rendered += " " + locText
 		}
-		switch out[i].Source.Type {
-		case "character":
+		switch out[i].Kind {
+		case engine.KindCharacter:
 			if strings.Contains(rendered, "{{character_card}}") {
 				out[i].Content = strings.ReplaceAll(rendered, "{{character_card}}", desc)
 			} else {
 				out[i].Content = desc
 			}
-		case "static":
+		case engine.KindSystem, engine.KindTimeAnchor, engine.KindNote:
 			out[i].Content = rendered
-		case "distilled_state":
+		case engine.KindDistilledState:
 			state := distill.LoadState(root, session, 0)
 			if state == "" {
 				continue // leave unresolved; engine will drop it
@@ -300,100 +300,59 @@ func renderBlocks(root, session, userName string, blocks []engine.Block) []engin
 			} else {
 				out[i].Content = state
 			}
-		case "distilled":
-			// Legacy single-block form (normalizeBlocks migrates it to the
-			// state/log split, but the editor may still send it raw).
-			sheet := distill.Load(root, session)
-			if sheet == "" {
-				continue // leave unresolved; engine will drop it
-			}
-			if strings.Contains(rendered, "{{distilled}}") {
-				out[i].Content = strings.ReplaceAll(rendered, "{{distilled}}", sheet)
-			} else {
-				out[i].Content = sheet
-			}
 		default:
-			// mcp/vectra/distilled_log are resolved elsewhere; keep any
-			// resolved Content the caller already set (e.g. preview overrides).
+			// rag/chat/distilled_log are resolved elsewhere; keep any resolved
+			// Content the caller already set (e.g. preview overrides).
 		}
 	}
 	return out
 }
 
-// normalizeBlocks migrates legacy block data in place: the "character" block
-// must use source.type=="character" so the card is injected (older files had
-// it as "static"). Retired fields are cleaned up: the per-block numeric
-// "max" cap (budget control moved to Level + L2 eviction) and the old
-// "vectra" RAG block (the RAG database is fully MCP now). Missing levels are
-// inferred from the block id/source for old presets.
-func normalizeBlocks(blocks []engine.Block) []engine.Block {
-	out := make([]engine.Block, 0, len(blocks)+1)
-	for _, b := range blocks {
-		// Migrate old time_anchor templates saved before {{location}} existed.
-		if b.ID == "time_anchor" && !strings.Contains(b.Template, "{{location}}") && !strings.Contains(b.Template, "[LOC") {
-			b.Template += " {{location}}"
+// normalizeModules repairs a loaded preset: missing Kind is inferred from the
+// module id, invalid Levels are repaired, and the per-module numeric cap
+// (budget control now lives in Level + L2 eviction) is cleared. List-backed
+// kinds are forced to L2 and distilled_state to L1 so the editor never shows
+// a no-op Level.
+func normalizeModules(modules []engine.Module) []engine.Module {
+	out := make([]engine.Module, 0, len(modules))
+	for _, m := range modules {
+		if m.Kind == "" {
+			m.Kind = inferKind(m.ID)
 		}
-		if b.Source.Type == "vectra" {
-			continue // retired: RAG is fully MCP
+		if m.Level < engine.LevelLocked || m.Level > engine.LevelElastic {
+			m.Level = defaultLevel(m)
 		}
-		if b.ID == "character" && b.Source.Type != "character" {
-			b.Source.Type = "character"
+		switch m.Kind {
+		case engine.KindChat, engine.KindRAG, engine.KindDistilledLog:
+			m.Level = engine.LevelTrim
+		case engine.KindDistilledState:
+			m.Level = engine.LevelLocked
 		}
-		// Migrate the legacy single distilled block into the state/log split:
-		// STATE (L1, always present, code-capped) + LOG (L2, oldest whole days
-		// evicted by the engine under budget pressure).
-		if b.Source.Type == "distilled" {
-			stateBlk := b
-			stateBlk.ID = "distilled_state"
-			stateBlk.Source = engine.Source{Type: "distilled_state", Collection: b.Source.Collection}
-			stateBlk.Level = engine.LevelLocked
-			stateBlk.Budget = engine.Budget{}
-			if strings.TrimSpace(stateBlk.Template) == "" || strings.Contains(stateBlk.Template, "{{distilled}}") {
-				stateBlk.Template = "<User State(Distilled Memory)>\n{{distilled_state}}\n</User State>"
-			}
-			logBlk := b
-			logBlk.ID = "distilled_log"
-			logBlk.Source = engine.Source{Type: "distilled_log", Collection: b.Source.Collection}
-			logBlk.Level = engine.LevelTrim
-			logBlk.Order = b.Order + 1
-			logBlk.Budget = engine.Budget{}
-			logBlk.Template = "<Memory Log>\n{{items}}\n</Memory Log>"
-			out = append(out, stateBlk, logBlk)
-			continue
-		}
-		if b.Level < engine.LevelLocked || b.Level > engine.LevelElastic {
-			b.Level = defaultLevel(b)
-		}
-		// List-backed sources are always L2 (the engine builds them as
-		// evictable lists regardless of Level) and distilled_state is always
-		// L1; keep the editor's Level in sync with reality instead of showing
-		// a no-op value (chat in L3, RAG mislabelled L1, ...).
-		switch b.Source.Type {
-		case "chat", "mcp", "vectra", "distilled_log":
-			b.Level = engine.LevelTrim
-		case "distilled_state":
-			b.Level = engine.LevelLocked
-		}
-		b.Budget = engine.Budget{}
-		out = append(out, b)
+		m.Budget = engine.Budget{}
+		out = append(out, m)
 	}
 	return out
 }
 
-// defaultLevel infers the eviction level for legacy blocks that predate the
-// L1/L2/L3 model.
-func defaultLevel(b engine.Block) engine.Level {
-	switch b.Source.Type {
-	case "chat", "mcp", "vectra", "distilled_log":
-		return engine.LevelTrim
-	case "distilled_state", "distilled":
-		return engine.LevelLocked
+// inferKind maps a known module id to its kind (for presets written before
+// Kind existed).
+func inferKind(id string) string {
+	switch id {
+	case "system", "time_anchor", "character", "distilled_state", "distilled_log", "rag", "chat":
+		return id
+	case "rag_mcp", "rag_vectra":
+		return engine.KindRAG
 	}
-	switch b.ID {
-	case "system", "time_anchor", "character", "distilled", "distilled_state":
-		return engine.LevelLocked
-	case "rag_mcp", "rag_vectra", "chat", "distilled_log":
+	return engine.KindNote
+}
+
+// defaultLevel infers the eviction level from a module's kind.
+func defaultLevel(m engine.Module) engine.Level {
+	switch m.Kind {
+	case engine.KindChat, engine.KindRAG, engine.KindDistilledLog:
 		return engine.LevelTrim
+	case engine.KindDistilledState, engine.KindSystem, engine.KindTimeAnchor, engine.KindCharacter, engine.KindNote:
+		return engine.LevelLocked
 	}
 	return engine.LevelElastic
 }

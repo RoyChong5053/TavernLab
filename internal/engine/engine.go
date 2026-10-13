@@ -33,38 +33,37 @@ const (
 	LevelElastic Level = 3 // L3: dropped entirely first
 )
 
-// Block is a single prompt unit in the IDE.
-type Block struct {
-	ID       string `json:"id"`
-	Role     string `json:"role"` // system | user | assistant
-	Order    int    `json:"order"`
-	Enabled  bool   `json:"enabled"`
-	Level    Level  `json:"level"`
-	Budget   Budget `json:"budget"`
-	Source   Source `json:"source"`
-	Template string `json:"template"`
-	// EvictPriority orders L2 blocks against each other: lower is evicted
+// Module is a single prompt unit in the IDE. Kind is the compiled-in
+// discriminator (see catalog.go); Collection carries the source target for
+// rag/distilled kinds. There is no user-facing macro layer: placeholders are
+// provided per-module by the compiled catalog.
+type Module struct {
+	ID         string `json:"id"`
+	Title      string `json:"title,omitempty"`
+	Kind       string `json:"kind"` // system | time_anchor | character | distilled_state | distilled_log | rag | chat | note
+	Role       string `json:"role"` // system | user | assistant
+	Order      int    `json:"order"`
+	Enabled    bool   `json:"enabled"`
+	Level      Level  `json:"level"`
+	Collection string `json:"collection,omitempty"`
+	Template   string `json:"template,omitempty"`
+	// EvictPriority orders L2 modules against each other: lower is evicted
 	// first, and the whole tier is drained (down to its floor) before the
-	// next tier is touched. nil = infer from Source.Type so heterogeneous
-	// lists never share one 0..1 scale (the "average everyone" bug).
+	// next tier is touched. nil = infer from Kind so heterogeneous lists
+	// never share one 0..1 scale (the "average everyone" bug).
 	EvictPriority *int `json:"evict_priority,omitempty"`
+	Budget        Budget `json:"budget"`
 	// Content is resolved text for this turn (after source fetch +
 	// template render). Empty means "use Template as-is" or "filled from a
 	// list source at assemble time".
 	Content string `json:"content,omitempty"`
 }
 
-// Budget per block. Max=0 means no cap; Min is retained for data
+// Budget per module. Max=0 means no cap; Min is retained for data
 // compatibility but the engine does not use it.
 type Budget struct {
 	Max int `json:"max"` // 0 = no cap
 	Min int `json:"min,omitempty"`
-}
-
-// Source describes where block content comes from.
-type Source struct {
-	Type       string `json:"type"` // static | character | chat | distilled | vectra | mcp | list
-	Collection string `json:"collection,omitempty"`
 }
 
 // ContextConfig is the global budget. Window is the total context (input +
@@ -110,8 +109,8 @@ type ItemList struct {
 	Weight        float64
 }
 
-// BlockUsage is per-block audit info.
-type BlockUsage struct {
+// ModuleUsage is per-module audit info.
+type ModuleUsage struct {
 	ID          string `json:"id"`
 	Role        string `json:"role"`
 	Order       int    `json:"order"`
@@ -123,22 +122,22 @@ type BlockUsage struct {
 
 // AssembleResult is what gets sent to the provider + saved to audit.
 type AssembleResult struct {
-	Messages   []Message    `json:"messages"`
-	Blocks     []BlockUsage `json:"blocks"`
-	TotalTok   int          `json:"total_tokens"`
-	BudgetTok  int          `json:"budget_tokens"` // input budget
-	Window     int          `json:"window"`
-	Overflow   bool         `json:"overflow"`
-	Dropped    []string     `json:"dropped"`
-	PromptText string       `json:"prompt_text"`
+	Messages   []Message     `json:"messages"`
+	Modules    []ModuleUsage `json:"modules"`
+	TotalTok   int           `json:"total_tokens"`
+	BudgetTok  int           `json:"budget_tokens"` // input budget
+	Window     int           `json:"window"`
+	Overflow   bool          `json:"overflow"`
+	Dropped    []string      `json:"dropped"`
+	PromptText string        `json:"prompt_text"`
 }
 
 // Input is the full assemble request.
 type Input struct {
-	Blocks []Block
-	Cfg    ContextConfig
-	Turns  []Message  // structured chat history, oldest first (newest last)
-	Lists  []ItemList // extra L2 list sources (RAG hits, future cards)
+	Modules []Module
+	Cfg     ContextConfig
+	Turns   []Message  // structured chat history, oldest first (newest last)
+	Lists   []ItemList // extra L2 list sources (RAG hits, future cards)
 }
 
 // EstimateTokens is a script-aware heuristic: CJK/kana/hangul runs count
@@ -195,20 +194,20 @@ type l2List struct {
 	sumAll    int
 }
 
-// resolvePriority returns the L2 eviction tier for a block (lower = evicted
+// resolvePriority returns the L2 eviction tier for a module (lower = evicted
 // first). An explicit EvictPriority always wins; otherwise it is inferred from
-// the source so the default order is chat(0) -> RAG(1) -> distilled log(2):
+// the kind so the default order is chat(0) -> RAG(1) -> distilled log(2):
 // recent chat is squeezed to its floor first, retrieval next, the diary last.
-func resolvePriority(b Block) int {
-	if b.EvictPriority != nil {
-		return *b.EvictPriority
+func resolvePriority(m Module) int {
+	if m.EvictPriority != nil {
+		return *m.EvictPriority
 	}
-	switch b.Source.Type {
+	switch m.Kind {
 	case "chat":
 		return 0
 	case "distilled_log":
 		return 2
-	case "mcp", "vectra":
+	case "rag":
 		return 1
 	}
 	return 1
@@ -248,9 +247,9 @@ func Assemble(in Input) AssembleResult {
 		listByID[il.BlockID] = il
 	}
 
-	// Enabled blocks in prompt order (also the emission order later).
-	ordered := make([]Block, 0, len(in.Blocks))
-	for _, b := range in.Blocks {
+	// Enabled modules in prompt order (also the emission order later).
+	ordered := make([]Module, 0, len(in.Modules))
+	for _, b := range in.Modules {
 		if !b.Enabled {
 			dropped = append(dropped, b.ID+" (disabled)")
 			continue
@@ -259,9 +258,9 @@ func Assemble(in Input) AssembleResult {
 	}
 	sort.Slice(ordered, func(i, j int) bool { return ordered[i].Order < ordered[j].Order })
 
-	// Classify blocks into L1 / L2 / L3.
+	// Classify modules into L1 / L2 / L3.
 	for _, b := range ordered {
-		if b.Source.Type == "chat" {
+		if b.Kind == "chat" {
 			items := make([]Item, len(in.Turns))
 			for i, t := range in.Turns {
 				items[i] = Item{Role: t.Role, Text: t.Content, ImageTokens: t.ImageTokens}
@@ -313,7 +312,7 @@ func Assemble(in Input) AssembleResult {
 			continue
 		}
 		if m := b.Budget.Max; m > 0 && EstimateTokens(text) > m {
-			text = truncateToTokens(text, m, keepHead(b.Source.Type))
+			text = truncateToTokens(text, m, keepHead(b.Kind))
 		}
 		tk := EstimateTokens(text)
 		switch b.Level {
@@ -450,7 +449,7 @@ func Assemble(in Input) AssembleResult {
 	// Emit messages in block order.
 	var msgs []Message
 	var sb strings.Builder
-	var usage []BlockUsage
+	var usage []ModuleUsage
 	total := 0
 
 	writeHeader := func(id string, order int) {
@@ -474,7 +473,7 @@ func Assemble(in Input) AssembleResult {
 				}
 				if any {
 					total += kept
-					usage = append(usage, BlockUsage{ID: id, Role: b.Role, Order: b.Order, Level: int(LevelTrim), Tokens: kept, Truncated: kept < l.sumAll})
+					usage = append(usage, ModuleUsage{ID: id, Role: b.Role, Order: b.Order, Level: int(LevelTrim), Tokens: kept, Truncated: kept < l.sumAll})
 				}
 				continue
 			}
@@ -489,7 +488,7 @@ func Assemble(in Input) AssembleResult {
 				tk := EstimateTokens(content)
 				msgs = append(msgs, Message{Role: b.Role, Content: content})
 				total += tk
-				usage = append(usage, BlockUsage{ID: id, Role: b.Role, Order: b.Order, Level: int(LevelTrim), Tokens: tk, Truncated: len(parts) < len(l.items)})
+				usage = append(usage, ModuleUsage{ID: id, Role: b.Role, Order: b.Order, Level: int(LevelTrim), Tokens: tk, Truncated: len(parts) < len(l.items)})
 				writeHeader(id, b.Order)
 				sb.WriteString(content + "\n\n")
 			} else if l.sumAll > 0 {
@@ -506,7 +505,7 @@ func Assemble(in Input) AssembleResult {
 			text := elasticText[id]
 			msgs = append(msgs, Message{Role: b.Role, Content: text})
 			total += elasticTok[id]
-			usage = append(usage, BlockUsage{ID: id, Role: b.Role, Order: b.Order, Level: int(LevelElastic), Tokens: elasticTok[id]})
+			usage = append(usage, ModuleUsage{ID: id, Role: b.Role, Order: b.Order, Level: int(LevelElastic), Tokens: elasticTok[id]})
 			writeHeader(id, b.Order)
 			sb.WriteString(text + "\n\n")
 			continue
@@ -514,7 +513,7 @@ func Assemble(in Input) AssembleResult {
 		if text, ok := lockedText[id]; ok {
 			msgs = append(msgs, Message{Role: b.Role, Content: text})
 			total += lockedTok[id]
-			usage = append(usage, BlockUsage{ID: id, Role: b.Role, Order: b.Order, Level: int(LevelLocked), Tokens: lockedTok[id]})
+			usage = append(usage, ModuleUsage{ID: id, Role: b.Role, Order: b.Order, Level: int(LevelLocked), Tokens: lockedTok[id]})
 			writeHeader(id, b.Order)
 			sb.WriteString(text + "\n\n")
 		}
@@ -526,7 +525,7 @@ func Assemble(in Input) AssembleResult {
 
 	return AssembleResult{
 		Messages:   msgs,
-		Blocks:     usage,
+		Modules:    usage,
 		TotalTok:   total,
 		BudgetTok:  inputBudget,
 		Window:     cfg.Window,
@@ -558,9 +557,9 @@ func renderListContent(tmpl, joined string) string {
 
 // keepHead reports whether truncation should preserve the beginning
 // (RAG hits are best-first; distilled state reads top-down).
-func keepHead(t string) bool {
-	switch t {
-	case "mcp", "vectra", "distilled":
+func keepHead(kind string) bool {
+	switch kind {
+	case "rag", "distilled_state":
 		return true
 	}
 	return false

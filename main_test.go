@@ -19,34 +19,30 @@ import (
 	"github.com/RoyChong5053/TavernLab/internal/store"
 )
 
-func TestNormalizeBlocksSplitsDistilled(t *testing.T) {
-	in := []engine.Block{{
-		ID: "distilled", Role: "system", Order: 40, Enabled: true, Level: engine.LevelLocked,
-		Source:   engine.Source{Type: "distilled", Collection: "default"},
-		Template: "<User State>\n{{distilled}}\n</User State>",
+func TestNormalizeModulesInfersKind(t *testing.T) {
+	in := []engine.Module{{
+		ID: "rag_mcp", Role: "system", Order: 55, Enabled: true,
+		Template: "<RAG>\\n{{rag}}\\n</RAG>",
 	}}
-	out := normalizeBlocks(in)
-	if len(out) != 2 {
-		t.Fatalf("want distilled split into 2 blocks, got %d", len(out))
+	out := normalizeModules(in)
+	if len(out) != 1 {
+		t.Fatalf("want 1 module, got %d", len(out))
 	}
-	if out[0].ID != "distilled_state" || out[0].Source.Type != "distilled_state" || out[0].Level != engine.LevelLocked {
-		t.Fatalf("bad state block: %+v", out[0])
+	if out[0].Kind != engine.KindRAG || out[0].Level != engine.LevelTrim {
+		t.Fatalf("bad normalized module: %+v", out[0])
 	}
-	if out[1].ID != "distilled_log" || out[1].Source.Type != "distilled_log" || out[1].Level != engine.LevelTrim {
-		t.Fatalf("bad log block: %+v", out[1])
-	}
-	if again := normalizeBlocks(out); len(again) != 2 {
-		t.Fatalf("migration must be idempotent, got %d blocks", len(again))
+	if again := normalizeModules(out); len(again) != 1 || again[0].Kind != engine.KindRAG {
+		t.Fatalf("normalize must be idempotent, got %+v", again)
 	}
 }
 
-func TestNormalizeBlocksCoercesListLevels(t *testing.T) {
-	in := []engine.Block{
-		{ID: "rag_mcp", Role: "system", Order: 55, Enabled: true, Level: engine.LevelLocked, Source: engine.Source{Type: "mcp"}},
-		{ID: "chat", Role: "user", Order: 100, Enabled: true, Level: engine.LevelElastic, Source: engine.Source{Type: "chat"}},
-		{ID: "distilled_state", Role: "system", Order: 40, Enabled: true, Level: engine.LevelTrim, Source: engine.Source{Type: "distilled_state"}},
+func TestNormalizeModulesCoercesListLevels(t *testing.T) {
+	in := []engine.Module{
+		{ID: "rag_mcp", Kind: engine.KindRAG, Role: "system", Order: 55, Enabled: true, Level: engine.LevelLocked},
+		{ID: "chat", Kind: engine.KindChat, Role: "user", Order: 100, Enabled: true, Level: engine.LevelElastic},
+		{ID: "distilled_state", Kind: engine.KindDistilledState, Role: "system", Order: 40, Enabled: true, Level: engine.LevelTrim},
 	}
-	out := normalizeBlocks(in)
+	out := normalizeModules(in)
 	want := map[string]engine.Level{
 		"rag_mcp":         engine.LevelTrim,
 		"chat":            engine.LevelTrim,
@@ -65,11 +61,11 @@ func TestListInputsBuildsDistilledLog(t *testing.T) {
 	if err := distill.Save(root, "阿离", sheet); err != nil {
 		t.Fatal(err)
 	}
-	blocks := []engine.Block{{
-		ID: "distilled_log", Role: "system", Order: 40, Enabled: true, Level: engine.LevelTrim,
-		Source: engine.Source{Type: "distilled_log"}, Template: "<M>{{items}}</M>",
+	modules := []engine.Module{{
+		ID: "distilled_log", Kind: engine.KindDistilledLog, Role: "system", Order: 40, Enabled: true, Level: engine.LevelTrim,
+		Template: "<M>{{items}}</M>",
 	}}
-	lists := listInputs(blocks, nil, root, "阿离")
+	lists := listInputs(modules, nil, root, "阿离")
 	if len(lists) != 1 || len(lists[0].Items) != 2 {
 		t.Fatalf("want 2 day items, got %+v", lists)
 	}
@@ -81,17 +77,17 @@ func TestListInputsBuildsDistilledLog(t *testing.T) {
 	}
 }
 
-func TestRenderBlocksInjectsTimeAndCharacter(t *testing.T) {
+func TestRenderModulesInjectsTimeAndCharacter(t *testing.T) {
 	root := t.TempDir()
 	base := charBase(root, "阿离")
 	if err := saveCharCard(base, CharCard{Name: "阿离", Description: "温柔的角色卡"}); err != nil {
 		t.Fatal(err)
 	}
-	blocks := []engine.Block{
-		{ID: "time", Source: engine.Source{Type: "static"}, Template: "今天是 {{isodate}} {{weekday}}"},
-		{ID: "character", Source: engine.Source{Type: "character"}, Template: "{{character_card}}"},
+	modules := []engine.Module{
+		{ID: "time", Kind: engine.KindTimeAnchor, Template: "今天是 {{isodate}} {{weekday}}"},
+		{ID: "character", Kind: engine.KindCharacter, Template: "{{character_card}}"},
 	}
-	out := renderBlocks(root, "阿离", "Roy", blocks)
+	out := renderModules(root, "阿离", "Roy", modules)
 	if strings.Contains(out[0].Content, "{{") || !strings.Contains(out[0].Content, "今天是") {
 		t.Fatalf("time macros not resolved: %q", out[0].Content)
 	}

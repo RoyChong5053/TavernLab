@@ -5,6 +5,7 @@ data/sessions.json
 data/characters/
 data/user_avatar.*
 data/presets/default.json
+data/presets/modules.json
 data/memory/
 data/vectra/
 .vectra_cache/

@@ -13,7 +13,6 @@ const store = {
   set(k, v) { localStorage.setItem('tavernlab.' + k, JSON.stringify(v)); },
 };
 
-let blocks = [];
 const settings = Object.assign(
   {
     context_window: 16384, reply_reserve: 4096, history_min_turns: 4,
@@ -55,8 +54,8 @@ async function api(path, opts) {
   // Only OUR gate rejection pops the login overlay. A 401 proxied from the
   // upstream (e.g. /api/models, /v1/chat/completions) must not log the user out.
   if (r.status === 401 && r.headers.get('X-Auth-Required') === '1') {
-    showLogin('登录已过期，请重新登录');
-    throw new Error('HTTP 401 未登录');
+    showLogin('Session expired, please sign in again');
+    throw new Error('HTTP 401 not signed in');
   }
   return r;
 }
@@ -94,7 +93,7 @@ async function doLogin() {
     $('#login-pass').value = '';
     location.reload(); // simplest correct boot: token persisted, init reruns authed
   } catch (e) {
-    $('#login-err').textContent = '登录失败：' + (e.message || e);
+    $('#login-err').textContent = 'Sign-in failed: ' + (e.message || e);
   }
 }
 async function doLogout() {
@@ -273,13 +272,13 @@ function highlightCode(el) {
       const btn = document.createElement('button');
       btn.type = 'button';
       btn.className = 'code-copy';
-      btn.textContent = '复制';
-      btn.title = '复制代码';
+      btn.textContent = 'Copy';
+      btn.title = 'Copy code';
       btn.onclick = (ev) => {
         ev.stopPropagation();
         copyText(code.innerText).then((ok) => {
-          btn.textContent = ok ? '已复制' : '失败';
-          setTimeout(() => { btn.textContent = '复制'; }, 1500);
+          btn.textContent = ok ? 'Copied' : 'Failed';
+          setTimeout(() => { btn.textContent = 'Copy'; }, 1500);
         });
       };
       head.append(lang, btn);
@@ -331,10 +330,10 @@ function renderRichBody(el, text, isUser) {
 
 /* ---------- theme (custom colors; local-only preference) ---------- */
 const THEMES = {
-  'st-dark': { name: 'ST 暗灰（默认）' },
-  'tavern-glass': { name: 'Tavern 玻璃（旧版）' },
-  'paper': { name: '纸白（浅色）' },
-  'custom': { name: '自定义' },
+  'st-dark': { name: 'ST dark (default)' },
+  'tavern-glass': { name: 'Tavern glass (legacy)' },
+  'paper': { name: 'Paper (light)' },
+  'custom': { name: 'Custom' },
 };
 function applyTheme() {
   const t = settings.theme || 'st-dark';
@@ -406,7 +405,7 @@ function makeUserAvatarEl() {
   const u = document.createElement('div');
   u.className = 'avatar user-avatar';
   u.textContent = userInitial();
-  u.title = settings.user_name || '你';
+  u.title = settings.user_name || 'You';
   u.dataset.useravatar = '1';
   return u;
 }
@@ -427,8 +426,8 @@ async function loadUserAvatar() {
 let userAvatarURL = '';
 const BLANK_GIF = 'data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==';
 function userInitial() {
-  const n = (settings.user_name || '你').trim();
-  return (n ? [...n][0] : '你').toUpperCase();
+  const n = (settings.user_name || 'You').trim();
+  return (n ? [...n][0] : 'You').toUpperCase();
 }
 function fmtTime(t) {
   if (!t) return '';
@@ -503,9 +502,9 @@ function uiConfirm(msg) {
     ov.setAttribute('role', 'dialog');
     ov.setAttribute('aria-modal', 'true');
     ov.innerHTML = '<div class="modal-box glass" style="max-width:420px">' +
-      '<div class="row" style="justify-content:space-between"><b>请确认</b></div>' +
+      '<div class="row" style="justify-content:space-between"><b>Please confirm</b></div>' +
       '<p style="font-size:14px;margin:8px 0"></p>' +
-      '<div class="row" style="justify-content:flex-end"><button data-x="0">取消</button><button data-x="1" class="primary">确定</button></div></div>';
+      '<div class="row" style="justify-content:flex-end"><button data-x="0">Cancel</button><button data-x="1" class="primary">OK</button></div></div>';
     ov.querySelector('p').textContent = msg;
     const onKey = (e) => { if (e.key === 'Escape') done(false); };
     const done = (v) => { document.removeEventListener('keydown', onKey, true); ov.remove(); resolve(v); };
@@ -529,7 +528,7 @@ function uiPrompt(title, placeholder) {
     ov.innerHTML = '<div class="modal-box glass" style="max-width:420px">' +
       '<div class="row" style="justify-content:space-between"><b></b></div>' +
       '<input style="width:100%;margin:8px 0" placeholder="">' +
-      '<div class="row" style="justify-content:flex-end"><button data-x="0">取消</button><button data-x="1" class="primary">确定</button></div></div>';
+      '<div class="row" style="justify-content:flex-end"><button data-x="0">Cancel</button><button data-x="1" class="primary">OK</button></div></div>';
     ov.querySelector('b').textContent = title;
     const inp = ov.querySelector('input');
     inp.placeholder = placeholder || '';
@@ -554,7 +553,7 @@ async function asyncAction(btn, fn) {
     const r = await fn();
     return r;
   } catch (e) {
-    toast('失败：' + (e && e.message ? e.message : e), 'err', 4200);
+    toast('Failed: ' + (e && e.message ? e.message : e), 'err', 4200);
     throw e;
   } finally {
     if (btn) { btn.disabled = false; btn.classList.remove('loading'); }
@@ -568,7 +567,7 @@ function setPending(on) {
   if (!el) return;
   clearInterval(pendingTimer);
   if (on) {
-    const frames = ['努力回复中', '努力回复中·', '努力回复中··', '努力回复中···'];
+    const frames = ['Replying', 'Replying.', 'Replying..', 'Replying...'];
     let i = 0;
     el.classList.add('pending');
     el.classList.remove('pending-dots');
@@ -577,7 +576,7 @@ function setPending(on) {
   } else {
     el.classList.remove('pending');
     // mood text is restored by classifyAndBadge; fall back if it never resolves
-    if (el.textContent.startsWith('努力回复中')) el.textContent = '心情 · —';
+    if (el.textContent.startsWith('Replying')) el.textContent = 'Mood · —';
   }
 }
 
@@ -612,7 +611,7 @@ function applyNavCollapsed() {
   document.body.classList.toggle('nav-collapsed', c);
   const b = $('#btn-nav-collapse');
   if (b) {
-    b.title = c ? '展开侧栏' : '收起侧栏';
+    b.title = c ? 'Expand sidebar' : 'Collapse sidebar';
     b.setAttribute('aria-label', b.title);
     b.setAttribute('aria-expanded', c ? 'false' : 'true');
   }
@@ -631,144 +630,137 @@ fetch('/api/health').then((r) => r.json()).then((h) => {
   const el = $('#health');
   el.textContent = '● ' + h.upstream;
   el.classList.add('ok');
-}).catch(() => { $('#health').textContent = '● 后端未连接'; });
+}).catch(() => { $('#health').textContent = '● Backend offline'; });
 
-/* ---------- blocks ---------- */
-async function loadBlocks() {
-  blocks = await (await api('/api/blocks')).json();
-  if (!Array.isArray(blocks)) blocks = [];
-  renderBlocks();
+/* ---------- prompt modules (Prompts-IDE) ---------- */
+// The list of modules is fixed by the binary; the catalog from /api/modules
+// drives labels, descriptions, placeholders and editability. Only text
+// modules (system / time_anchor / note) expose an editable prompt.
+let modules = [];
+let moduleCatalog = [];
+const MODULE_LEVELS = [
+  { v: 1, t: 'L1 locked (never trimmed)' },
+  { v: 2, t: 'L2 trimmable (evicted after floor)' },
+  { v: 3, t: 'L3 elastic (dropped first)' },
+];
+function specFor(kind) { return moduleCatalog.find((s) => s.kind === kind) || null; }
+async function loadModules() {
+  try {
+    const j = await (await api('/api/modules')).json();
+    moduleCatalog = Array.isArray(j.catalog) ? j.catalog : [];
+    modules = Array.isArray(j.modules) ? j.modules : [];
+  } catch { moduleCatalog = []; modules = []; }
+  renderModules();
 }
-let blockSaveTimer = null;
-function scheduleBlockSave() {
+let moduleSaveTimer = null;
+function scheduleModuleSave() {
   setUnsaved(true);
-  clearTimeout(blockSaveTimer);
-  blockSaveTimer = setTimeout(() => saveBlocks(), 600);
+  clearTimeout(moduleSaveTimer);
+  moduleSaveTimer = setTimeout(() => saveModules(true), 700);
 }
 function setUnsaved(on) {
-  const b = $('#btn-save-blocks');
-  if (b) b.textContent = on ? '保存 •（未保存）' : '保存';
+  const b = $('#btn-save-modules');
+  const s = $('#modules-state');
+  if (b) b.textContent = on ? 'Save •' : 'Save';
+  if (s) s.textContent = on ? 'Unsaved changes…' : '';
 }
-async function saveBlocks(quiet) {
-  clearTimeout(blockSaveTimer);
+async function saveModules(quiet) {
+  clearTimeout(moduleSaveTimer);
   try {
-    const r = await api('/api/blocks', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(blocks) });
+    const r = await api('/api/modules', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ modules }) });
     if (!r.ok) throw new Error('HTTP ' + r.status);
     setUnsaved(false);
-    if (!quiet) toast('Blocks 已保存');
+    if (!quiet) toast('Modules saved');
   } catch (e) {
-    toast('Blocks 保存失败：' + e.message, 'err', 4200);
+    toast('Save failed: ' + e.message, 'err', 4200);
     setUnsaved(true);
   }
 }
-let dragId = null;
-const LEVELS = [
-  { v: 1, t: 'L1 锁定（永不裁剪）' },
-  { v: 2, t: 'L2 可裁剪（保底后淘汰）' },
-  { v: 3, t: 'L3 弹性（最先整个砍）' },
-];
-const SOURCES = ['static', 'character', 'distilled_state', 'distilled_log', 'distilled', 'mcp', 'chat'];
-function renderBlocks() {
-  const el = $('#blocks');
+function moveModule(id, dir) {
+  const ordered = [...modules].sort((a, b) => (a.order || 0) - (b.order || 0));
+  const i = ordered.findIndex((m) => m.id === id);
+  const j = i + dir;
+  if (i < 0 || j < 0 || j >= ordered.length) return;
+  const tmp = ordered[i]; ordered[i] = ordered[j]; ordered[j] = tmp;
+  ordered.forEach((m, n) => { m.order = n; });
+  modules = ordered;
+  renderModules();
+  scheduleModuleSave();
+}
+function renderModules() {
+  const el = $('#modules');
+  if (!el) return;
   el.innerHTML = '';
-  [...blocks].sort((a, b) => a.order - b.order).forEach((b) => {
+  const ordered = [...modules].sort((a, b) => (a.order || 0) - (b.order || 0));
+  ordered.forEach((m, idx) => {
+    const spec = specFor(m.kind) || {};
+    const editable = m.kind === 'note' || !!spec.editable;
+    const lvl = m.level || 1;
+    const levelOpts = MODULE_LEVELS.map((x) => `<option value="${x.v}" ${x.v === lvl ? 'selected' : ''}>${x.t}</option>`).join('');
+    const roleOpts = ['system', 'user', 'assistant'].map((r) => `<option value="${r}" ${r === m.role ? 'selected' : ''}>${r}</option>`).join('');
+    const nameHTML = m.kind === 'note'
+      ? `<input class="mod-title" data-id="${m.id}" data-k="title" value="${esc(m.title || '')}" placeholder="Module title">`
+      : `<b>${esc(spec.title || m.id)}</b>`;
+    const ph = (spec.placeholders || []).map((p) => `<code>${esc(p)}</code>`).join(' ');
     const d = document.createElement('div');
-    d.className = 'block';
-    d.draggable = true;
-    d.dataset.id = b.id;
-    const lvl = b.level || 3;
-    const src = (b.source && b.source.type) || 'static';
-    const levelOpts = LEVELS.map((x) => `<option value="${x.v}" ${x.v === lvl ? 'selected' : ''}>${x.t}</option>`).join('');
-    const srcOpts = SOURCES.map((s) => `<option value="${s}" ${s === src ? 'selected' : ''}>${s}</option>`).join('');
-    const roleOpts = ['system', 'user', 'assistant'].map((r) => `<option value="${r}" ${r === b.role ? 'selected' : ''}>${r}</option>`).join('');
+    d.className = 'module' + (m.enabled ? '' : ' off');
+    d.dataset.id = m.id;
     d.innerHTML = `
-      <div class="hd">
-        <label><span class="grip" title="只从这里拖动排序">⠿</span><input type="checkbox" data-id="${b.id}" data-k="enabled" ${b.enabled ? 'checked' : ''}> <b>${b.id}</b></label>
-        <span class="blk-actions">
-          <select data-id="${b.id}" data-k="level" title="级别决定超预算时的淘汰顺序">${levelOpts}</select>
-          <button class="danger" data-del="${b.id}" title="删除此 block">✕</button>
+      <div class="mod-hd">
+        <label class="mod-check" title="${spec.imports_context ? 'Import context' : 'Enabled'}"><input type="checkbox" data-id="${m.id}" data-k="enabled" ${m.enabled ? 'checked' : ''}></label>
+        <div class="mod-name">${nameHTML}</div>
+        <span class="mod-actions">
+          <button type="button" data-up="${m.id}" title="Move up" ${idx === 0 ? 'disabled' : ''}>↑</button>
+          <button type="button" data-down="${m.id}" title="Move down" ${idx === ordered.length - 1 ? 'disabled' : ''}>↓</button>
+          ${m.kind === 'note' ? `<button type="button" class="danger" data-del="${m.id}" title="Delete module">✕</button>` : ''}
         </span>
       </div>
-      <div class="meta blk-meta">
-        role <select data-id="${b.id}" data-k="role">${roleOpts}</select>
-        source <select data-id="${b.id}" data-k="source">${srcOpts}</select>
-        <label title="L2 淘汰优先级：数字小=先被砍；留空=按来源默认(chat 0 / RAG 1 / 日记 2)">priority
-          <input type="number" data-id="${b.id}" data-k="evict_priority" value="${b.evict_priority ?? ''}" placeholder="auto" style="width:64px"></label>
-        ${b.source && b.source.collection ? '<span>collection: ' + b.source.collection + '</span>' : ''}
+      <div class="mod-badges">
+        <span class="mod-badge ${spec.imports_context ? 'ctx' : ''}">${spec.imports_context ? 'Imports context' : 'Static text'}</span>
+        <span class="mod-badge kind">${esc(m.kind)}</span>
+        <span class="mod-badge">${m.enabled ? 'on' : 'off'}</span>
       </div>
-      <textarea rows="2" data-id="${b.id}" data-k="template" placeholder="模板；list 源用 {{rag}} / {{items}} 占位">${(b.template || '').replace(/</g, '&lt;')}</textarea>`;
+      <div class="mod-desc meta">${esc(spec.description || '')}</div>
+      ${editable ? `<textarea rows="3" data-id="${m.id}" data-k="template" placeholder="Prompt text">${esc(m.template || '')}</textarea>` : ''}
+      ${ph ? `<div class="mod-ph">Available placeholders: ${ph}</div>` : ''}
+      <details class="mod-advanced">
+        <summary>Advanced</summary>
+        <div class="mod-meta">
+          <label>role <select data-id="${m.id}" data-k="role">${roleOpts}</select></label>
+          <label>level <select data-id="${m.id}" data-k="level" title="Eviction tier">${levelOpts}</select></label>
+          <label>priority <input type="number" data-id="${m.id}" data-k="evict_priority" value="${m.evict_priority ?? ''}" placeholder="auto" style="width:64px"></label>
+          ${m.collection ? `<span class="meta">collection: ${esc(m.collection)}</span>` : ''}
+        </div>
+      </details>`;
     el.appendChild(d);
   });
   el.querySelectorAll('input,textarea,select').forEach((inp) => {
     inp.onchange = () => {
-      const b = blocks.find((x) => x.id === inp.dataset.id);
-      if (!b) return;
+      const m = modules.find((x) => x.id === inp.dataset.id);
+      if (!m) return;
       const k = inp.dataset.k;
-      if (k === 'enabled') b.enabled = inp.checked;
-      else if (k === 'level') b.level = +inp.value;
-      else if (k === 'role') b.role = inp.value;
+      if (k === 'enabled') m.enabled = inp.checked;
+      else if (k === 'level') m.level = +inp.value;
+      else if (k === 'role') m.role = inp.value;
+      else if (k === 'title') m.title = inp.value;
       else if (k === 'evict_priority') {
         const v = inp.value.trim();
-        if (v === '') delete b.evict_priority; else b.evict_priority = +v;
-      } else if (k === 'source') b.source = Object.assign({}, b.source, { type: inp.value });
-      else b[k] = inp.value;
-      scheduleBlockSave();
+        if (v === '') delete m.evict_priority; else m.evict_priority = +v;
+      } else m[k] = inp.value;
+      scheduleModuleSave();
     };
   });
+  el.querySelectorAll('[data-up]').forEach((btn) => { btn.onclick = () => moveModule(btn.dataset.up, -1); });
+  el.querySelectorAll('[data-down]').forEach((btn) => { btn.onclick = () => moveModule(btn.dataset.down, 1); });
   el.querySelectorAll('[data-del]').forEach((btn) => {
     btn.onclick = async () => {
       const id = btn.dataset.del;
-      if (!(await uiConfirm(`删除 block「${id}」？`))) return;
-      blocks = blocks.filter((x) => x.id !== id);
-      renderBlocks();
-      scheduleBlockSave();
+      if (!(await uiConfirm(`Delete module "${id}"?`))) return;
+      modules = modules.filter((x) => x.id !== id);
+      renderModules();
+      scheduleModuleSave();
     };
   });
-  // vertical-only drag from the grip; drop before/after by pointer half.
-  el.querySelectorAll('.block').forEach((d) => {
-    d.addEventListener('dragstart', (e) => {
-      if (!e.target.closest('.grip')) { e.preventDefault(); return; }
-      dragId = d.dataset.id;
-      d.classList.add('dragging');
-      e.dataTransfer.effectAllowed = 'move';
-    });
-    d.addEventListener('dragend', () => { d.classList.remove('dragging'); dragId = null; clearDropMarks(el); });
-    d.addEventListener('dragover', (e) => {
-      if (!dragId || d.dataset.id === dragId) return;
-      e.preventDefault();
-      e.dataTransfer.dropEffect = 'move';
-      const r = d.getBoundingClientRect();
-      const after = e.clientY > r.top + r.height / 2;
-      clearDropMarks(el);
-      d.classList.add(after ? 'drop-after' : 'drop-before');
-      d.dataset.after = after ? '1' : '0';
-    });
-    d.addEventListener('dragleave', () => d.classList.remove('drop-before', 'drop-after'));
-    d.addEventListener('drop', (e) => {
-      e.preventDefault();
-      const after = d.dataset.after === '1';
-      clearDropMarks(el);
-      if (dragId && d.dataset.id !== dragId) reorderBlocks(dragId, d.dataset.id, after);
-      dragId = null;
-    });
-  });
-}
-function clearDropMarks(el) {
-  el.querySelectorAll('.block').forEach((x) => x.classList.remove('drop-before', 'drop-after'));
-}
-function reorderBlocks(fromId, toId, after) {
-  const ordered = [...blocks].sort((a, b) => a.order - b.order);
-  const from = ordered.findIndex((b) => b.id === fromId);
-  const to = ordered.findIndex((b) => b.id === toId);
-  if (from < 0 || to < 0) return;
-  const [mv] = ordered.splice(from, 1);
-  let idx = ordered.findIndex((b) => b.id === toId);
-  if (after) idx++;
-  ordered.splice(idx, 0, mv);
-  ordered.forEach((b, n) => { b.order = n; });
-  blocks = ordered;
-  renderBlocks();
-  scheduleBlockSave();
 }
 function ctxCfg() {
   return {
@@ -776,22 +768,6 @@ function ctxCfg() {
     reply_reserve: settings.reply_reserve,
     history_min_turns: settings.history_min_turns,
   };
-}
-function budgetLine(res) {
-  const drop = (res.dropped || []).join(', ') || '无';
-  const blocksTxt = (res.blocks || []).map((b) => `${b.id}(L${b.level}):${b.tokens}${b.truncated ? '✂' : ''}`).join(' · ');
-  const overflow = res.overflow ? ' · <span style="color:#ffb4b4">⚠ OVERFLOW（超过输入预算）</span>' : '';
-  const win = res.window ? `窗口 ${Math.round(res.window / 1024)}k · ` : '';
-  return `<b>${res.total_tokens}</b> / ${res.budget_tokens} 输入 tokens · ${win}dropped: ${drop}${overflow}<br>${blocksTxt}`;
-}
-async function assemble() {
-  const r = await api('/api/assemble', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ blocks, context: ctxCfg(), session: settings.char }),
-  });
-  const res = await r.json();
-  $('#budget').innerHTML = budgetLine(res);
-  return res;
 }
 
 /* ---------- chat ---------- */
@@ -867,8 +843,6 @@ document.addEventListener('click', (e) => {
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') {
     closeLightbox();
-    const pm = $('#preview-modal');
-    if (pm && !pm.classList.contains('hidden')) pm.classList.add('hidden');
     if (document.body.classList.contains('nav-open')) {
       document.body.classList.remove('nav-open');
       syncHamburger();
@@ -902,7 +876,7 @@ function renderMsg(role, text, who, prepend, images, id, time, mood) {
   content.className = 'msg-content';
   const w = document.createElement('div');
   w.className = 'who';
-  const defaultWho = role === 'user' ? (settings.user_name || '你') : role === 'assistant' ? settings.char : (role === 'distilled_memory' ? 'Distilled Memory' : '系统');
+  const defaultWho = role === 'user' ? (settings.user_name || 'You') : role === 'assistant' ? settings.char : (role === 'distilled_memory' ? 'Distilled Memory' : 'System');
   const nameEl = document.createElement('span');
   nameEl.className = 'who-name';
   nameEl.textContent = who || defaultWho;
@@ -921,24 +895,24 @@ function renderMsg(role, text, who, prepend, images, id, time, mood) {
     acts.className = 'msg-actions';
     const btnCopy = document.createElement('button');
     btnCopy.type = 'button';
-    btnCopy.textContent = '复制';
-    btnCopy.title = '复制原文';
+    btnCopy.textContent = 'Copy';
+    btnCopy.title = 'Copy raw text';
     btnCopy.onclick = () => {
-      copyText(text || '').then((ok) => toast(ok ? '已复制' : '复制失败', ok ? 'ok' : 'err'));
+      copyText(text || '').then((ok) => toast(ok ? 'Copied' : 'Copy failed', ok ? 'ok' : 'err'));
     };
     acts.appendChild(btnCopy);
     if (role === 'assistant') {
       const btnRe = document.createElement('button');
       btnRe.type = 'button';
-      btnRe.textContent = '重发';
-      btnRe.title = '重新生成上一条（/regenerate）';
+      btnRe.textContent = 'Regen';
+      btnRe.title = 'Regenerate the last reply (/regenerate)';
       btnRe.onclick = () => { send(true); };
       acts.appendChild(btnRe);
     }
     const btnDel = document.createElement('button');
     btnDel.type = 'button';
-    btnDel.textContent = '删除';
-    btnDel.title = '删除这条消息';
+    btnDel.textContent = 'Delete';
+    btnDel.title = 'Delete this message';
     btnDel.className = 'danger';
     btnDel.onclick = () => deleteMsg(d, id);
     acts.appendChild(btnDel);
@@ -980,15 +954,15 @@ function addMsg(role, text, who, images) { return renderMsg(role, text, who, fal
 // local optimistic bubbles that carry no id yet.
 async function deleteMsg(node, id) {
   if (!id) { node.remove(); return; }
-  if (!(await uiConfirm('删除这条消息？服务端同步删除，刷新后也不恢复。'))) return;
+  if (!(await uiConfirm('Delete this message? It is removed on the server too and will not reappear after a refresh.'))) return;
   try {
     const r = await api('/api/history?session=' + encodeURIComponent(settings.char) + '&id=' + encodeURIComponent(id), { method: 'DELETE' });
     if (!r.ok) throw new Error('HTTP ' + r.status + ' ' + (await r.text()).slice(0, 120));
     if (node.isConnected) node.remove();
     seenMsgIds.delete(id);
     historyShown = Math.max(0, historyShown - 1);
-    toast('已删除');
-  } catch (e) { toast('删除失败：' + (e.message || e), 'err', 4200); }
+    toast('Deleted');
+  } catch (e) { toast('Delete failed: ' + (e.message || e), 'err', 4200); }
 }
 async function loadHistory() {
   historyShown = 0;
@@ -1003,14 +977,14 @@ async function loadEarlier() {
   loadEarlier.busy = true;
   const btn = $('#btn-earlier');
   const oldLabel = btn ? btn.textContent : '';
-  if (btn) { btn.disabled = true; btn.textContent = '加载中…'; }
+  if (btn) { btn.disabled = true; btn.textContent = 'Loading…'; }
   try {
     const q = new URLSearchParams({ session: settings.char, limit: settings.visible_turns, before: historyShown });
     const r = await api('/api/history?' + q);
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const j = await r.json();
     const msgs = j.messages || [];
-    if (!msgs.length) { if (btn) btn.textContent = '没有更早了'; return; }
+    if (!msgs.length) { if (btn) btn.textContent = 'No earlier messages'; return; }
     const chat = $('#chat');
     const cbox = chatBox();
     // Anchor preservation: keep the first visible message stable.
@@ -1023,10 +997,10 @@ async function loadEarlier() {
       const newTop = anchor.getBoundingClientRect().top;
       cbox.scrollTop = oldScroll + (newTop - oldTop);
     }
-    if (btn) btn.textContent = j.has_more ? '↑ 加载更早' : '没有更早了';
+    if (btn) btn.textContent = j.has_more ? '↑ Load earlier' : 'No earlier messages';
   } catch (e) {
-    if (btn) btn.textContent = oldLabel || '↑ 加载更早（重试）';
-    toast('加载历史失败：' + (e.message || e), 'err', 4200);
+    if (btn) btn.textContent = oldLabel || '↑ Load earlier (retry)';
+    toast('Failed to load history: ' + (e.message || e), 'err', 4200);
   } finally {
     loadEarlier.busy = false;
     if (btn) btn.disabled = false;
@@ -1089,7 +1063,7 @@ async function classifyAndBadge(text, msgEl) {
       body: JSON.stringify({ text: text.slice(-500), rerank_url: settings.rerank_url }),
     });
     const j = await r.json();
-    $('#expr-badge').textContent = j.fallback ? '心情 · 😐 平静' : '心情 · 😊 ' + j.label;
+    $('#expr-badge').textContent = j.fallback ? 'Mood · 😐 calm' : 'Mood · 😊 ' + j.label;
     $('#expr-badge').title = JSON.stringify(j.scores || {});
     // Mood avatar: swap this bubble's avatar to the expression file when the
     // character ships one (expressions/<label>.webp...). Preload to avoid
@@ -1108,20 +1082,20 @@ async function classifyAndBadge(text, msgEl) {
         probe.src = imgURL(u);
       }
     }
-  } catch { /* 静默：表情失败不打断聊天 */ }
+  } catch { /* silent: an expression failure must not interrupt chat */ }
 }
 /* ---------- image attach ---------- */
 let pendingImages = [];
 const MAX_IMG_MB = 8;
 function addPendingImage(dataUrl, name) {
   if (!dataUrl || !dataUrl.startsWith('data:image/')) {
-    toast('不支持的图片格式' + (name ? '：' + name : ''), 'err');
+    toast('Unsupported image format' + (name ? ': ' + name : ''), 'err');
     return false;
   }
   // ~4/3 overhead for base64; reject loudly instead of silent drop (P0).
   const mb = (dataUrl.length * 3 / 4) / 1024 / 1024;
   if (mb > MAX_IMG_MB) {
-    toast(`图片太大（约${mb.toFixed(1)}MB，上限${MAX_IMG_MB}MB），请压缩后重发`, 'err', 4200);
+    toast(`Image too large (~${mb.toFixed(1)}MB, max ${MAX_IMG_MB}MB) — compress and resend`, 'err', 4200);
     return false;
   }
   pendingImages = [dataUrl];
@@ -1136,7 +1110,7 @@ function renderImgPreview() {
   pendingImages.forEach((d, i) => {
     const chip = document.createElement('div');
     chip.className = 'img-chip';
-    chip.innerHTML = `<img src="${d}"><button title="移除">✕</button>`;
+    chip.innerHTML = `<img src="${d}"><button title="Remove">✕</button>`;
     chip.querySelector('button').onclick = () => { pendingImages.splice(i, 1); renderImgPreview(); };
     box.appendChild(chip);
   });
@@ -1146,14 +1120,14 @@ $('#img-file').onchange = async (e) => {
   const files = [...(e.target.files || [])];
   // Single image only: most vision APIs can't handle multiple. New pick replaces.
   const f = files.find((x) => x.type.startsWith('image/'));
-  if (!f) { if (files.length) toast('选中的不是图片', 'err'); }
+  if (!f) { if (files.length) toast('Selected file is not an image', 'err'); }
   else if (f.size > MAX_IMG_MB * 1024 * 1024) {
-    toast(`图片太大（${(f.size / 1048576).toFixed(1)}MB，上限${MAX_IMG_MB}MB）`, 'err', 4200);
+    toast(`Image too large (${(f.size / 1048576).toFixed(1)}MB, max ${MAX_IMG_MB}MB)`, 'err', 4200);
   } else if (f) {
     try {
       const d = await new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = rej; r.readAsDataURL(f); });
       addPendingImage(d, f.name);
-    } catch { toast('图片读取失败', 'err'); }
+    } catch { toast('Failed to read image', 'err'); }
   }
   renderImgPreview();
   e.target.value = '';
@@ -1161,7 +1135,7 @@ $('#img-file').onchange = async (e) => {
 
 // Slash-commands understood by the composer. Only exact matches are commands:
 // any other text beginning with "/" is sent to the model as a normal message.
-const REGEN_COMMANDS = new Set(['/regenerate', '/regen', '/重发', '/重新生成', '/重新回复']);
+const REGEN_COMMANDS = new Set(['/regenerate', '/regen']);
 function isRegenCommand(t) { return REGEN_COMMANDS.has((t || '').trim().toLowerCase()); }
 
 async function send(regen = false) {
@@ -1178,7 +1152,7 @@ async function send(regen = false) {
     const last = ais.pop();
     if (last) last.remove(); // replaced by the streamed reply
   } else {
-    addMsg('user', text || '(图片)', null, imgs);
+    addMsg('user', text || '(image)', null, imgs);
   }
   ta.value = '';
   growComposer();
@@ -1191,8 +1165,8 @@ async function send(regen = false) {
   const seqAtStart = assistantSseSeq;
   const maxTokens = Math.min(65536, Math.max(256, +settings.reply_reserve || 4096));
   const body = regen
-    ? { model: settings.model || undefined, session: settings.char, regenerate: true, stream, blocks, context: ctxCfg(), max_tokens: maxTokens }
-    : { model: settings.model || undefined, session: settings.char, text, images: imgs, stream, blocks, context: ctxCfg(), max_tokens: maxTokens };
+    ? { model: settings.model || undefined, session: settings.char, regenerate: true, stream, modules, context: ctxCfg(), max_tokens: maxTokens }
+    : { model: settings.model || undefined, session: settings.char, text, images: imgs, stream, modules, context: ctxCfg(), max_tokens: maxTokens };
   try {
       if (stream) {
       const r = await api('/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
@@ -1242,13 +1216,13 @@ async function send(regen = false) {
       if (full.trim()) {
         renderRichBody(belly, full, false);
       } else {
-        belly.textContent = '（空回复）';
+        belly.textContent = '(empty reply)';
       }
       pendingAssistant = null;
       setPending(false);
-      if (streamError) toast('上游流中断，回复可能不完整：' + streamError, 'err', 6000);
-      else if (finishReason === 'length') toast('回复触到生成上限被截断（finish=length），可调大“生成上限”', 'err', 5000);
-      else if (finishReason === 'content_filter') toast('回复被安全策略截断（finish=content_filter）', 'err', 5000);
+      if (streamError) toast('Upstream stream interrupted, reply may be incomplete: ' + streamError, 'err', 6000);
+      else if (finishReason === 'length') toast('Reply truncated at the generation limit (finish=length) — raise Reply reserve', 'err', 5000);
+      else if (finishReason === 'content_filter') toast('Reply cut by content filter (finish=content_filter)', 'err', 5000);
       if (full.trim()) classifyAndBadge(full, box);
       return;
     }
@@ -1256,13 +1230,13 @@ async function send(regen = false) {
     const j = await r.json().catch(() => ({}));
     if (!r.ok) {
       const detail = (typeof j === 'string' ? j : JSON.stringify(j)).slice(0, 300);
-      if (r.status === 400 && /图片/.test(detail)) throw new Error('图片被拒：' + detail);
+      if (r.status === 400 && /image/i.test(detail)) throw new Error('Image rejected: ' + detail);
       throw new Error('HTTP ' + r.status + ' ' + detail);
     }
-    const reply = j.choices?.[0]?.message?.content || '（无内容）';
+    const reply = j.choices?.[0]?.message?.content || '(no content)';
     const finish = j.choices?.[0]?.finish_reason || '';
-    if (finish === 'length') toast('回复被长度截断（finish=length），可调大“生成上限”', 'err', 4200);
-    else if (finish === 'content_filter') toast('回复被安全策略截断（finish=content_filter）', 'err', 4200);
+    if (finish === 'length') toast('Reply truncated (finish=length) — raise Reply reserve', 'err', 4200);
+    else if (finish === 'content_filter') toast('Reply cut by content filter (finish=content_filter)', 'err', 4200);
     // SSE may have already rendered this reply (server publishes before our HTTP
     // response lands); only add the bubble if it isn't already the last one.
     // Compare dataset.raw: rendered textContent drops markdown and mismatches.
@@ -1282,14 +1256,14 @@ async function send(regen = false) {
   } catch (e) {
     setPending(false);
     pendingAssistant = null;
-    const box = addMsg('assistant', '⚠ 发送失败：' + (e.message || e), 'err');
+    const box = addMsg('assistant', '⚠ Send failed: ' + (e.message || e), 'err');
     const btn = document.createElement('button');
     btn.className = 'retry';
-    btn.textContent = '重试';
+    btn.textContent = 'Retry';
     btn.onclick = () => { box.remove(); ta.value = text; pendingImages = imgs; renderImgPreview(); send(); };
     box.querySelector('.body').appendChild(document.createElement('br'));
     box.querySelector('.body').appendChild(btn);
-    toast('发送失败：' + (e.message || e), 'err', 4200);
+    toast('Send failed: ' + (e.message || e), 'err', 4200);
   }
 }
 $('#btn-send').onclick = () => asyncAction($('#btn-send'), send);
@@ -1311,43 +1285,25 @@ $('#input').addEventListener('paste', async (e) => {
   e.preventDefault();
   const f = items[0].getAsFile();
   if (f) {
-    if (f.size > MAX_IMG_MB * 1024 * 1024) { toast('粘贴图片太大，请压缩后重发', 'err'); return; }
+    if (f.size > MAX_IMG_MB * 1024 * 1024) { toast('Pasted image too large — compress and resend', 'err'); return; }
     try {
       const d = await new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = rej; r.readAsDataURL(f); });
       addPendingImage(d, 'paste');
-    } catch { toast('图片读取失败', 'err'); }
+    } catch { toast('Failed to read image', 'err'); }
   }
   renderImgPreview();
 });
-$('#btn-assemble').onclick = assemble;
-$('#btn-preview').onclick = async () => {
-  const res = await assemble();
-  if (!res) return;
-  const m = res.memory || {};
-  $('#preview-memory').textContent = m.enabled
-    ? `MCP: ${m.collection} · query=「${(m.query || '').slice(0, 60)}」 · ${m.chars ?? 0} chars${m.error ? ' · ⚠ ' + m.error : ''}`
-    : 'MCP disabled: no memory injected this turn';
-  $('#preview-blocks').innerHTML = budgetLine(res);
-  $('#preview-text').textContent = res.prompt_text || '(空)';
-  $('#preview-modal').classList.remove('hidden');
-};
-$('#btn-preview-close').onclick = () => $('#preview-modal').classList.add('hidden');
-$('#preview-modal').addEventListener('click', (e) => { if (e.target.id === 'preview-modal') e.target.classList.add('hidden'); });
-$('#btn-save-blocks').onclick = () => asyncAction($('#btn-save-blocks'), async () => { await saveBlocks(false); assemble(); });
-$('#btn-reload-blocks').onclick = () => asyncAction($('#btn-reload-blocks'), async () => { await loadBlocks(); toast('已重载'); });
-$('#btn-add-block').onclick = async () => {
-  const raw = await uiPrompt('新 block 的名字（英文/数字/下划线，唯一）', 'my_block');
-  const id = (raw || '').trim();
-  if (!id) return;
-  if (!/^[A-Za-z0-9_-]+$/.test(id)) { toast('名字只能用英文、数字、下划线、中划线', 'err'); return; }
-  if (blocks.some((b) => b.id === id)) { toast('名字已存在', 'err'); return; }
-  const maxOrder = blocks.reduce((m, b) => Math.max(m, b.order || 0), 0);
-  blocks.push({
-    id, role: 'system', order: maxOrder + 1, enabled: true, level: 3,
-    budget: {}, source: { type: 'static' }, template: '',
-  });
-  renderBlocks();
-  scheduleBlockSave();
+$('#btn-save-modules').onclick = () => asyncAction($('#btn-save-modules'), async () => { await saveModules(false); });
+$('#btn-reload-modules').onclick = () => asyncAction($('#btn-reload-modules'), async () => { await loadModules(); toast('Reloaded'); });
+$('#btn-add-module').onclick = async () => {
+  const raw = await uiPrompt('New module title', 'Author note');
+  const title = (raw || '').trim();
+  if (!title) return;
+  const id = 'note_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  const maxOrder = modules.reduce((m, x) => Math.max(m, x.order || 0), 0);
+  modules.push({ id, title, kind: 'note', role: 'system', order: maxOrder + 1, enabled: true, level: 1, template: '' });
+  renderModules();
+  scheduleModuleSave();
 };
 
 /* ---------- export / archive (moved to settings) ---------- */
@@ -1360,22 +1316,51 @@ $('#btn-export-all').onclick = () => {
   window.open(withToken('/api/export?' + q), '_blank');
 };
 $('#btn-archive').onclick = async () => {
-  if (!(await uiConfirm(`归档「${settings.char}」当前楼并另起新楼？归档进该角色数据包，聊天数据不会丢。`))) return;
+  if (!(await uiConfirm(`Archive the current floor for "${settings.char}" and start a new one? It is moved into the character package; chat data is kept.`))) return;
   const j = await (await api('/api/archive', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ session: settings.char }),
   })).json();
-  if (j.ok) { loadHistory(); } else alert('归档失败。');
+  if (j.ok) { loadHistory(); } else alert('Archive failed.');
 };
 
-/* ---------- audit ---------- */
+/* ---------- audit: dry-run compile + per-generation replay ---------- */
+function esc(s) { return String(s ?? '').replace(/</g, '&lt;'); }
+function moduleTable(rows) {
+  return `<table><tr><th>module</th><th>tier</th><th>role</th><th>tokens</th><th>cut</th><th>note</th></tr>` +
+    rows.map((b) => `<tr><td>${esc(b.id)}</td><td>L${b.level || '?'}</td><td>${esc(b.role)}</td><td>${b.tokens}</td><td>${b.truncated ? '✂' : ''}</td><td class="meta">${esc(b.note || '')}</td></tr>`).join('') + `</table>`;
+}
+function compileLine(res) {
+  const drop = (res.dropped || []).join(', ') || 'none';
+  const mods = (res.modules || []).map((b) => `${b.id}(L${b.level}):${b.tokens}${b.truncated ? '✂' : ''}`).join(' · ');
+  const overflow = res.overflow ? ' · <span style="color:#ffb4b4">⚠ OVERFLOW (over input budget)</span>' : '';
+  const win = res.window ? `window ${Math.round(res.window / 1024)}k · ` : '';
+  return `<b>${res.total_tokens}</b> / ${res.budget_tokens} input tokens · ${win}dropped: ${drop}${overflow}<br>${mods}`;
+}
+async function compile() {
+  const r = await api('/api/assemble', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ modules, context: ctxCfg(), session: settings.char }),
+  });
+  const res = await r.json();
+  const m = res.memory || {};
+  const memTxt = m.enabled
+    ? `Memory: ${esc(m.collection || '')} · query="${esc((m.query || '').slice(0, 60))}" · ${m.chars ?? 0} chars${m.error ? ' · ⚠ ' + esc(m.error) : ''}`
+    : 'Memory: disabled (no recall this turn)';
+  $('#compile-summary').innerHTML = compileLine(res) + `<br><span class="meta">${memTxt}</span>`;
+  $('#compile-modules').innerHTML = moduleTable(res.modules || []);
+  const pre = $('#compile-text');
+  pre.textContent = res.prompt_text || '(empty)';
+  pre.classList.remove('hidden');
+  return res;
+}
 async function refreshAudit() {
-  const { ids } = await (await api('/api/audit')).json();
+  const j = await (await api('/api/audit')).json().catch(() => ({}));
+  const ids = Array.isArray(j.ids) ? j.ids : [];
   $('#audit-list').innerHTML = ids.map((id) => `<option>${id}</option>`).join('');
   if (ids.length) { $('#audit-list').value = ids[0]; viewAudit(); }
-  else { $('#audit').textContent = '暂无记录，先去聊一句。'; $('#audit-summary').textContent = ''; $('#audit-blocks').innerHTML = ''; }
+  else { $('#audit').textContent = 'No records yet — send a message first.'; $('#audit-summary').textContent = ''; $('#audit-modules').innerHTML = ''; }
 }
-function esc(s) { return String(s ?? '').replace(/</g, '&lt;'); }
 async function viewAudit() {
   const id = $('#audit-list').value;
   if (!id) return;
@@ -1386,23 +1371,21 @@ async function viewAudit() {
   const act = a.actual_tokens || up.prompt_tokens || 0;
   const comp = a.completion_tokens || up.completion_tokens || 0;
   const fin = a.finish_reason || '';
-  const truncWarn = fin === 'length' ? ' · <span style="color:#ffb4b4">⚠ 生成被截断（finish=length），调大“回复预留”</span>' : '';
-  const overWarn = a.overflow ? ' · <span style="color:#ffb4b4">⚠ OVERFLOW（超过输入预算）</span>' : '';
+  const truncWarn = fin === 'length' ? ' · <span style="color:#ffb4b4">⚠ reply truncated (finish=length) — raise Reply reserve</span>' : '';
+  const overWarn = a.overflow ? ' · <span style="color:#ffb4b4">⚠ OVERFLOW (over input budget)</span>' : '';
   const memTxt = mem.enabled
-    ? `记忆：${esc(mem.collection || '')} · query=「${esc((mem.query || '').slice(0, 60))}」 · ${mem.chars ?? 0} chars${mem.error ? ' · ⚠ ' + esc(mem.error) : ''}`
-    : '记忆：未启用';
+    ? `Memory: ${esc(mem.collection || '')} · query="${esc((mem.query || '').slice(0, 60))}" · ${mem.chars ?? 0} chars${mem.error ? ' · ⚠ ' + esc(mem.error) : ''}`
+    : 'Memory: disabled';
   $('#audit-summary').innerHTML =
-    `<b>${a.total_tokens}</b> / ${a.budget_tokens} 输入 tokens（估算${est} vs 实际${act || '?'}` +
-    `${comp ? ' · 补全' + comp : ''} · max_tokens${a.max_tokens || '?'}${fin ? ' · finish=' + esc(fin) : ''}` +
-    `）· 窗口 ${a.window ? Math.round(a.window / 1024) + 'k' : '?'} · dropped: ${esc((a.dropped || []).join(', ') || '无')}` +
+    `<b>${a.total_tokens}</b> / ${a.budget_tokens} input tokens (estimate ${est} vs actual ${act || '?'}` +
+    `${comp ? ' · completion ' + comp : ''} · max_tokens ${a.max_tokens || '?'}${fin ? ' · finish=' + esc(fin) : ''}` +
+    `) · window ${a.window ? Math.round(a.window / 1024) + 'k' : '?'} · dropped: ${esc((a.dropped || []).join(', ') || 'none')}` +
     `${truncWarn}${overWarn}<br>${memTxt}` +
-    `<br><span class="meta">滑动窗口：输入预算 = 窗口 − 回复预留。L1 永不裁剪；L3 先整个砍；L2 按级别淘汰（RAG 砍最低分，chat 淘汰最旧、保底 4 轮）。</span>`;
-  const rows = (a.blocks || []).map((b) =>
-    `<tr><td>${esc(b.id)}</td><td>L${b.level || '?'}</td><td>${esc(b.role)}</td><td>${b.tokens}</td><td>${b.truncated ? '✂' : ''}</td><td class="meta">${esc(b.note || '')}</td></tr>`).join('');
-  $('#audit-blocks').innerHTML =
-    `<table><tr><th>block</th><th>级别</th><th>role</th><th>tokens</th><th>淘汰</th><th>备注</th></tr>${rows}</table>`;
+    `<br><span class="meta">Sliding window: input budget = window − reply reserve. L1 is never trimmed; L3 is dropped first; L2 is evicted by tier (RAG drops the lowest score, chat drops the oldest, keeping the floor).</span>`;
+  $('#audit-modules').innerHTML = moduleTable(a.modules || []);
   $('#audit').textContent = JSON.stringify(a, null, 2);
 }
+$('#btn-compile').onclick = () => asyncAction($('#btn-compile'), compile);
 $('#btn-audit-list').onclick = refreshAudit;
 $('#btn-audit-view').onclick = viewAudit;
 
@@ -1433,7 +1416,7 @@ async function openLogs() {
   logSince = 0;
   renderLogEntries(j.entries || []);
   if (j.level) $('#log-level').value = j.level;
-  $('#log-state').textContent = '实时中…';
+  $('#log-state').textContent = 'Live…';
   if ($('#log-live').checked) startLogStream();
 }
 function startLogStream() {
@@ -1442,19 +1425,19 @@ function startLogStream() {
   logES.addEventListener('log', (ev) => {
     try { renderLogEntries([JSON.parse(ev.data)]); } catch {}
     if ($('#log-autoscroll').checked) { const v = $('#log-view'); v.scrollTop = v.scrollHeight; }
-    $('#log-state').textContent = '实时中…';
+    $('#log-state').textContent = 'Live…';
   });
-  logES.onerror = () => { $('#log-state').textContent = '连接中断，重连中…'; };
+  logES.onerror = () => { $('#log-state').textContent = 'Disconnected, reconnecting…'; };
 }
 $('#btn-log-refresh').onclick = () => asyncAction($('#btn-log-refresh'), openLogs);
-$('#log-live').onchange = () => { if ($('#log-live').checked) startLogStream(); else { stopLogStream(); $('#log-state').textContent = '已暂停'; } };
+$('#log-live').onchange = () => { if ($('#log-live').checked) startLogStream(); else { stopLogStream(); $('#log-state').textContent = 'Paused'; } };
 $('#log-level').onchange = async () => {
   await api('/api/logs', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ level: $('#log-level').value }) });
   openLogs();
 };
 $('#btn-log-copy').onclick = () => asyncAction($('#btn-log-copy'), async () => {
   await navigator.clipboard.writeText($('#log-view').innerText);
-  toast('日志已复制');
+  toast('Log copied');
 });
 
 
@@ -1467,35 +1450,35 @@ async function refreshGT20() {
     const loc = await (await api('/api/location')).json();
     if (loc.ok) {
       const p = loc.latest || {}, g = loc.geocode || {};
-      $('#gt20-render').textContent = '{{location}} → ' + (loc.render || '(空)') +
-        `\n坐标 ${p.lat}, ${p.lon} · acc ${p.acc || '?'}m · batt ${p.batt ?? '?'}% · provider ${p.provider || '?'}` +
+      $('#gt20-render').textContent = '{{location}} → ' + (loc.render || '(empty)') +
+        `\nlat ${p.lat}, ${p.lon} · acc ${p.acc || '?'}m · batt ${p.batt ?? '?'}% · provider ${p.provider || '?'}` +
         `\nplace: ${g.place || '?'}  [${(g.hierarchy || []).join(' > ')}]`;
-    } else { $('#gt20-render').textContent = '暂无定位上报'; }
+    } else { $('#gt20-render').textContent = 'No location reported yet'; }
     const pts = await (await api('/api/location/points?cap=50')).json();
     const rows = (pts.points || []).slice(-20).map(p =>
       `${new Date(p.tst*1000).toLocaleString()}  ${p.lat},${p.lon}  acc=${p.acc||'?'}  batt=${p.batt ?? '?'}  ${p.provider||''}`);
-    $('#gt20-points').textContent = rows.length ? rows.join('\n') : '无点位记录';
+    $('#gt20-points').textContent = rows.length ? rows.join('\n') : 'No points recorded';
     const jl = await (await api('/api/logs?limit=200')).json();
     const lines = (jl.entries || []).filter(e => /location|geocode|paikka/i.test(e.msg))
       .map(e => `[${(e.time||'').replace('T',' ').replace(/\+.*$/,'')}] ${e.level} ${e.msg} ${e.fields ? JSON.stringify(e.fields) : ''}`);
-    $('#gt20-log').textContent = lines.length ? lines.join('\n') : '无相关日志';
-    $('#gt20-state').textContent = '更新于 ' + new Date().toLocaleTimeString();
-  } catch (e) { $('#gt20-state').textContent = '加载失败: ' + e.message; }
+    $('#gt20-log').textContent = lines.length ? lines.join('\n') : 'No related log lines';
+    $('#gt20-state').textContent = 'Updated ' + new Date().toLocaleTimeString();
+  } catch (e) { $('#gt20-state').textContent = 'Load failed: ' + e.message; }
 }
 async function refreshReitti() {
   try {
     const j = await (await api('/api/reitti/movements?limit=30')).json();
     const rows = (j.movements || []).map(m =>
       `### ${m.ts || ''}  (session: ${m.session || '?'}, since: ${m.since || 'default'})\n${m.text || ''}`);
-    $('#reitti-list').textContent = rows.length ? rows.join('\n\n') : '尚无落盘的 narrative（蒸馏触发时记录）';
-    $('#reitti-state').textContent = '更新于 ' + new Date().toLocaleTimeString();
-  } catch (e) { $('#reitti-state').textContent = '加载失败: ' + e.message; }
+    $('#reitti-list').textContent = rows.length ? rows.join('\n\n') : 'No narrative stored yet (recorded when distill runs)';
+    $('#reitti-state').textContent = 'Updated ' + new Date().toLocaleTimeString();
+  } catch (e) { $('#reitti-state').textContent = 'Load failed: ' + e.message; }
 }
 $('#btn-gt20-refresh').onclick = () => asyncAction($('#btn-gt20-refresh'), refreshGT20);
 $('#btn-reitti-refresh').onclick = () => asyncAction($('#btn-reitti-refresh'), refreshReitti);
 $('#btn-reitti-live').onclick = () => asyncAction($('#btn-reitti-live'), async () => {
   const j = await (await api('/api/reitti/movement')).json();
-  $('#reitti-live-out').textContent = j.ok ? (j.text || '(空窗口)') : ('错误: ' + (j.error || 'unknown'));
+  $('#reitti-live-out').textContent = j.ok ? (j.text || '(empty window)') : ('Error: ' + (j.error || 'unknown'));
 });
 
 /* ---------- chat avatar size (global, header + per-message) ---------- */
@@ -1520,7 +1503,7 @@ function syncChatHead() {
       });
     }
     const ex = $('#char-expr');
-    if (ex) ex.textContent = (charExpressions || []).length ? '表情：' + charExpressions.join(', ') : '';
+    if (ex) ex.textContent = (charExpressions || []).length ? 'Expressions: ' + charExpressions.join(', ') : '';
   }).catch(() => {});
 }
 
@@ -1532,14 +1515,14 @@ async function refreshChars() {
   const list = characters || [];
   const grid = $('#char-grid');
   if (!list.length) {
-    grid.innerHTML = '<div class="meta">还没有角色，点「＋ 新建角色」开始。</div>';
+    grid.innerHTML = '<div class="meta">No characters yet — click "＋ New character" to start.</div>';
   } else {
     grid.innerHTML = list.map((c) => `
       <div class="char-card ${c.name === settings.char ? 'on' : ''}" data-name="${c.name}">
         <img class="avatar sq" src="${imgURL(c.avatar_url) || EMPTY_AVATAR}" alt="">
         <div>
-          <div class="cc-name">${c.name}${c.orphan ? ' <span class="badge">遗留·无卡</span>' : ''}</div>
-          <div class="cc-desc">${(c.description || '（暂无描述，点卡片后编辑）').replace(/</g, '&lt;')}</div>
+          <div class="cc-name">${c.name}${c.orphan ? ' <span class="badge">Legacy · no card</span>' : ''}</div>
+          <div class="cc-desc">${(c.description || '(No description — open the card to edit)').replace(/</g, '&lt;')}</div>
         </div>
       </div>`).join('');
     grid.querySelectorAll('.char-card').forEach((el) => {
@@ -1566,14 +1549,14 @@ async function refreshOrphanHint() {
     el.innerHTML = '';
     const span = document.createElement('span');
     span.className = 'meta';
-    span.textContent = `发现 ${n} 个遗留目录（无角色卡，仅聊天）：${orphans.map((o) => o.name).join('、')}。`;
+    span.textContent = `Found ${n} legacy directories (chat only, no card): ${orphans.map((o) => o.name).join(', ')}.`;
     const b = document.createElement('button');
-    b.textContent = '归档清理';
+    b.textContent = 'Archive & clean';
     b.onclick = async () => {
-      if (!(await uiConfirm(`将这 ${n} 个遗留目录移动到 data/_trash/ 归档？（不删除，可用 shell 找回）`))) return;
+      if (!(await uiConfirm(`Move these ${n} legacy directories to data/_trash/? (Not deleted; recoverable via shell.)`))) return;
       const r = await api('/api/characters/cleanup', { method: 'POST' });
       const j = await r.json();
-      toast(`已归档 ${(j.archived || []).length} 个目录到 _trash`);
+      toast(`Archived ${(j.archived || []).length} directories to _trash`);
       refreshChars();
     };
     el.append(span, b);
@@ -1595,7 +1578,7 @@ async function selectChar(name) {
 function openEditor(name, isNew) {
   editingNew = !!isNew;
   $('#char-editor').classList.remove('hidden');
-  $('#char-editor-title').textContent = isNew ? '新建角色' : '编辑角色';
+  $('#char-editor-title').textContent = isNew ? 'New character' : 'Edit character';
   if (isNew) {
     $('#char-name').value = '';
     $('#char-desc').value = '';
@@ -1608,7 +1591,7 @@ function openEditor(name, isNew) {
       $('#char-name').value = j.name || name;
       $('#char-desc').value = j.description || '';
       $('#char-avatar').src = imgURL(j.avatar_url) || EMPTY_AVATAR;
-      $('#char-expr').textContent = (j.expressions || []).length ? '表情：' + j.expressions.join(', ') : '';
+      $('#char-expr').textContent = (j.expressions || []).length ? 'Expressions: ' + j.expressions.join(', ') : '';
     });
     $('#char-name').readOnly = true;
     $('#btn-char-delete').style.display = 'inline-block';
@@ -1619,7 +1602,7 @@ $('#btn-char-cancel').onclick = () => $('#char-editor').classList.add('hidden');
 $('#btn-char-save').onclick = async () => {
   const name = $('#char-name').value.trim();
   const desc = $('#char-desc').value;
-  if (!name) { toast('角色名不能为空', 'err'); return; }
+  if (!name) { toast('Name cannot be empty', 'err'); return; }
   if (editingNew) {
     const r = await api('/api/characters', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -1627,12 +1610,12 @@ $('#btn-char-save').onclick = async () => {
     });
     if (!r.ok) {
       const t = (await r.text()).trim();
-      if (r.status === 409) { toast('同名角色卡已存在；请打开它编辑，或换个名字', 'err'); return; }
-      toast('创建失败（' + r.status + '）：' + (t || '非法角色名？'), 'err');
+      if (r.status === 409) { toast('A character with this name already exists — open it to edit, or pick another name', 'err'); return; }
+      toast('Create failed (' + r.status + '): ' + (t || 'invalid name?'), 'err');
       return;
     }
     const j = await r.json().catch(() => ({}));
-    if (j.reclaimed) toast('已认领同名遗留目录并写入角色卡');
+    if (j.reclaimed) toast('Reclaimed the matching legacy directory and wrote the card');
   } else {
     await api('/api/characters/' + encodeURIComponent(name) + '/card', {
       method: 'PUT', headers: { 'Content-Type': 'application/json' },
@@ -1650,8 +1633,8 @@ $('#btn-char-delete').onclick = async () => {
   if (!name) return;
   const purge = $('#char-purge-chats') && $('#char-purge-chats').checked;
   const msg = purge
-    ? `删除角色「${name}」并【永久删除】其聊天、蒸馏记录、归档与图片？此操作不可撤销！`
-    : `删除角色「${name}」？默认保留聊天数据（只删角色卡与头像）。`;
+    ? `Delete character "${name}" and PERMANENTLY delete its chat, distill records, archive and images? This cannot be undone!`
+    : `Delete character "${name}"? Chat data is kept by default (only the card and avatar are removed).`;
   if (!(await uiConfirm(msg))) return;
   await api('/api/characters/' + encodeURIComponent(name) + (purge ? '?chats=1' : ''), { method: 'DELETE' });
   $('#char-editor').classList.add('hidden');
@@ -1661,7 +1644,7 @@ $('#char-file').onchange = async (e) => {
   const f = e.target.files[0];
   if (!f) return;
   const name = $('#char-name').value.trim();
-  if (!name) { toast('先填角色名', 'err'); e.target.value = ''; return; }
+  if (!name) { toast('Enter a name first', 'err'); e.target.value = ''; return; }
   const fd = new FormData();
   fd.append('file', f);
   const r = await api('/api/characters/' + encodeURIComponent(name) + '/avatar', { method: 'PUT', body: fd });
@@ -1743,7 +1726,7 @@ function renderWrite(list, value) {
   if (!sel) return;
   const names = (list || []).map((c) => c.name);
   if (value && !names.includes(value)) names.unshift(value);
-  sel.innerHTML = '<option value="">（不写入）</option>' + names.map((n) => `<option value="${esc(n)}">${esc(n)}</option>`).join('');
+  sel.innerHTML = '<option value="">(none)</option>' + names.map((n) => `<option value="${esc(n)}">${esc(n)}</option>`).join('');
   sel.value = value || '';
 }
 
@@ -1754,7 +1737,7 @@ function renderSections(sections) {
   if (!sections || !sections.length) {
     const s = document.createElement('span');
     s.className = 'meta';
-    s.textContent = '还没有记忆，先聊几轮或按 Distill now。';
+    s.textContent = 'No memory yet — chat a few turns or press Distill now.';
     wrap.appendChild(s);
     return;
   }
@@ -1767,7 +1750,7 @@ function renderSections(sections) {
     t.textContent = sec.tag;
     const c = document.createElement('span');
     c.className = 'meta';
-    c.textContent = (sec.entries || []).length + ' 条';
+    c.textContent = (sec.entries || []).length + ' entries';
     head.append(t, c);
     box.appendChild(head);
     const body = document.createElement('div');
@@ -1792,7 +1775,7 @@ function renderSections(sections) {
 async function loadMemoryProfile() {
   const char = settings.char;
   const title = $('#mem-char-title');
-  if (title) title.textContent = '当前角色档案：' + char;
+  if (title) title.textContent = 'Current profile: ' + char;
   try {
     const [prof, dist] = await Promise.all([
       (await api('/api/characters/' + encodeURIComponent(char))).json(),
@@ -1812,15 +1795,15 @@ async function loadMemoryProfile() {
         s.textContent = txt;
         badges.appendChild(s);
       };
-      b('召回 ' + (recall.length ? '[' + recall.join(', ') + ']' : '（不召回）'), recall.length ? 'on' : 'off');
-      b('写入 ' + (write || '（不写入）'), write ? 'on' : 'off');
-      if (prof.profile_source === 'migrated') b('已从旧全局迁移', 'warn');
+      b('Recall ' + (recall.length ? '[' + recall.join(', ') + ']' : '(no recall)'), recall.length ? 'on' : 'off');
+      b('Write ' + (write || '(none)'), write ? 'on' : 'off');
+      if (prof.profile_source === 'migrated') b('Migrated from global', 'warn');
     }
     const warn = $('#mem-char-warn');
     if (warn) {
       if (prof.profile_source === 'migrated') {
         warn.classList.remove('hidden');
-        warn.textContent = '这个角色还没有自己的档案，当前值是从旧的全局设置迁移来的；保存一次即可固化。';
+        warn.textContent = 'This character has no profile yet; these values were migrated from the old global settings. Save once to persist.';
       } else { warn.classList.add('hidden'); }
     }
     if ($('#mem-distill-enabled')) $('#mem-distill-enabled').checked = !!dist.enabled;
@@ -1831,14 +1814,14 @@ async function loadMemoryProfile() {
     distillDefaultPrompt = dist.default_prompt || '';
     if ($('#mem-distill-meta')) {
       const state = dist.enabled
-        ? (dist.need_turns > 0 ? `还需约 ${dist.need_turns} 个用户轮触发自动蒸馏` : '已就绪')
-        : '自动蒸馏已关闭';
-      $('#mem-distill-meta').textContent = state + ` · ${dist.days || 0} 天记录`;
+        ? (dist.need_turns > 0 ? `~${dist.need_turns} more user turns until auto-distill` : 'Ready')
+        : 'Auto-distill off';
+      $('#mem-distill-meta').textContent = state + ` · ${dist.days || 0} days recorded`;
     }
     if ($('#mem-maxchars')) $('#mem-maxchars').value = dist.max_chars || 5000;
     if ($('#dmem-vec-enabled')) $('#dmem-vec-enabled').checked = !!dist.vectorize_enabled;
     renderSections(dist.sections || []);
-  } catch (e) { toast('加载角色档案失败：' + e.message, 'err'); }
+  } catch (e) { toast('Failed to load profile: ' + e.message, 'err'); }
 }
 
 function selectedRecall() {
@@ -1859,7 +1842,7 @@ async function saveMemoryGlobal() {
     }),
   });
   if (!r.ok) throw new Error('HTTP ' + r.status);
-  toast('全局连接设置已保存');
+  toast('Global connection settings saved');
 }
 
 async function saveMemoryProfile() {
@@ -1874,8 +1857,8 @@ async function saveMemoryProfile() {
     method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
   });
   if (!r.ok) throw new Error('HTTP ' + r.status);
-  if ($('#mem-profile-saved')) $('#mem-profile-saved').textContent = '已保存 ' + new Date().toLocaleTimeString();
-  toast(`已保存「${settings.char}」的记忆档案`);
+  if ($('#mem-profile-saved')) $('#mem-profile-saved').textContent = 'Saved ' + new Date().toLocaleTimeString();
+  toast(`Saved the memory profile for "${settings.char}"`);
   await loadMemoryProfile();
 }
 async function loadServerSettings() {
@@ -1887,7 +1870,7 @@ async function loadServerSettings() {
     if (s.reply_reserve) settings.reply_reserve = s.reply_reserve;
     if (s.history_min_turns) settings.history_min_turns = s.history_min_turns;
     store.set('settings', settings);
-    $('#set-key-state').textContent = s.api_key_set ? ('API Key 已设置 ' + (s.api_key_hint || '')) : 'API Key 未设置';
+    $('#set-key-state').textContent = s.api_key_set ? ('API Key set ' + (s.api_key_hint || '')) : 'API Key not set';
     $('#mem-url').value = s.mcp_url || '';
     $('#mem-timeout').value = s.mcp_timeout ?? 180;
     $('#mem-enabled').checked = !!s.mcp_enabled;
@@ -1910,19 +1893,19 @@ $('#btn-mem-prompt-restore') && ($('#btn-mem-prompt-restore').onclick = () => {
   if ($('#mem-distill-prompt')) $('#mem-distill-prompt').value = '';
 });
 $('#btn-mem-distill-run') && ($('#btn-mem-distill-run').onclick = () => asyncAction($('#btn-mem-distill-run'), async () => {
-  if ($('#mem-distill-meta')) $('#mem-distill-meta').textContent = '蒸馏中…（可能几十秒，请保持页面打开）';
+  if ($('#mem-distill-meta')) $('#mem-distill-meta').textContent = 'Distilling… (may take a while, keep this page open)';
   const r = await api('/api/distilled/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ session: settings.char }) });
   const j = await r.json();
   if (!j.ok) throw new Error(j.error || ('HTTP ' + r.status));
-  toast('蒸馏完成');
+  toast('Distilling done');
   await loadMemoryProfile();
 }));
 $('#btn-mem-rebuild') && ($('#btn-mem-rebuild').onclick = () => asyncAction($('#btn-mem-rebuild'), async () => {
-  if (!(await uiConfirm('从 chat.jsonl 的每条 distilled_memory 记录重建事实表？会先写 distilled.md.bak 备份，不调用 LLM。'))) return;
+  if (!(await uiConfirm('Rebuild the fact table from the distilled_memory rows in chat.jsonl? A distilled.md.bak backup is written first; no LLM call.'))) return;
   const r = await api('/api/distilled/rebuild', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ session: settings.char }) });
   const j = await r.json();
   if (!j.ok) throw new Error(j.error || ('HTTP ' + r.status));
-  toast(`回填完成：${j.sheets} 条记录 → ${j.days} 天`);
+  toast(`Backfill done: ${j.sheets} records → ${j.days} days`);
   await loadMemoryProfile();
 }));
 
@@ -2012,11 +1995,11 @@ async function saveNtfy(silent) {
     method: 'PUT', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ ntfy_url: $('#set-ntfy-url').value.trim(), ntfy_topic: $('#set-ntfy-topic').value.trim() }),
   });
-  if (!silent) toast('推送设置已保存');
+  if (!silent) toast('Push settings saved');
 }
 $('#btn-ntfy-save').onclick = () => asyncAction($('#btn-ntfy-save'), () => saveNtfy(false));
 ['set-ntfy-url', 'set-ntfy-topic'].forEach((id) => {
-  const el = document.getElementById(id); if (el) el.addEventListener('change', () => saveNtfy(true).catch((e) => toast('推送保存失败：' + e.message, 'err')));
+  const el = document.getElementById(id); if (el) el.addEventListener('change', () => saveNtfy(true).catch((e) => toast('Push save failed: ' + e.message, 'err')));
 });
 
 /* ---------- distilled memory ---------- */
@@ -2048,7 +2031,7 @@ async function refreshModels() {
     sel.innerHTML = ids.map((id) => `<option value="${id}">${id}</option>`).join('');
     if (ids.includes(settings.model)) sel.value = settings.model;
     else if (ids.length) { setChatModel(ids[0], true); sel.value = ids[0]; }
-  } catch { /* 上游未通时静默 */ }
+  } catch { /* silent while upstream is unreachable */ }
   checkModelStatus();
 }
 
@@ -2061,9 +2044,9 @@ async function checkModelStatus() {
     const st = await (await api('/api/model-status')).json();
     if (st && st.ok === false) {
       const avail = (st.available || []).slice(0, 8).join(', ');
-      el.innerHTML = `⚠ 主模型「${st.model || '?'}」不可用：${st.error || '不在上游模型列表'}。` +
-        (avail ? ` 可用：${avail}…` : '') +
-        ` <a id="model-banner-fix">去设置</a>`;
+      el.innerHTML = `⚠ Main model "${st.model || '?'}" unavailable: ${st.error || 'not in the upstream model list'}.` +
+        (avail ? ` Available: ${avail}…` : '') +
+        ` <a id="model-banner-fix">Settings</a>`;
       el.classList.remove('hidden');
       const fix = $('#model-banner-fix');
       if (fix) fix.onclick = () => { document.querySelector('[data-page="settings"]')?.click(); };
@@ -2123,9 +2106,9 @@ async function saveSettings(silent) {
   apiKeyDirty = false;
   $('#set-apikey').value = '';
   applyAvatarSize();
-  refreshUserAvatarGutters(); // user_name 改了首字块也要跟
+  refreshUserAvatarGutters(); // user_name changed: refresh initial-avatars too
   applyTheme();
-  if (!silent) toast('偏好已保存');
+  if (!silent) toast('Preferences saved');
   return r;
 }
 $('#btn-settings-save').onclick = () => asyncAction($('#btn-settings-save'), async () => { await saveSettings(false); await loadServerSettings(); refreshModels(); });
@@ -2135,8 +2118,8 @@ $('#btn-settings-save').onclick = () => asyncAction($('#btn-settings-save'), asy
     const file = e.target.files[0];
     e.target.value = '';
     if (!file) return;
-    if (!file.type.startsWith('image/')) { toast('选中的不是图片', 'err'); return; }
-    if (file.size > 8 * 1024 * 1024) { toast('图片太大（上限8MB）', 'err', 4200); return; }
+    if (!file.type.startsWith('image/')) { toast('Selected file is not an image', 'err'); return; }
+    if (file.size > 8 * 1024 * 1024) { toast('Image too large (max 8MB)', 'err', 4200); return; }
     const fd = new FormData();
     fd.append('file', file);
     try {
@@ -2145,8 +2128,8 @@ $('#btn-settings-save').onclick = () => asyncAction($('#btn-settings-save'), asy
       if (!r.ok) throw new Error((j && j.error) || ('HTTP ' + r.status));
       userAvatarURL = j.avatar_url || '';
       refreshUserAvatarGutters();
-      toast('我的头像已更新');
-    } catch (err) { toast('上传失败：' + (err.message || err), 'err', 4200); }
+      toast('My avatar updated');
+    } catch (err) { toast('Upload failed: ' + (err.message || err), 'err', 4200); }
   });
 }
 { const del = $('#btn-user-avatar-del');
@@ -2154,7 +2137,7 @@ $('#btn-settings-save').onclick = () => asyncAction($('#btn-settings-save'), asy
     await api('/api/user/avatar/', { method: 'DELETE' });
     userAvatarURL = '';
     refreshUserAvatarGutters();
-    toast('我的头像已删除，改用名字首字');
+    toast('My avatar removed; using name initial');
   });
 }
 // Theme picker: local-only, applies instantly (no server round-trip).
@@ -2166,7 +2149,7 @@ document.querySelectorAll('[data-themek]').forEach((el) => {
 let settingsSaveTimer = null;
 function scheduleSettingsSave() {
   clearTimeout(settingsSaveTimer);
-  settingsSaveTimer = setTimeout(() => saveSettings(true).catch((e) => toast('偏好保存失败：' + e.message, 'err')), 600);
+  settingsSaveTimer = setTimeout(() => saveSettings(true).catch((e) => toast('Preference save failed: ' + e.message, 'err')), 600);
 }
 ['set-window', 'set-reserve', 'set-uiscale', 'set-minrounds', 'set-rerank', 'set-stream', 'set-visible', 'set-avatar-size', 'set-user']
   .forEach((id) => { const el = document.getElementById(id); if (el) el.addEventListener('change', scheduleSettingsSave); });
@@ -2198,7 +2181,7 @@ async function init() {
   $('#chat-char-name').textContent = settings.char;
   applyAvatarSize();
   loadUserAvatar();
-  loadBlocks();
+  loadModules();
   refreshChars();
   refreshModels();
   syncChatHead();

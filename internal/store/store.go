@@ -53,7 +53,7 @@ type Audit struct {
 	Transport   map[string]any `json:"transport,omitempty"`     // per-hop stream counters (proxy.Forward)
 	MaxTokens   int            `json:"max_tokens,omitempty"`
 	ImageCount  int            `json:"image_count,omitempty"`
-	Blocks      []BlockRow     `json:"blocks"`
+	Modules     []ModuleRow    `json:"modules"`
 	Dropped     []string       `json:"dropped"`
 	Raw         map[string]any `json:"raw_request"`
 	ReplyText   string         `json:"reply_text,omitempty"`
@@ -61,8 +61,8 @@ type Audit struct {
 	Memory      map[string]any `json:"memory,omitempty"` // mcp recall: query/collection/hits/error
 }
 
-// BlockRow mirrors engine.BlockUsage for storage.
-type BlockRow struct {
+// ModuleRow mirrors engine.ModuleUsage for storage.
+type ModuleRow struct {
 	ID     string `json:"id"`
 	Role   string `json:"role"`
 	Order  int    `json:"order"`

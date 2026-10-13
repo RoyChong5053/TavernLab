@@ -52,9 +52,9 @@ type Config struct {
 	Port          int
 	DataRoot      string
 	Upstream      string // one-api base URL (startup snapshot; live value in runtimeSettings)
-	APIKey        string
-	DefaultBlocks []engine.Block
-	Ctx           engine.ContextConfig
+	APIKey         string
+	DefaultModules []engine.Module
+	Ctx            engine.ContextConfig
 }
 
 // runtimeSettings is the live config: edited via PUT /api/settings,
@@ -284,7 +284,7 @@ func main() {
 	cfg := Config{
 		Port: *port, DataRoot: *data, Upstream: rt.get().Upstream,
 		APIKey:        rt.get().APIKey,
-		DefaultBlocks: engine.DefaultBlocks(),
+		DefaultModules: engine.DefaultModules(),
 		Ctx:           ctxFromSettings(rt.get()),
 	}
 	st := store.New(cfg.DataRoot)
@@ -624,7 +624,7 @@ func main() {
 			}
 		}
 		if len(sheets) == 0 {
-			writeJSON(w, map[string]any{"ok": false, "error": "没有可回填的 distilled_memory 记录"})
+			writeJSON(w, map[string]any{"ok": false, "error": "no distilled_memory records to backfill"})
 			return
 		}
 		base := filepath.Join(cfg.DataRoot, "characters", store.CleanSession(session))
@@ -674,55 +674,48 @@ func main() {
 		})
 	})
 
-	// Blocks CRUD (file-backed): data/presets/default.json
-	mux.HandleFunc("/api/blocks", func(w http.ResponseWriter, r *http.Request) {
-		p := filepath.Join(cfg.DataRoot, "presets", "default.json")
+	// Modules CRUD (file-backed): data/presets/modules.json. The GET also
+	// returns the compiled catalog so the Prompts-IDE UI renders descriptions,
+	// placeholders and defaults straight from the binary.
+	modulesPath := filepath.Join(cfg.DataRoot, "presets", "modules.json")
+	loadModules := func() []engine.Module {
+		b, err := os.ReadFile(modulesPath)
+		if err != nil {
+			return normalizeModules(cfg.DefaultModules)
+		}
+		var ms []engine.Module
+		if err := json.Unmarshal(b, &ms); err != nil {
+			return normalizeModules(cfg.DefaultModules)
+		}
+		return normalizeModules(ms)
+	}
+	mux.HandleFunc("/api/modules", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case "GET":
-			b, err := os.ReadFile(p)
-			if err != nil {
-				writeJSON(w, normalizeBlocks(cfg.DefaultBlocks))
-				return
-			}
-			var blocks []engine.Block
-			if json.Unmarshal(b, &blocks) != nil {
-				writeJSON(w, normalizeBlocks(cfg.DefaultBlocks))
-				return
-			}
-			writeJSON(w, normalizeBlocks(blocks))
+			writeJSON(w, map[string]any{"catalog": engine.Catalog(), "modules": loadModules()})
 		case "PUT":
 			b, _ := io.ReadAll(r.Body)
-			var blocks []engine.Block
-			if err := json.Unmarshal(b, &blocks); err != nil {
-				http.Error(w, "bad blocks json", 400)
+			var in struct {
+				Modules []engine.Module `json:"modules"`
+			}
+			if err := json.Unmarshal(b, &in); err != nil {
+				http.Error(w, "bad modules json", 400)
 				return
 			}
-			_ = os.MkdirAll(filepath.Dir(p), 0o755)
-			_ = os.WriteFile(p, b, 0o644)
-			writeJSON(w, map[string]any{"ok": true, "n": len(blocks)})
+			_ = os.MkdirAll(filepath.Dir(modulesPath), 0o755)
+			save, _ := json.MarshalIndent(in.Modules, "", "  ")
+			_ = os.WriteFile(modulesPath, save, 0o644)
+			writeJSON(w, map[string]any{"ok": true, "n": len(in.Modules)})
 		default:
 			http.Error(w, "method not allowed", 405)
 		}
 	})
 
-	loadBlocks := func() []engine.Block {
-		p := filepath.Join(cfg.DataRoot, "presets", "default.json")
-		b, err := os.ReadFile(p)
-		if err != nil {
-			return normalizeBlocks(cfg.DefaultBlocks)
-		}
-		var blocks []engine.Block
-		if err := json.Unmarshal(b, &blocks); err != nil {
-			return normalizeBlocks(cfg.DefaultBlocks)
-		}
-		return normalizeBlocks(blocks)
-	}
-
-	// Dry-run assemble: blocks -> raw + per-block tokens + dropped. No LLM call.
-	// Also resolves mcp blocks so Preview shows exactly what the model would get.
+	// Dry-run assemble: modules -> raw + per-module tokens + dropped. No LLM
+	// call. The Audit page calls this to preview exactly what the model gets.
 	mux.HandleFunc("/api/assemble", func(w http.ResponseWriter, r *http.Request) {
 		var in struct {
-			Blocks  []engine.Block       `json:"blocks"`
+			Modules []engine.Module      `json:"modules"`
 			Context engine.ContextConfig `json:"context"`
 			Chat    []map[string]string  `json:"chat"`
 			Session string               `json:"session"` // when set, full history slides server-side
@@ -731,9 +724,9 @@ func main() {
 		if len(b) > 0 {
 			_ = json.Unmarshal(b, &in)
 		}
-		blocks := in.Blocks
-		if len(blocks) == 0 {
-			blocks = loadBlocks()
+		modules := in.Modules
+		if len(modules) == 0 {
+			modules = loadModules()
 		}
 		ctx := in.Context
 		if ctx.Window <= 0 {
@@ -746,11 +739,11 @@ func main() {
 				turns = chatToTurns(cfg.DataRoot, session, all)
 			}
 		}
-		blocks = renderBlocks(cfg.DataRoot, session, rt.get().UserName, blocks)
+		modules = renderModules(cfg.DataRoot, session, rt.get().UserName, modules)
 		ragItems, memInfo := resolveMCP(r.Context(), rt.get(), cfg.DataRoot, session, turns)
-		res := engine.Assemble(engine.Input{Blocks: blocks, Cfg: ctx, Turns: turns, Lists: listInputs(blocks, ragItems, cfg.DataRoot, session)})
+		res := engine.Assemble(engine.Input{Modules: modules, Cfg: ctx, Turns: turns, Lists: listInputs(modules, ragItems, cfg.DataRoot, session)})
 		out := map[string]any{
-			"messages": res.Messages, "blocks": res.Blocks, "total_tokens": res.TotalTok,
+			"messages": res.Messages, "modules": res.Modules, "total_tokens": res.TotalTok,
 			"budget_tokens": res.BudgetTok, "window": res.Window, "overflow": res.Overflow,
 			"dropped": res.Dropped, "prompt_text": res.PromptText,
 			"memory": memInfo,
@@ -769,7 +762,7 @@ func main() {
 			Session   string               `json:"session"`
 			Text      string               `json:"text"`   // new path: single fresh user message
 			Images    []string             `json:"images"` // data URLs / raw base64 for the fresh message
-			Blocks    []engine.Block       `json:"blocks"`
+			Modules   []engine.Module      `json:"modules"`
 			Context   engine.ContextConfig `json:"context"`
 			Chat      []map[string]string  `json:"chat"` // legacy: explicit turns (assemble/preview compat)
 			MaxTokens int                  `json:"max_tokens"`
@@ -779,9 +772,9 @@ func main() {
 			Regenerate bool `json:"regenerate"`
 		}
 		_ = json.Unmarshal(body, &in)
-		blocks := in.Blocks
-		if len(blocks) == 0 {
-			blocks = loadBlocks()
+		modules := in.Modules
+		if len(modules) == 0 {
+			modules = loadModules()
 		}
 		ctx := in.Context
 		if ctx.Window <= 0 {
@@ -802,11 +795,11 @@ func main() {
 			lastUser, removedRows, hasUser, derr := st.DropTrailingAssistant(session)
 			if derr != nil {
 				obs.Warn("chat regenerate drop failed", map[string]any{"session": session, "error": derr.Error()})
-				http.Error(w, "无法回退上一条回复："+derr.Error(), 500)
+				http.Error(w, "cannot roll back the previous reply: "+derr.Error(), 500)
 				return
 			}
 			if !hasUser {
-				http.Error(w, "没有可重新生成的用户消息", 400)
+				http.Error(w, "no user message to regenerate", 400)
 				return
 			}
 			upImages = loadMediaAsDataURLs(cfg.DataRoot, session, lastUser.Images)
@@ -824,7 +817,7 @@ func main() {
 			paths, dataURLs, imgErr := saveImages(cfg.DataRoot, session, in.Images)
 			if len(in.Images) > 0 && len(paths) == 0 && len(dataURLs) == 0 {
 				obs.Warn("image save failed", map[string]any{"session": session, "error": imgErrString(imgErr)})
-				http.Error(w, "图片保存失败："+imgErrString(imgErr), 400)
+				http.Error(w, "image save failed: "+imgErrString(imgErr), 400)
 				return
 			}
 			upImages = dataURLs
@@ -837,14 +830,14 @@ func main() {
 			// classic OpenAI path: convert caller messages to turns
 			turns = rawToTurns(in.Messages)
 		}
-		blocks = renderBlocks(cfg.DataRoot, session, s.UserName, blocks)
+		modules = renderModules(cfg.DataRoot, session, s.UserName, modules)
 		model := in.Model
 		if model == nil || model == "" {
 			model = defaultChatModel(s)
 		}
 		setActiveModel(fmt.Sprint(model))
 		ragItems, memInfo := resolveMCP(r.Context(), s, cfg.DataRoot, session, turns)
-		res := engine.Assemble(engine.Input{Blocks: blocks, Cfg: ctx, Turns: turns, Lists: listInputs(blocks, ragItems, cfg.DataRoot, session)})
+		res := engine.Assemble(engine.Input{Modules: modules, Cfg: ctx, Turns: turns, Lists: listInputs(modules, ragItems, cfg.DataRoot, session)})
 
 		// Build upstream body from assembled messages (attach fresh images).
 		upMsgs := buildUpMessages(res.Messages, upImages)
@@ -1764,11 +1757,11 @@ func main() {
 			lastUser, removedRows, hasUser, derr := st.DropTrailingAssistant(session)
 			if derr != nil {
 				obs.Warn("app regenerate drop failed", map[string]any{"session": session, "error": derr.Error()})
-				http.Error(w, "无法回退上一条回复："+derr.Error(), 500)
+				http.Error(w, "cannot roll back the previous reply: "+derr.Error(), 500)
 				return
 			}
 			if !hasUser {
-				http.Error(w, "没有可重新生成的用户消息", 400)
+				http.Error(w, "no user message to regenerate", 400)
 				return
 			}
 			upImages = loadMediaAsDataURLs(cfg.DataRoot, session, lastUser.Images)
@@ -1807,7 +1800,7 @@ func main() {
 					savedPaths = paths
 					if len(freshImages) > 0 && len(paths) == 0 && len(dataURLs) == 0 {
 						obs.Warn("app image save failed", map[string]any{"session": session, "error": imgErrString(imgErr)})
-						http.Error(w, "图片保存失败："+imgErrString(imgErr), 400)
+						http.Error(w, "image save failed: "+imgErrString(imgErr), 400)
 						return
 					}
 					upImages = dataURLs
@@ -1828,10 +1821,10 @@ func main() {
 		}
 		all, _ := st.LoadAll(session)
 		turns := chatToTurns(cfg.DataRoot, session, all)
-		blocks := renderBlocks(cfg.DataRoot, session, s.UserName, loadBlocks())
+		modules := renderModules(cfg.DataRoot, session, s.UserName, loadModules())
 		setActiveModel(model)
 		ragItems, memInfo := resolveMCP(r.Context(), s, cfg.DataRoot, session, turns)
-		res := engine.Assemble(engine.Input{Blocks: blocks, Cfg: ctxFromSettings(s), Turns: turns, Lists: listInputs(blocks, ragItems, cfg.DataRoot, session)})
+		res := engine.Assemble(engine.Input{Modules: modules, Cfg: ctxFromSettings(s), Turns: turns, Lists: listInputs(modules, ragItems, cfg.DataRoot, session)})
 		upMsgs := buildUpMessages(res.Messages, upImages)
 		mt := s.ReplyReserve
 		if mt <= 0 {
@@ -2048,21 +2041,21 @@ func writeJSON(w http.ResponseWriter, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-// injectChat renders {{chat_history}} into the chat block from simple turns.
+// injectChat renders {{chat_history}} into the chat module from simple turns.
 // Deprecated: chat history is now passed as structured turns to the engine,
 // but kept for the classic /v1 messages path.
-func injectChat(blocks []engine.Block, chat []map[string]string) []engine.Block {
+func injectChat(modules []engine.Module, chat []map[string]string) []engine.Module {
 	if len(chat) == 0 {
-		return blocks
+		return modules
 	}
 	var sb strings.Builder
 	for _, m := range chat {
 		sb.WriteString(m["role"] + ": " + m["content"] + "\n")
 	}
-	out := make([]engine.Block, len(blocks))
-	copy(out, blocks)
+	out := make([]engine.Module, len(modules))
+	copy(out, modules)
 	for i := range out {
-		if out[i].Source.Type == "chat" {
+		if out[i].Kind == engine.KindChat {
 			out[i].Content = strings.ReplaceAll(out[i].Template, "{{chat_history}}", sb.String())
 			if out[i].Content == out[i].Template {
 				out[i].Content = sb.String()
@@ -2110,9 +2103,9 @@ func toAudit(id string, model any, res engine.AssembleResult, upBody, respBody [
 	if s, ok := model.(string); ok && s != "" {
 		mName = s
 	}
-	rows := make([]store.BlockRow, 0, len(res.Blocks))
-	for _, b := range res.Blocks {
-		rows = append(rows, store.BlockRow{ID: b.ID, Role: b.Role, Order: b.Order, Level: b.Level, Tokens: b.Tokens, Cut: b.Truncated, Note: b.DroppedNote})
+	rows := make([]store.ModuleRow, 0, len(res.Modules))
+	for _, b := range res.Modules {
+		rows = append(rows, store.ModuleRow{ID: b.ID, Role: b.Role, Order: b.Order, Level: b.Level, Tokens: b.Tokens, Cut: b.Truncated, Note: b.DroppedNote})
 	}
 	actual := 0
 	completion := 0
@@ -2152,7 +2145,7 @@ func toAudit(id string, model any, res engine.AssembleResult, upBody, respBody [
 		Budget: res.BudgetTok, TotalTok: res.TotalTok, Estimate: res.TotalTok, Actual: actual,
 		Completion: completion, Finish: finish, StreamError: streamErr, Cut: cut, Transport: transport,
 		MaxTokens: maxTok, ImageCount: imgCount,
-		Blocks:  rows,
+		Modules: rows,
 		Dropped: res.Dropped, Raw: raw, ReplyText: reply, Upstream: usage,
 		Memory: mem,
 	}
@@ -2436,7 +2429,7 @@ func sniffImageMime(data []byte) string {
 
 func imgErrString(err error) string {
 	if err == nil {
-		return "空图片或解码失败（可能是过大/非图片/base64损坏）"
+		return "empty image or decode failure (too large / not an image / corrupt base64)"
 	}
 	return err.Error()
 }
@@ -2575,7 +2568,7 @@ func refreshModelCheck(client *http.Client, s settings.Settings) {
 	}
 	ids := upstreamModelIDs(client, s.Upstream, s.APIKey)
 	if len(ids) == 0 {
-		modelCheck.set(m, nil, "无法从上游获取模型列表")
+		modelCheck.set(m, nil, "could not fetch the model list from upstream")
 		obs.Warn("model check: upstream model list unavailable", map[string]any{"model": m, "upstream": s.Upstream})
 		return
 	}
@@ -2586,7 +2579,7 @@ func refreshModelCheck(client *http.Client, s settings.Settings) {
 			return
 		}
 	}
-	modelCheck.set(m, ids, "主模型 "+m+" 不在上游模型列表中")
+	modelCheck.set(m, ids, "main model "+m+" is not in the upstream model list")
 	obs.Warn("model check failed: chat model not offered by upstream", map[string]any{"model": m, "available": ids})
 }
 
@@ -2755,7 +2748,7 @@ func firstLine(s string, n int) string {
 		return string(r[:n]) + "…"
 	}
 	if s == "" {
-		return "新对话"
+		return "New chat"
 	}
 	return s
 }
@@ -2854,21 +2847,21 @@ func resolveMCP(ctx context.Context, s settings.Settings, root, session string, 
 	return []engine.Item{{Text: text}}, info
 }
 
-// listInputs binds the RAG hits to every enabled mcp/vectra block and the
-// diary to every enabled distilled_log block, so the engine treats them as L2
+// listInputs binds the RAG hits to every enabled rag module and the diary to
+// every enabled distilled_log module, so the engine treats them as L2
 // evictable lists. Both work even when the other source is empty.
-func listInputs(blocks []engine.Block, rag []engine.Item, root, session string) []engine.ItemList {
+func listInputs(modules []engine.Module, rag []engine.Item, root, session string) []engine.ItemList {
 	var out []engine.ItemList
-	for _, b := range blocks {
+	for _, b := range modules {
 		if !b.Enabled {
 			continue
 		}
-		switch b.Source.Type {
-		case "mcp", "vectra":
+		switch b.Kind {
+		case engine.KindRAG:
 			if len(rag) > 0 {
 				out = append(out, engine.ItemList{BlockID: b.ID, Items: rag, Floor: 0, FloorFromHead: true, Weight: 1})
 			}
-		case "distilled_log":
+		case engine.KindDistilledLog:
 			items := distillItems(root, session)
 			if len(items) > 0 {
 				// Retain already enforces the character budget; the engine may
@@ -3118,7 +3111,7 @@ func runDistill(ctx context.Context, st *store.Store, client *http.Client, root 
 		timeline = distill.FormatTimeline(session, s.UserName, fresh)
 	}
 	if timeline == "" {
-		return "", fmt.Errorf("没有可蒸馏的新消息")
+		return "", fmt.Errorf("no new messages to distill")
 	}
 	// The extractor sees the current state (small), a BOUNDED tail of recent
 	// entries (continuity) and the new messages; it never receives the whole
@@ -3167,11 +3160,11 @@ func runDistill(ctx context.Context, st *store.Store, client *http.Client, root 
 			if delta == "" {
 				p := writeDistillTmp(root, s, session, fresh, len(all)-len(fresh), len(all), "", "empty", movement, time.Now())
 				autoVectorize(root, s, session, p)
-				return "", fmt.Errorf("上游返回空增量")
+				return "", fmt.Errorf("upstream returned an empty delta")
 			}
 			p := writeDistillTmp(root, s, session, fresh, len(all)-len(fresh), len(all), delta, "parse-failed", movement, time.Now())
 			autoVectorize(root, s, session, p)
-			return "", fmt.Errorf("蒸馏输出无法解析（保留旧记录）")
+			return "", fmt.Errorf("distill output could not be parsed (keeping old records)")
 		}
 	}
 	if bad := distill.UnparsedDatedLines(delta); len(bad) > 0 {

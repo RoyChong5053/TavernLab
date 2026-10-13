@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="zh">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
@@ -7,7 +7,6 @@
 <link rel="icon" type="image/png" href="/icon.png">
 <link rel="apple-touch-icon" href="/icon.png">
 <link rel="stylesheet" href="style.css">
-<!-- Formatting libs, vendored locally (no CDN: LAN/offline-safe, rclone-friendly) -->
 <link rel="stylesheet" href="vendor/katex.min.css">
 <link rel="stylesheet" href="vendor/hljs-github-dark.min.css">
 <script src="vendor/showdown.min.js"></script>
@@ -21,7 +20,7 @@
   <defs>
     <symbol id="i-chat" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></symbol>
     <symbol id="i-char" viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M20 21a8 8 0 0 0-16 0"/></symbol>
-    <symbol id="i-blocks" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></symbol>
+    <symbol id="i-modules" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></symbol>
     <symbol id="i-audit" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></symbol>
     <symbol id="i-memory" viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="8" ry="2.8"/><path d="M4 5v14c0 1.55 3.58 2.8 8 2.8s8-1.25 8-2.8V5"/><path d="M4 12c0 1.55 3.58 2.8 8 2.8s8-1.25 8-2.8"/></symbol>
     <symbol id="i-gps" viewBox="0 0 24 24"><path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0"/><circle cx="12" cy="10" r="2.6"/></symbol>
@@ -30,192 +29,188 @@
     <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m15 18-6-6 6-6"/></symbol>
   </defs>
 </svg>
-<button id="hamburger" aria-label="菜单" aria-expanded="false">☰</button>
+<button id="hamburger" aria-label="Menu" aria-expanded="false">☰</button>
 <div id="nav-backdrop" class="nav-backdrop hidden" aria-hidden="true"></div>
 <div id="app">
 <div class="shell">
   <aside class="sidebar glass" id="sidebar">
     <div class="brand"><img src="/icon.png" alt="" class="brand-logo"> <span class="brand-name">TavernLab</span> <span class="sub">IDE</span></div>
     <nav class="nav">
-      <button data-page="chat" class="on" title="聊天" aria-label="聊天"><svg class="ni" aria-hidden="true"><use href="#i-chat"/></svg><span class="nav-label">聊天</span></button>
-      <button data-page="chars" title="角色" aria-label="角色"><svg class="ni" aria-hidden="true"><use href="#i-char"/></svg><span class="nav-label">角色</span></button>
-      <button data-page="blocks" title="Blocks" aria-label="Blocks"><svg class="ni" aria-hidden="true"><use href="#i-blocks"/></svg><span class="nav-label">Blocks</span></button>
+      <button data-page="chat" class="on" title="Chat" aria-label="Chat"><svg class="ni" aria-hidden="true"><use href="#i-chat"/></svg><span class="nav-label">Chat</span></button>
+      <button data-page="chars" title="Characters" aria-label="Characters"><svg class="ni" aria-hidden="true"><use href="#i-char"/></svg><span class="nav-label">Characters</span></button>
+      <button data-page="modules" title="Prompts-IDE" aria-label="Prompts-IDE"><svg class="ni" aria-hidden="true"><use href="#i-modules"/></svg><span class="nav-label">Prompts-IDE</span></button>
       <button data-page="audit" title="Audit" aria-label="Audit"><svg class="ni" aria-hidden="true"><use href="#i-audit"/></svg><span class="nav-label">Audit</span></button>
       <button data-page="memory" title="Memory" aria-label="Memory"><svg class="ni" aria-hidden="true"><use href="#i-memory"/></svg><span class="nav-label">Memory</span></button>
       <button data-page="gps" title="GPS-Logger" aria-label="GPS-Logger"><svg class="ni" aria-hidden="true"><use href="#i-gps"/></svg><span class="nav-label">GPS-Logger</span></button>
       <button data-page="logs" title="Logs" aria-label="Logs"><svg class="ni" aria-hidden="true"><use href="#i-logs"/></svg><span class="nav-label">Logs</span></button>
-      <button data-page="settings" title="设置" aria-label="设置"><svg class="ni" aria-hidden="true"><use href="#i-settings"/></svg><span class="nav-label">设置</span></button>
+      <button data-page="settings" title="Settings" aria-label="Settings"><svg class="ni" aria-hidden="true"><use href="#i-settings"/></svg><span class="nav-label">Settings</span></button>
     </nav>
     <div class="side-foot">
       <div id="health" class="health">…</div>
-      <div class="hint">Go thin core · data/可rclone</div>
-      <button id="btn-logout" class="meta hidden" title="退出登录">退出登录</button>
+      <div class="hint">Go thin core · data/ rclone-friendly</div>
+      <button id="btn-logout" class="meta hidden" title="Sign out">Sign out</button>
     </div>
-    <button id="btn-nav-collapse" class="nav-toggle" type="button" aria-label="收起侧栏" title="收起侧栏"><svg class="ni" aria-hidden="true"><use href="#i-chevron"/></svg><span class="nav-label">收起</span></button>
+    <button id="btn-nav-collapse" class="nav-toggle" type="button" aria-label="Collapse sidebar" title="Collapse sidebar"><svg class="ni" aria-hidden="true"><use href="#i-chevron"/></svg><span class="nav-label">Collapse</span></button>
   </aside>
   <main class="content">
     <div id="model-banner" class="model-banner hidden"></div>
     <!-- CHAT (default) -->
     <section class="page on" id="page-chat">
       <div class="chat-head glass">
-        <img id="chat-avatar" class="avatar sq" alt="角色头像" src="">
+        <img id="chat-avatar" class="avatar sq" alt="Character avatar" src="">
         <div class="chat-head-info">
           <strong id="chat-char-name">Leer乐儿</strong>
-          <div id="expr-badge" class="mood" title="最近一次表情判定">心情 · —</div>
+          <div id="expr-badge" class="mood" title="Latest expression label">Mood · —</div>
         </div>
       </div>
       <div class="glass chat-box">
-        <div class="row" style="justify-content:center"><button id="btn-earlier" class="meta">↑ 加载更早</button></div>
+        <div class="row" style="justify-content:center"><button id="btn-earlier" class="meta">↑ Load earlier</button></div>
         <div id="chat"></div>
-        <button id="btn-bottom" class="meta hidden" title="回到最新">↓ 回到底部 <span id="btn-bottom-n" class="newcount hidden"></span></button>
+        <button id="btn-bottom" class="meta hidden" title="Back to latest">↓ Back to bottom <span id="btn-bottom-n" class="newcount hidden"></span></button>
       </div>
       <div class="composer glass">
-        <button id="btn-attach" class="icon-btn" title="上传图片（仅单图）">＋</button>
+        <button id="btn-attach" class="icon-btn" title="Attach image (single)">＋</button>
         <input type="file" id="img-file" accept="image/*" hidden>
         <div class="composer-main">
           <div id="img-preview" class="img-preview hidden"></div>
-          <textarea id="input" rows="2" placeholder="输入消息…（Enter发送 / Shift+Enter换行；/regenerate 重新生成上一条）"></textarea>
+          <textarea id="input" rows="2" placeholder="Type a message… (Enter to send / Shift+Enter for newline; /regenerate to rerun the last reply)"></textarea>
         </div>
         <button id="btn-send" class="primary">➤</button>
       </div>
     </section>
     <!-- CHARACTERS -->
     <section class="page" id="page-chars">
-      <h2>角色 <small>一个角色一个自包含数据包（角色卡 + 头像 + 聊天 + 归档）</small></h2>
+      <h2>Characters <small>A character is a self-contained package (card + avatar + chat + archive).</small></h2>
       <div class="row">
-        <button id="btn-char-new" class="primary">＋ 新建角色</button>
-        <span class="meta">点头像卡片即切换；聊天数据各自独立，切换不会清空。</span>
+        <button id="btn-char-new" class="primary">＋ New character</button>
+        <span class="meta">Click a card to switch. Chats are stored per character; switching never clears them.</span>
       </div>
       <div id="char-orphans" class="row hidden"></div>
       <div id="char-grid" class="char-grid"></div>
       <div id="char-editor" class="char-editor glass hidden">
-        <div class="row"><b id="char-editor-title">编辑角色</b><span class="meta">描述会直接注入 Blocks 的角色卡区块</span></div>
+        <div class="row"><b id="char-editor-title">Edit character</b><span class="meta">The description is injected into the Character Card module.</span></div>
         <div class="char-editor-body">
           <div class="char-avatar-col">
-            <img id="char-avatar" class="avatar sq" alt="头像预览">
-            <label class="filebtn">上传头像 <input type="file" id="char-file" accept=".webp,.png,.jpg,.jpeg,.gif" hidden></label>
+            <img id="char-avatar" class="avatar sq" alt="Avatar preview">
+            <label class="filebtn">Upload avatar <input type="file" id="char-file" accept=".webp,.png,.jpg,.jpeg,.gif" hidden></label>
             <div id="char-expr" class="meta"></div>
           </div>
           <div class="char-fields">
-            <label>角色名 <input id="char-name" placeholder="如 Leer乐儿" size="24"></label>
-            <label>角色描述<textarea id="char-desc" rows="6" placeholder="写下这个角色的设定、性格、说话方式…（不用宏，直接写自然语言）"></textarea></label>
-            <p class="meta">记忆档案（召回库 / 回灌库 / 蒸馏 prompt）在 <b>Memory</b> 页按角色设置。</p>
+            <label>Name <input id="char-name" placeholder="e.g. Leer" size="24"></label>
+            <label>Description<textarea id="char-desc" rows="6" placeholder="The character's settings, personality, way of speaking… (plain language, no macros)"></textarea></label>
+            <p class="meta">Memory profile (recall / write collections / distill prompt) is per character on the <b>Memory</b> page.</p>
           </div>
         </div>
         <div class="row">
-          <button id="btn-char-save" class="primary">保存</button>
-          <button id="btn-char-cancel">取消</button>
-          <label class="meta" title="勾选后删除角色会连同聊天、蒸馏、归档与图片一起永久删除"><input type="checkbox" id="char-purge-chats"> 同时删除聊天</label>
-          <button id="btn-char-delete" class="danger">删除角色</button>
+          <button id="btn-char-save" class="primary">Save</button>
+          <button id="btn-char-cancel">Cancel</button>
+          <label class="meta" title="If checked, deleting the character also permanently deletes its chat, distill data, archive and images"><input type="checkbox" id="char-purge-chats"> Also delete chats</label>
+          <button id="btn-char-delete" class="danger">Delete character</button>
         </div>
       </div>
     </section>
-    <!-- BLOCKS -->
-    <section class="page" id="page-blocks">
-      <h2>Blocks <small>order=位置；Level=超预算时的淘汰级别</small></h2>
-      <div id="budget" class="glass budget"></div>
+    <!-- PROMPTS-IDE -->
+    <section class="page" id="page-modules">
+      <h2>Prompts-IDE <small>Which compiled modules run, in what order.</small></h2>
       <div class="row">
-        <button id="btn-add-block" class="primary">＋ 新增 block</button>
-        <button id="btn-assemble">试算 Assemble</button>
-        <button id="btn-preview">👁 Preview（模拟试算）</button>
-        <button id="btn-save-blocks">保存</button>
-        <button id="btn-reload-blocks">重载</button>
+        <button id="btn-add-module" class="primary">＋ Add module</button>
+        <button id="btn-save-modules">Save</button>
+        <button id="btn-reload-modules">Reload</button>
+        <span id="modules-state" class="meta"></span>
       </div>
-      <p class="meta">拖动卡片排序。预算：<b>输入 = 上下文窗口 − 回复预留</b>。超预算时按级别淘汰：
-        <b>L1 锁定</b>（system/角色卡/distilled_state，永不裁剪）；<b>L3 弹性</b>（实验块，整个先砍）；
-        <b>L2 可裁剪</b>：先比 <b>priority</b>（数字小=先砍），同一 priority 再按 rank（RAG 砍最低分、chat 淘汰最旧、日记淘汰最旧整天），
-        每个 L2 块各自保住 floor（chat 保底轮数、日记至少 retain_days 天）。chat 固定为 L2，改 Level 无效，请用 priority 调。</p>
-      <div id="blocks"></div>
-      <div id="preview-modal" class="modal hidden">
-        <div class="modal-box glass">
-          <div class="row modal-hd"><b>👁 Preview · 模拟试算（非账单，token 为估算）</b><button id="btn-preview-close">✕</button></div>
-          <div id="preview-memory" class="meta"></div>
-          <div id="preview-blocks" class="meta"></div>
-          <pre id="preview-text" class="preview-text"></pre>
-        </div>
-      </div>
+      <p class="meta">Modules are compiled into the binary — the list below is fixed; only <b>text modules</b> expose a prompt you can edit. Toggle a module on/off, reorder with ↑/↓, and edit its prompt where shown. Full token accounting and a dry-run preview of the final request live on the <b>Audit</b> page.</p>
+      <div id="modules"></div>
     </section>
     <!-- AUDIT -->
     <section class="page" id="page-audit">
-      <h2>Audit <small>每次生成存 raw+tokens+档位，可 Replay</small></h2>
+      <h2>Audit <small>Dry-run preview, per-generation tokens and Replay.</small></h2>
+      <div class="glass pad">
+        <div class="row">
+          <button id="btn-compile" class="primary">Compile (dry-run)</button>
+          <span class="meta">Assemble the current modules into the final request — no model call, no cost.</span>
+        </div>
+        <div id="compile-summary" class="budget"></div>
+        <div id="compile-modules" class="pad"></div>
+        <pre id="compile-text" class="preview-text hidden"></pre>
+      </div>
       <div class="row">
-        <button id="btn-audit-list">刷新</button>
+        <button id="btn-audit-list">Refresh</button>
         <select id="audit-list"></select>
-        <button id="btn-audit-view">查看</button>
+        <button id="btn-audit-view">View</button>
       </div>
       <div id="audit-summary" class="glass budget"></div>
-      <div id="audit-blocks" class="glass pad"></div>
+      <div id="audit-modules" class="glass pad"></div>
       <pre id="audit" class="glass audit"></pre>
     </section>
     <!-- MEMORY -->
     <section class="page" id="page-memory">
-      <h2>Memory <small>每个角色一套记忆档案：召回库(多选) + 自动回灌库(单选) + 蒸馏 prompt；切换角色即切换整套</small></h2>
+      <h2>Memory <small>Per character: recall collections (multi) + auto-write collection (single) + distill prompt. Switching characters switches the whole profile.</small></h2>
 
       <div class="glass pad form">
-        <div class="row"><b id="mem-char-title">当前角色档案</b><span id="mem-char-badges" class="membadges"></span></div>
+        <div class="row"><b id="mem-char-title">Current character profile</b><span id="mem-char-badges" class="membadges"></span></div>
         <div id="mem-char-warn" class="meta hidden"></div>
 
-        <label>召回 collections <span class="meta">多选；一个都不选 = 本角色本轮不召回（新角色先保持干净）</span></label>
+        <label>Recall collections <span class="meta">multi-select; none = no recall this turn (keep a new character clean)</span></label>
         <div id="mem-recall" class="collist" role="group" aria-label="Recall collections"></div>
 
-        <label>自动回灌 collection <span class="meta">单选；蒸馏结果只写进这里（知识库只读、不回写）</span>
-          <select id="mem-write" style="max-width:260px"><option value="">（不写入）</option></select>
+        <label>Auto-write collection <span class="meta">single; distilled results are written only here (knowledge bases stay read-only)</span>
+          <select id="mem-write" style="max-width:260px"><option value="">(none)</option></select>
         </label>
 
         <div class="row">
-          <label class="meta"><input type="checkbox" id="mem-distill-enabled"> 本角色自动蒸馏</label>
-          <label>每 <input id="mem-distill-interval" type="number" min="1" value="8" style="width:56px"> 个 user 轮</label>
-          <button id="btn-mem-profile-save" class="primary">保存档案</button>
+          <label class="meta"><input type="checkbox" id="mem-distill-enabled"> Auto-distill this character</label>
+          <label>Every <input id="mem-distill-interval" type="number" min="1" value="8" style="width:56px"> user turns</label>
+          <button id="btn-mem-profile-save" class="primary">Save profile</button>
           <span id="mem-profile-saved" class="meta"></span>
         </div>
-        <label>蒸馏 prompt（按角色人格；留空 = 内置 STATE/LOG 抽取器）
-          <textarea id="mem-distill-prompt" rows="5" placeholder="留空使用内置默认抽取器（STATE/LOG）"></textarea>
+        <label>Distill prompt (per character; empty = built-in STATE/LOG extractor)
+          <textarea id="mem-distill-prompt" rows="5" placeholder="Empty uses the built-in extractor (STATE/LOG)"></textarea>
         </label>
         <div class="row">
-          <button id="btn-mem-prompt-default">载入内置默认</button>
-          <button id="btn-mem-prompt-restore">清空(用默认)</button>
+          <button id="btn-mem-prompt-default">Load built-in default</button>
+          <button id="btn-mem-prompt-restore">Clear (use default)</button>
           <button id="btn-mem-distill-run" class="primary">Distill now</button>
           <span id="mem-distill-meta" class="meta">—</span>
         </div>
       </div>
 
       <div class="glass pad form">
-        <div class="row"><b>本角色记忆</b><span class="meta">每个 [TAG] 段一个框；[STATE] 常驻，其余按日期自动淘汰并回灌</span>
-          <button id="btn-mem-rebuild" class="meta" title="从 chat.jsonl 的 distilled_memory 记录重建事实表（不调用 LLM）">Backfill records</button>
+        <div class="row"><b>Character memory</b><span class="meta">One box per [TAG] section; [STATE] is always present, the rest age out by date and are re-indexed</span>
+          <button id="btn-mem-rebuild" class="meta" title="Rebuild the fact table from distilled_memory rows in chat.jsonl (no LLM call)">Backfill records</button>
         </div>
-        <div id="mem-sections" class="memsections"><span class="meta">还没有记忆，先聊几轮或按 Distill now。</span></div>
+        <div id="mem-sections" class="memsections"><span class="meta">No memory yet — chat a few turns or press Distill now.</span></div>
       </div>
 
       <details class="glass pad form" id="mem-global">
-        <summary><b>全局连接设置</b> <span class="meta">所有角色共用（召回细节在 rag-mcp-server 的 WebUI 管理）</span></summary>
+        <summary><b>Global connection</b> <span class="meta">Shared by all characters (retrieval details are managed in the rag-mcp-server WebUI)</span></summary>
         <label>MCP endpoint <input id="mem-url" size="28" placeholder="http://192.168.10.2:8199"></label>
         <div class="row">
           <label>Timeout (s) <input id="mem-timeout" type="number" min="1" value="180" style="width:64px"></label>
           <label><input type="checkbox" id="mem-enabled"> Retrieve every turn</label>
-          <label class="meta" title="每次蒸馏后把审计文件 append 进本角色的「自动回灌 collection」"><input type="checkbox" id="dmem-vec-enabled"> Auto-index to RAG</label>
+          <label class="meta" title="After each distill, append the audit file into this character's auto-write collection"><input type="checkbox" id="dmem-vec-enabled"> Auto-index to RAG</label>
         </div>
         <div class="row">
-          <label>记忆字数上限 max chars <input id="mem-maxchars" type="number" min="0" value="5000" style="width:88px"> <span class="meta">安全阀：超过就从最旧数据丢</span></label>
-          <button id="btn-mem-save" class="primary">保存全局</button>
+          <label>Memory char cap <input id="mem-maxchars" type="number" min="0" value="5000" style="width:88px"> <span class="meta">Safety valve: oldest data is dropped past this</span></label>
+          <button id="btn-mem-save" class="primary">Save global</button>
         </div>
       </details>
 
       <div class="glass pad form">
         <div class="row">
-          <input id="mem-test-q" size="30" placeholder="测试查询，如 how did I sleep last week">
+          <input id="mem-test-q" size="30" placeholder="Test query, e.g. how did I sleep last week">
           <button id="btn-mem-test">Run test search</button>
         </div>
-        <div id="mem-test-out" class="mem-hits"><span class="meta">测试结果会显示在这里（用当前角色的召回库）。</span></div>
-        <p class="meta">档案存在 characters/&lt;名&gt;/profile.json，随角色数据包走；切换角色即切换整套记忆设定。</p>
+        <div id="mem-test-out" class="mem-hits"><span class="meta">Results appear here (using the current character's recall collections).</span></div>
+        <p class="meta">The profile is stored at characters/&lt;name&gt;/profile.json and travels with the character package; switching characters switches the whole memory setup.</p>
       </div>
     </section>
     <!-- LOGS -->
     <section class="page" id="page-logs">
-      <h2>Logs <small>运行时日志：请求/上游/错误/蒸馏，静默失败不再是黑盒</small></h2>
+      <h2>Logs <small>Runtime log: requests / upstream / errors / distill — no more silent failures.</small></h2>
       <div class="row">
-        <button id="btn-log-refresh">刷新</button>
-        <label class="meta"><input type="checkbox" id="log-live" checked> 实时</label>
-        <label class="meta">级别
+        <button id="btn-log-refresh">Refresh</button>
+        <label class="meta"><input type="checkbox" id="log-live" checked> Live</label>
+        <label class="meta">Level
           <select id="log-level">
             <option value="debug">debug</option>
             <option value="info" selected>info</option>
@@ -223,113 +218,113 @@
             <option value="error">error</option>
           </select>
         </label>
-        <label class="meta"><input type="checkbox" id="log-autoscroll" checked> 自动滚动</label>
-        <button id="btn-log-copy">复制</button>
+        <label class="meta"><input type="checkbox" id="log-autoscroll" checked> Auto-scroll</label>
+        <button id="btn-log-copy">Copy</button>
         <span id="log-state" class="meta">—</span>
       </div>
-      <pre id="log-view" class="glass audit">正在加载…</pre>
+      <pre id="log-view" class="glass audit">Loading…</pre>
     </section>
     <!-- GPS-LOGGER -->
     <section class="page" id="page-gps">
-      <h2>GPS-Logger <small>地理位置：GT20 兜底 + Reitti MCP</small></h2>
+      <h2>GPS-Logger <small>Location: GT20 fallback + Reitti MCP</small></h2>
       <div class="glass audit" style="margin-bottom:12px">
-        <b>① GT20 兜底（{{location}} · Termux 脚本 → Paikka，省电）</b>
-        <div class="row"><button id="btn-gt20-refresh">刷新</button><span id="gt20-state" class="meta">—</span></div>
-        <pre id="gt20-render" class="preview-text">加载中…</pre>
+        <b>① GT20 fallback ({{location}} · Termux script → Paikka, power-frugal)</b>
+        <div class="row"><button id="btn-gt20-refresh">Refresh</button><span id="gt20-state" class="meta">—</span></div>
+        <pre id="gt20-render" class="preview-text">Loading…</pre>
         <pre id="gt20-points" class="preview-text"></pre>
         <pre id="gt20-log" class="preview-text"></pre>
       </div>
       <div class="glass audit">
-        <b>② Reitti MCP（staypoint 轨迹 narrative）</b>
+        <b>② Reitti MCP (staypoint track narrative)</b>
         <div class="row">
-          <button id="btn-reitti-refresh">刷新历史</button>
-          <button id="btn-reitti-live">实时拉取</button>
+          <button id="btn-reitti-refresh">Refresh history</button>
+          <button id="btn-reitti-live">Pull live</button>
           <span id="reitti-state" class="meta">—</span>
         </div>
         <pre id="reitti-live-out" class="preview-text"></pre>
-        <pre id="reitti-list" class="preview-text">加载中…</pre>
+        <pre id="reitti-list" class="preview-text">Loading…</pre>
       </div>
     </section>
     <!-- SETTINGS -->
     <section class="page" id="page-settings">
-      <h2>设置</h2>
+      <h2>Settings</h2>
       <div class="glass pad form">
-        <label>上游 One-API <input id="set-upstream" size="30" placeholder="http://192.168.10.2:3000" autocomplete="off"></label>
-        <label>API Key <input id="set-apikey" type="password" size="30" placeholder="空=保持不变" autocomplete="new-password"></label>
+        <label>Upstream One-API <input id="set-upstream" size="30" placeholder="http://192.168.10.2:3000" autocomplete="off"></label>
+        <label>API Key <input id="set-apikey" type="password" size="30" placeholder="empty = keep current" autocomplete="new-password"></label>
         <span id="set-key-state" class="meta"></span>
         <div class="row">
-          <label>上下文窗口 <input id="set-window" type="number" min="2048" max="131072" step="1024" value="16384" style="width:92px" title="输入+回复的总预算"></label>
-          <label>回复预留 <input id="set-reserve" type="number" min="256" max="65536" value="4096" style="width:80px" title="留给回复的预算，同时作为上游 max_tokens"></label>
-          <label>保底轮数 <input id="set-minrounds" type="number" min="1" max="50" value="4" style="width:56px" title="滑动窗口至少保留的对话轮数"></label>
+          <label>Context window <input id="set-window" type="number" min="2048" max="131072" step="1024" value="16384" style="width:92px" title="Total budget for input + reply"></label>
+          <label>Reply reserve <input id="set-reserve" type="number" min="256" max="65536" value="4096" style="width:80px" title="Budget held back for the reply; also sent as upstream max_tokens"></label>
+          <label>Min kept turns <input id="set-minrounds" type="number" min="1" max="50" value="4" style="width:56px" title="Minimum conversation turns kept by the sliding window"></label>
         </div>
-        <p class="meta">输入预算 = 上下文窗口 − 回复预留（例如 16384 − 4096 = 12288）。窗口内先放锁定块，RAG 与对话按级别淘汰。</p>
+        <p class="meta">Input budget = context window − reply reserve (e.g. 16384 − 4096 = 12288). Locked modules are placed first; RAG and chat are evicted by tier.</p>
         <div class="row">
-          <label>界面缩放 <input id="set-uiscale" type="number" min="80" max="150" value="100" style="width:64px"> %（存本机，替代浏览器130%）</label>
+          <label>UI scale <input id="set-uiscale" type="number" min="80" max="150" value="100" style="width:64px"> % (stored locally)</label>
         </div>
         <div class="row">
-          <label>主题 <select id="set-theme">
-            <option value="st-dark">ST 暗灰（默认）</option>
-            <option value="tavern-glass">Tavern 玻璃（旧版）</option>
-            <option value="paper">纸白（浅色）</option>
-            <option value="custom">自定义…</option>
-          </select>（存本机）</label>
+          <label>Theme <select id="set-theme">
+            <option value="st-dark">ST dark (default)</option>
+            <option value="tavern-glass">Tavern glass (legacy)</option>
+            <option value="paper">Paper (light)</option>
+            <option value="custom">Custom…</option>
+          </select> (stored locally)</label>
         </div>
         <div id="theme-custom" class="row hidden">
-          <label>背景 <input type="color" data-themek="--bg" value="#23262d"></label>
-          <label>卡片 <input type="color" data-themek="--card" value="#2e3138"></label>
-          <label>文字 <input type="color" data-themek="--txt" value="#e6e8eb"></label>
-          <label>强调 <input type="color" data-themek="--acc" value="#7dd3fc"></label>
+          <label>Background <input type="color" data-themek="--bg" value="#23262d"></label>
+          <label>Card <input type="color" data-themek="--card" value="#2e3138"></label>
+          <label>Text <input type="color" data-themek="--txt" value="#e6e8eb"></label>
+          <label>Accent <input type="color" data-themek="--acc" value="#7dd3fc"></label>
         </div>
-        <label>Reranker（表情判定） <input id="set-rerank" size="26" value="http://127.0.0.1:11437"></label>
-        <label>主模型 <select id="set-model" style="max-width:230px"></select>（与 App 共用，存服务端）</label>
-        <label><input type="checkbox" id="set-stream"> 流式输出</label>
-        <label>聊天显示最近 <input id="set-visible" type="number" value="10" min="5" max="200" style="width:60px"> 轮（滑动窗口，上下文不受影响）</label>
+        <label>Reranker (expression) <input id="set-rerank" size="26" value="http://127.0.0.1:11437"></label>
+        <label>Main model <select id="set-model" style="max-width:230px"></select> (shared with the App, stored server-side)</label>
+        <label><input type="checkbox" id="set-stream"> Streaming output</label>
+        <label>Show latest <input id="set-visible" type="number" value="10" min="5" max="200" style="width:60px"> turns (display window; context is unaffected)</label>
         <div class="row">
-          <label>聊天头像大小 <input id="set-avatar-size" type="number" min="32" max="240" value="88" style="width:64px"> px</label>
+          <label>Chat avatar size <input id="set-avatar-size" type="number" min="32" max="240" value="88" style="width:64px"> px</label>
         </div>
-        <label>导出时我的名字 <input id="set-user" size="12" placeholder="RoyChong" autocomplete="off"></label>
+        <label>My name on export <input id="set-user" size="12" placeholder="RoyChong" autocomplete="off"></label>
         <div class="row">
-          <img id="user-avatar-preview" class="avatar sq" alt="我的头像" style="width:64px;height:64px">
-          <label class="filebtn">上传我的头像 <input type="file" id="user-avatar-file" accept=".webp,.png,.jpg,.jpeg,.gif" hidden></label>
-          <button id="btn-user-avatar-del" class="danger">删除</button>
-          <span class="meta">显示在每条消息左侧；不设则用名字首字。</span>
+          <img id="user-avatar-preview" class="avatar sq" alt="My avatar" style="width:64px;height:64px">
+          <label class="filebtn">Upload my avatar <input type="file" id="user-avatar-file" accept=".webp,.png,.jpg,.jpeg,.gif" hidden></label>
+          <button id="btn-user-avatar-del" class="danger">Delete</button>
+          <span class="meta">Shown left of each message; falls back to the name's initial.</span>
         </div>
-        <div class="row"><button id="btn-settings-save" class="primary">保存偏好</button><button id="btn-models-refresh">刷新模型列表</button></div>
-        <p class="meta">upstream/key/current_char 存后端 data/settings.json（0600，不进 git）；其余存浏览器 localStorage。</p>
+        <div class="row"><button id="btn-settings-save" class="primary">Save preferences</button><button id="btn-models-refresh">Refresh models</button></div>
+        <p class="meta">upstream / key / current_char live in the backend data/settings.json (0600, not in git); the rest is stored in browser localStorage.</p>
       </div>
       <div class="glass pad form">
-        <b>会话操作</b>
-        <p class="meta">导出 = 把当前角色整楼（可含全部归档）转 timeline md 喂 RAG；归档 = 封存当前楼另起新楼（角色数据不丢）。</p>
+        <b>Session</b>
+        <p class="meta">Export = turn the current character's full floor (optionally including archives) into a timeline md for RAG; Archive = seal the current floor and start a new one (character data is kept).</p>
         <div class="row">
-          <button id="btn-export">📥 导出 md</button>
-          <button id="btn-export-all">📥 导出全部归档+当前</button>
-          <button id="btn-archive">🗃 归档新楼</button>
+          <button id="btn-export">📥 Export md</button>
+          <button id="btn-export-all">📥 Export all archives + current</button>
+          <button id="btn-archive">🗃 Archive & new floor</button>
         </div>
       </div>
       <div class="glass pad form">
-        <b>后台推送（ntfy，可选）</b>
-        <label>ntfy 地址 <input id="set-ntfy-url" size="28" placeholder="http://192.168.10.2:8081"></label>
+        <b>Push notifications (ntfy, optional)</b>
+        <label>ntfy URL <input id="set-ntfy-url" size="28" placeholder="http://192.168.10.2:8081"></label>
         <label>ntfy topic <input id="set-ntfy-topic" size="16" placeholder="tavernlab"></label>
-        <div class="row"><button id="btn-ntfy-save">保存推送设置</button></div>
-        <p class="meta">填了地址+主题后，助手回复会推送到手机 App（App 锁屏也能收）。</p>
+        <div class="row"><button id="btn-ntfy-save">Save push settings</button></div>
+        <p class="meta">With a URL + topic set, assistant replies are pushed to the phone app (received even when locked).</p>
       </div>
     </section>
   </main>
 </div>
 </div>
-<div id="img-lightbox" class="modal img-lightbox hidden" role="dialog" aria-modal="true" aria-label="图片预览">
-  <img id="img-lightbox-img" alt="图片预览">
+<div id="img-lightbox" class="modal img-lightbox hidden" role="dialog" aria-modal="true" aria-label="Image preview">
+  <img id="img-lightbox-img" alt="Image preview">
 </div>
 <div id="toast-wrap" aria-live="polite"></div>
 <div id="login-overlay" class="login-overlay hidden">
   <form id="login-form" class="login-card glass" autocomplete="on">
     <div class="login-brand"><img src="/icon.png" alt="" class="brand-logo"> TavernLab <span class="sub">IDE</span></div>
-    <p class="meta">需要登录（与 rag-mcp-server 同一套 admin 鉴权）</p>
-    <label>用户名 <input id="login-user" autocomplete="username" placeholder="admin"></label>
-    <label>密码 <input id="login-pass" type="password" autocomplete="current-password" placeholder="••••••••"></label>
-    <label class="meta"><input type="checkbox" id="login-remember" checked> 记住我（本浏览器 30 天）</label>
+    <p class="meta">Sign in (shares admin auth with rag-mcp-server)</p>
+    <label>Username <input id="login-user" autocomplete="username" placeholder="admin"></label>
+    <label>Password <input id="login-pass" type="password" autocomplete="current-password" placeholder="••••••••"></label>
+    <label class="meta"><input type="checkbox" id="login-remember" checked> Remember me (30 days in this browser)</label>
     <div id="login-err" class="login-err"></div>
-    <button type="submit" class="primary">登录</button>
+    <button type="submit" class="primary">Sign in</button>
   </form>
 </div>
 <script src="app.js"></script>
