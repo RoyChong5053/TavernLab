@@ -84,7 +84,7 @@ func TestSearchMCPParsesHitsWithRawTextIntact(t *testing.T) {
 	defer srv.Close()
 
 	s := settings.Settings{MCPEnabled: true, MCPURL: srv.URL, MCPTimeout: 5}
-	text, err := searchMCP(context.Background(), s, "查询")
+	text, err := searchMCP(context.Background(), s, t.TempDir(), "test", "查询")
 	if err != nil {
 		t.Fatal(err)
 	}

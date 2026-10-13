@@ -72,6 +72,7 @@
         <button id="btn-char-new" class="primary">＋ 新建角色</button>
         <span class="meta">点头像卡片即切换；聊天数据各自独立，切换不会清空。</span>
       </div>
+      <div id="char-orphans" class="row hidden"></div>
       <div id="char-grid" class="char-grid"></div>
       <div id="char-editor" class="char-editor glass hidden">
         <div class="row"><b id="char-editor-title">编辑角色</b><span class="meta">描述会直接注入 Blocks 的角色卡区块</span></div>
@@ -84,11 +85,13 @@
           <div class="char-fields">
             <label>角色名 <input id="char-name" placeholder="如 Leer乐儿" size="24"></label>
             <label>角色描述<textarea id="char-desc" rows="6" placeholder="写下这个角色的设定、性格、说话方式…（不用宏，直接写自然语言）"></textarea></label>
+            <label>专用 RAG collection <input id="char-collection" placeholder="留空=跟随全局；也可在 Memory 页绑定" size="28"></label>
           </div>
         </div>
         <div class="row">
           <button id="btn-char-save" class="primary">保存</button>
           <button id="btn-char-cancel">取消</button>
+          <label class="meta" title="勾选后删除角色会连同聊天、蒸馏、归档与图片一起永久删除"><input type="checkbox" id="char-purge-chats"> 同时删除聊天</label>
           <button id="btn-char-delete" class="danger">删除角色</button>
         </div>
       </div>
@@ -137,6 +140,15 @@
         <label>MCP endpoint <input id="mem-url" size="28" placeholder="http://192.168.10.2:8199"></label>
         <label>Collections <span class="meta">Tick one or more. Leave all unticked to use the server default.</span></label>
         <div id="mem-collection" class="collist" role="group" aria-label="Collections"></div>
+        <div class="glass pad" style="margin:8px 0">
+          <b>Per-character binding <small class="meta">Each character can recall + auto-index its own collection; switching characters switches it automatically. Empty = follow the global Collections above.</small></b>
+          <div id="mem-char-info" class="meta">—</div>
+          <div class="row">
+            <input id="mem-char-collection" size="30" placeholder="character-specific collection (CSV); empty = follow global">
+            <button id="btn-mem-char-save" class="primary">Bind to this character</button>
+            <button id="btn-mem-char-clear">Follow global</button>
+          </div>
+        </div>
         <div class="row">
           <label>Timeout (s) <input id="mem-timeout" type="number" min="1" value="180" style="width:64px"></label>
           <label><input type="checkbox" id="mem-enabled"> Retrieve every turn</label>

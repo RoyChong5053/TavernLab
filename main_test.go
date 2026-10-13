@@ -320,7 +320,7 @@ func TestResolveMCPTimeoutCancelsRequest(t *testing.T) {
 		MCPTimeout: 1,
 	}
 	started := time.Now()
-	_, info := resolveMCP(context.Background(), s, []engine.Message{{Role: "user", Content: "query"}})
+	_, info := resolveMCP(context.Background(), s, t.TempDir(), "test", []engine.Message{{Role: "user", Content: "query"}})
 	if elapsed := time.Since(started); elapsed > 1500*time.Millisecond {
 		t.Fatalf("MCP timeout was not honored: %s", elapsed)
 	}
@@ -351,7 +351,7 @@ func TestResolveMCPInjectsResponseVerbatim(t *testing.T) {
 	defer srv.Close()
 
 	s := settings.Settings{MCPEnabled: true, MCPURL: srv.URL, MCPTimeout: 5}
-	items, info := resolveMCP(context.Background(), s, []engine.Message{{Role: "user", Content: "我上周睡眠咋样"}})
+	items, info := resolveMCP(context.Background(), s, t.TempDir(), "test", []engine.Message{{Role: "user", Content: "我上周睡眠咋样"}})
 	if len(items) != 1 {
 		t.Fatalf("want a single verbatim item, got %d", len(items))
 	}
@@ -432,5 +432,84 @@ func TestChatModelSettingRoundTrips(t *testing.T) {
 	}
 	if got := settings.Load(root).ChatModel; got != "auto-agent" {
 		t.Fatalf("reload ChatModel = %q, want auto-agent", got)
+	}
+}
+
+// A character's meta.json mcp_collection overrides the global setting, and
+// clearing it falls back to the global again. This is what makes switching
+// characters switch the recall collection with no extra client action.
+func TestEffectiveMCPCollectionFollowsCharacterThenGlobal(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(charBase(root, "阿离"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	base := charBase(root, "阿离")
+	if err := saveCharCard(base, CharCard{Name: "阿离", Description: "x"}); err != nil {
+		t.Fatal(err)
+	}
+	glob := settings.Settings{MCPCollection: "global_recall"}
+
+	// No override -> global.
+	if got := effectiveMCPCollection(root, glob, "阿离"); got != "global_recall" {
+		t.Fatalf("no override: got %q, want global_recall", got)
+	}
+	if src := collectionSource(root, glob, "阿离"); src != "global" {
+		t.Fatalf("source = %q, want global", src)
+	}
+
+	// Override wins.
+	if err := os.WriteFile(filepath.Join(base, "meta.json"),
+		[]byte(`{"avatar_px":88,"mcp_collection":"ali_recall"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := effectiveMCPCollection(root, glob, "阿离"); got != "ali_recall" {
+		t.Fatalf("override: got %q, want ali_recall", got)
+	}
+	if src := collectionSource(root, glob, "阿离"); src != "character" {
+		t.Fatalf("source = %q, want character", src)
+	}
+
+	// A different character still follows the global: no cross-talk.
+	if err := os.MkdirAll(charBase(root, "小北"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := effectiveMCPCollection(root, glob, "小北"); got != "global_recall" {
+		t.Fatalf("other character: got %q, want global_recall", got)
+	}
+}
+
+// Only card.json makes a directory a real character; a dir with just a chat
+// file (legacy main/test) is an orphan that the list hides and cleanup can
+// reclaim/archive.
+func TestHasCharCardDistinguishesOrphans(t *testing.T) {
+	root := t.TempDir()
+	orphan := charBase(root, "test")
+	if err := os.MkdirAll(orphan, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Create(filepath.Join(orphan, "chat.jsonl")); err != nil {
+		t.Fatal(err)
+	}
+	if hasCharCard(orphan) {
+		t.Fatal("chat-only dir must not count as a card")
+	}
+	if err := saveCharCard(orphan, CharCard{Name: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	if !hasCharCard(orphan) {
+		t.Fatal("dir with card.json must count as a card")
+	}
+}
+
+// charBase must sanitize like the store does, or the API and the chat store
+// would address different directories for names with odd characters.
+func TestCharBaseUsesCleanSession(t *testing.T) {
+	got := charBase("/data", "../evil/../x")
+	want := filepath.Join("/data", "characters", store.CleanSession("../evil/../x"))
+	if got != want {
+		t.Fatalf("charBase = %q, want %q", got, want)
+	}
+	if strings.Contains(got, "..") {
+		t.Fatalf("charBase escaped the characters dir: %q", got)
 	}
 }

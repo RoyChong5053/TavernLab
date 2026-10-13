@@ -1507,6 +1507,7 @@ function syncChatHead() {
 
 /* ---------- characters: self-contained packages ---------- */
 let editingNew = false;
+const EMPTY_AVATAR = 'data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==';
 async function refreshChars() {
   const { characters } = await (await api('/api/characters')).json();
   const list = characters || [];
@@ -1516,9 +1517,9 @@ async function refreshChars() {
   } else {
     grid.innerHTML = list.map((c) => `
       <div class="char-card ${c.name === settings.char ? 'on' : ''}" data-name="${c.name}">
-        <img class="avatar sq" src="${imgURL(c.avatar_url) || 'data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw=='}" alt="">
+        <img class="avatar sq" src="${imgURL(c.avatar_url) || EMPTY_AVATAR}" alt="">
         <div>
-          <div class="cc-name">${c.name}</div>
+          <div class="cc-name">${c.name}${c.orphan ? ' <span class="badge">遗留·无卡</span>' : ''}</div>
           <div class="cc-desc">${(c.description || '（暂无描述，点卡片后编辑）').replace(/</g, '&lt;')}</div>
         </div>
       </div>`).join('');
@@ -1530,6 +1531,34 @@ async function refreshChars() {
   if (list.length && !list.some((c) => c.name === settings.char)) {
     selectChar(list[0].name);
   }
+  refreshOrphanHint();
+}
+// Orphan dirs (chat/media but no card, e.g. legacy main/test) are hidden from
+// the grid; surface a one-click cleanup when any exist so the WebUI is never
+// stuck listing something it cannot delete.
+async function refreshOrphanHint() {
+  const el = $('#char-orphans');
+  if (!el) return;
+  try {
+    const { orphans } = await (await api('/api/characters/cleanup')).json();
+    const n = (orphans || []).length;
+    if (!n) { el.classList.add('hidden'); el.innerHTML = ''; return; }
+    el.classList.remove('hidden');
+    el.innerHTML = '';
+    const span = document.createElement('span');
+    span.className = 'meta';
+    span.textContent = `发现 ${n} 个遗留目录（无角色卡，仅聊天）：${orphans.map((o) => o.name).join('、')}。`;
+    const b = document.createElement('button');
+    b.textContent = '归档清理';
+    b.onclick = async () => {
+      if (!(await uiConfirm(`将这 ${n} 个遗留目录移动到 data/_trash/ 归档？（不删除，可用 shell 找回）`))) return;
+      const r = await api('/api/characters/cleanup', { method: 'POST' });
+      const j = await r.json();
+      toast(`已归档 ${(j.archived || []).length} 个目录到 _trash`);
+      refreshChars();
+    };
+    el.append(span, b);
+  } catch { el.classList.add('hidden'); }
 }
 async function selectChar(name) {
   settings.char = name;
@@ -1543,24 +1572,31 @@ async function selectChar(name) {
   loadHistory();
   subscribeChat();
   loadDistill();
+  loadCharCollection();
 }
 function openEditor(name, isNew) {
   editingNew = !!isNew;
   $('#char-editor').classList.remove('hidden');
   $('#char-editor-title').textContent = isNew ? '新建角色' : '编辑角色';
+  const collEl = $('#char-collection');
   if (isNew) {
     $('#char-name').value = '';
     $('#char-desc').value = '';
-    $('#char-avatar').src = 'data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==';
+    $('#char-avatar').src = EMPTY_AVATAR;
     $('#char-expr').textContent = '';
     $('#char-name').readOnly = false;
     $('#btn-char-delete').style.display = 'none';
+    if (collEl) collEl.value = '';
   } else {
     api('/api/characters/' + encodeURIComponent(name)).then((r) => r.json()).then((j) => {
       $('#char-name').value = j.name || name;
       $('#char-desc').value = j.description || '';
-      $('#char-avatar').src = imgURL(j.avatar_url) || 'data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==';
+      $('#char-avatar').src = imgURL(j.avatar_url) || EMPTY_AVATAR;
       $('#char-expr').textContent = (j.expressions || []).length ? '表情：' + j.expressions.join(', ') : '';
+      if (collEl) {
+        collEl.value = j.mcp_collection || '';
+        collEl.placeholder = '留空=跟随全局；生效：' + (j.effective_mcp_collection || '(server default)');
+      }
     });
     $('#char-name').readOnly = true;
     $('#btn-char-delete').style.display = 'inline-block';
@@ -1571,28 +1607,49 @@ $('#btn-char-cancel').onclick = () => $('#char-editor').classList.add('hidden');
 $('#btn-char-save').onclick = async () => {
   const name = $('#char-name').value.trim();
   const desc = $('#char-desc').value;
-  if (!name) { alert('角色名不能为空'); return; }
+  if (!name) { toast('角色名不能为空', 'err'); return; }
   if (editingNew) {
     const r = await api('/api/characters', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name, description: desc }),
     });
-    if (!r.ok) { alert('创建失败：' + (await r.text())); return; }
+    if (!r.ok) {
+      const t = (await r.text()).trim();
+      if (r.status === 409) { toast('同名角色卡已存在；请打开它编辑，或换个名字', 'err'); return; }
+      toast('创建失败（' + r.status + '）：' + (t || '非法角色名？'), 'err');
+      return;
+    }
+    const j = await r.json().catch(() => ({}));
+    if (j.reclaimed) toast('已认领同名遗留目录并写入角色卡');
   } else {
     await api('/api/characters/' + encodeURIComponent(name) + '/card', {
       method: 'PUT', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ description: desc }),
     });
   }
+  // Per-character RAG binding (empty clears the override -> follow global).
+  const collEl = $('#char-collection');
+  if (collEl) {
+    await api('/api/characters/' + encodeURIComponent(name) + '/meta', {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mcp_collection: collEl.value.trim() }),
+    });
+  }
   $('#char-editor').classList.add('hidden');
   refreshChars();
-  if (!editingNew && name === settings.char) syncChatHead();
+  // A brand-new character should become the active one so the user lands on it.
+  if (editingNew) selectChar($('#char-name').value.trim());
+  else if (name === settings.char) { syncChatHead(); loadCharCollection(); }
 };
 $('#btn-char-delete').onclick = async () => {
   const name = $('#char-name').value.trim();
   if (!name) return;
-  if (!(await uiConfirm(`删除角色「${name}」？默认保留聊天数据（只删角色卡与头像）。`))) return;
-  await api('/api/characters/' + encodeURIComponent(name), { method: 'DELETE' });
+  const purge = $('#char-purge-chats') && $('#char-purge-chats').checked;
+  const msg = purge
+    ? `删除角色「${name}」并【永久删除】其聊天、蒸馏记录、归档与图片？此操作不可撤销！`
+    : `删除角色「${name}」？默认保留聊天数据（只删角色卡与头像）。`;
+  if (!(await uiConfirm(msg))) return;
+  await api('/api/characters/' + encodeURIComponent(name) + (purge ? '?chats=1' : ''), { method: 'DELETE' });
   $('#char-editor').classList.add('hidden');
   refreshChars();
 };
@@ -1600,7 +1657,7 @@ $('#char-file').onchange = async (e) => {
   const f = e.target.files[0];
   if (!f) return;
   const name = $('#char-name').value.trim();
-  if (!name) { alert('先填角色名'); e.target.value = ''; return; }
+  if (!name) { toast('先填角色名', 'err'); e.target.value = ''; return; }
   const fd = new FormData();
   fd.append('file', f);
   const r = await api('/api/characters/' + encodeURIComponent(name) + '/avatar', { method: 'PUT', body: fd });
@@ -1723,6 +1780,50 @@ $('#btn-mem-save').onclick = () => asyncAction($('#btn-mem-save'), () => saveMem
 ['mem-url', 'mem-collection', 'mem-timeout', 'mem-enabled'].forEach((id) => {
   const el = document.getElementById(id); if (el) el.addEventListener('change', () => saveMemory(true).catch((e) => toast('Failed to save memory settings: ' + e.message, 'err')));
 });
+
+/* ---------- per-character RAG binding ---------- */
+// Each character may point recall + auto-index at its own collection. The
+// binding lives in that character's meta.json, so switching characters
+// switches the library with no extra step; empty follows the global setting.
+async function loadCharCollection() {
+  const info = $('#mem-char-info');
+  const inp = $('#mem-char-collection');
+  if (!inp) return;
+  try {
+    const j = await (await api('/api/characters/' + encodeURIComponent(settings.char))).json();
+    inp.value = j.mcp_collection || '';
+    if (info) {
+      const src = j.mcp_collection ? '角色专用' : '跟随全局';
+      info.textContent = `当前角色「${settings.char}」生效 collection：${j.effective_mcp_collection || '(server default)'}（${src}）`;
+    }
+  } catch {
+    if (info) info.textContent = `当前角色「${settings.char}」`;
+  }
+}
+async function saveCharCollection(value) {
+  await api('/api/characters/' + encodeURIComponent(settings.char) + '/meta', {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ mcp_collection: value }),
+  });
+  await loadCharCollection();
+}
+const btnMemCharSave = $('#btn-mem-char-save');
+if (btnMemCharSave) btnMemCharSave.onclick = () => asyncAction(btnMemCharSave, async () => {
+  const v = $('#mem-char-collection').value.trim();
+  await saveCharCollection(v);
+  toast(v ? `已把「${settings.char}」绑定到 ${v}` : `「${settings.char}」已改为跟随全局`);
+});
+const btnMemCharClear = $('#btn-mem-char-clear');
+if (btnMemCharClear) btnMemCharClear.onclick = () => asyncAction(btnMemCharClear, async () => {
+  $('#mem-char-collection').value = '';
+  await saveCharCollection('');
+  toast(`「${settings.char}」已改为跟随全局`);
+});
+['mem-char-collection'].forEach((id) => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('change', () => saveCharCollection(el.value.trim()).catch((e) => toast('保存角色绑定失败：' + e.message, 'err')));
+});
+
 /* ---------- memory test search: card view ---------- */
 // The cards render exactly the chunks that would be injected into the prompt.
 // The body is set via textContent, so nothing is escaped, re-flowed or cut.
@@ -1798,7 +1899,7 @@ $('#btn-mem-test').onclick = async () => {
   $('#mem-test-out').textContent = 'Searching…';
   try {
     const j = await (await api('/api/memory/search', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ query: q }),
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ query: q, session: settings.char }),
     })).json();
     if (!j.ok) { $('#mem-test-out').textContent = 'Failed: ' + (j.error || 'search failed'); return; }
     renderMemoryHits(j);
@@ -1837,8 +1938,23 @@ async function loadDistill() {
     $('#dmem-prompt').placeholder = 'Distillation prompt (editable; “Restore default prompt” resets it)';
     const m = j.meta || {};
     const days = j.days || 0;
-    $('#dmem-meta').textContent = (m.runs ? `${m.runs} run${m.runs === 1 ? '' : 's'} · last ${(m.last_run || '').replace('T', ' ').replace(/\+.*$/, '')}` : 'not run yet') + (days ? ` · ${days} days of log` : '') + (m.last_vectorize ? ` · indexed ${(m.last_vectorize || '').replace('T', ' ').replace(/\+.*$/, '')}${m.last_vectorize_error ? '⚠' : ''}` : '');
-    $('#dmem-out').textContent = (j.sheet && j.sheet.trim()) ? j.sheet : '(no entries yet — reach the turn threshold or press “Distill now”)';
+    let metaTxt = (m.runs ? `${m.runs} run${m.runs === 1 ? '' : 's'} · last ${(m.last_run || '').replace('T', ' ').replace(/\+.*$/, '')}` : 'not run yet') + (days ? ` · ${days} days of log` : '') + (m.last_vectorize ? ` · indexed ${(m.last_vectorize || '').replace('T', ' ').replace(/\+.*$/, '')}${m.last_vectorize_error ? '⚠' : ''}` : '');
+    // Fresh characters accumulate user turns before the first run; say so
+    // instead of looking broken when the sheet is empty.
+    if (j.enabled && !(j.sheet && j.sheet.trim()) && (j.need_turns || 0) > 0) {
+      metaTxt += ` · 还需 ${j.need_turns} 个用户轮触发首次蒸馏`;
+    } else if (j.enabled && !(j.sheet && j.sheet.trim()) && (j.need_turns || 0) === 0 && m.runs) {
+      metaTxt += ' · 即将蒸馏';
+    }
+    $('#dmem-meta').textContent = metaTxt;
+    const outEl = $('#dmem-out');
+    if (outEl) {
+      outEl.textContent = (j.sheet && j.sheet.trim())
+        ? j.sheet
+        : ((j.enabled && (j.need_turns || 0) > 0)
+          ? `(no entries yet — 还需约 ${j.need_turns} 个用户轮才会自动蒸馏；也可按 “Distill now” 立即运行)`
+          : '(no entries yet — reach the turn threshold or press “Distill now”)');
+    }
   } catch (e) { toast('Failed to load distillation info: ' + e.message, 'err'); }
 }
 async function saveDistill(silent) {
@@ -2066,5 +2182,6 @@ async function init() {
   loadHistory();
   subscribeChat();
   loadDistill();
+  loadCharCollection();
 }
 init();

@@ -411,6 +411,8 @@ func main() {
 				"upstream": s.Upstream, "api_key_set": s.APIKey != "",
 				"api_key_hint": settings.Mask(s.APIKey), "rerank_url": s.RerankURL,
 				"mcp_url": s.MCPURL, "mcp_collection": s.MCPCollection,
+				"effective_mcp_collection": firstNonEmpty(effectiveMCPCollection(cfg.DataRoot, s, s.CurrentChar), "(server default)"),
+				"collection_source":        collectionSource(cfg.DataRoot, s, s.CurrentChar),
 				"mcp_enabled": s.MCPEnabled, "mcp_timeout": s.MCPTimeout,
 				"context_window": s.ContextWindow, "reply_reserve": s.ReplyReserve, "history_min_turns": s.HistoryMinTurns,
 				"current_char": s.CurrentChar, "user_name": s.UserName,
@@ -527,6 +529,31 @@ func main() {
 		if prompt == "" {
 			prompt = distill.DefaultPrompt
 		}
+		// Turns still needed before the next auto run (0 = ready/disabled).
+		// Lets the Memory page tell a fresh character "还需 N 轮" instead of
+		// looking broken while the threshold accumulates.
+		needTurns, freshTurns := 0, 0
+		interval := s.DistillInterval
+		if interval <= 0 {
+			interval = 8
+		}
+		if s.DistillEnabled {
+			if all, err := st.LoadAll(session); err == nil {
+				meta := distill.LoadMeta(cfg.DataRoot, session)
+				start := meta.LastIndex
+				if start < 0 || start > len(all) {
+					start = 0
+				}
+				for _, m := range all[start:] {
+					if m.Role == "user" {
+						freshTurns++
+					}
+				}
+				if freshTurns < interval {
+					needTurns = interval - freshTurns
+				}
+			}
+		}
 		writeJSON(w, map[string]any{
 			"session": session, "sheet": sheet, "meta": distill.LoadMeta(cfg.DataRoot, session),
 			"state": distill.LoadState(cfg.DataRoot, session, 0), "days": len(distill.LogDays(cfg.DataRoot, session)),
@@ -537,7 +564,15 @@ func main() {
 			"model":           s.DistillModel,
 			"prompt":          prompt, "default_prompt": distill.DefaultPrompt,
 			"vectorize_enabled":    s.DistillVectorizeEnabled,
-			"vectorize_collection": firstNonEmpty(s.DistillVectorizeCollection, s.MCPCollection, "(server default)"),
+			// Empty explicit vectorize target follows the character's recall
+			// collection (which itself may be a per-character override), so
+			// auto-indexing can never leak one character's diary into
+			// another character's library.
+			"vectorize_collection":   firstNonEmpty(s.DistillVectorizeCollection, effectiveMCPCollection(cfg.DataRoot, s, session), "(server default)"),
+			"effective_collection":   firstNonEmpty(effectiveMCPCollection(cfg.DataRoot, s, session), "(server default)"),
+			"collection_source":      collectionSource(cfg.DataRoot, s, session),
+			"need_turns":             needTurns,
+			"fresh_user_turns":       freshTurns,
 		})
 	})
 	mux.HandleFunc("/api/distilled/run", func(w http.ResponseWriter, r *http.Request) {
@@ -612,12 +647,14 @@ func main() {
 			return
 		}
 		var in struct {
-			Query string `json:"query"`
+			Query   string `json:"query"`
+			Session string `json:"session"`
 		}
 		b, _ := io.ReadAll(r.Body)
 		_ = json.Unmarshal(b, &in)
 		s := rt.get()
-		text, err := searchMCP(r.Context(), s, in.Query)
+		session := store.CleanSession(firstNonEmpty(in.Session, s.CurrentChar, "main"))
+		text, err := searchMCP(r.Context(), s, cfg.DataRoot, session, in.Query)
 		if err != nil {
 			writeJSON(w, map[string]any{"ok": false, "error": err.Error()})
 			return
@@ -630,7 +667,8 @@ func main() {
 			hits = []memoryHit{}
 		}
 		writeJSON(w, map[string]any{
-			"ok": true, "collection": firstNonEmpty(s.MCPCollection, "(server default)"),
+			"ok": true, "collection": firstNonEmpty(effectiveMCPCollection(cfg.DataRoot, s, session), "(server default)"),
+			"session": session,
 			"chars": utf8.RuneCountInString(text), "text": text, "hits": hits,
 		})
 	})
@@ -708,7 +746,7 @@ func main() {
 			}
 		}
 		blocks = renderBlocks(cfg.DataRoot, session, rt.get().UserName, blocks)
-		ragItems, memInfo := resolveMCP(r.Context(), rt.get(), turns)
+		ragItems, memInfo := resolveMCP(r.Context(), rt.get(), cfg.DataRoot, session, turns)
 		res := engine.Assemble(engine.Input{Blocks: blocks, Cfg: ctx, Turns: turns, Lists: listInputs(blocks, ragItems, cfg.DataRoot, session, rt.get().DistillRetainDays)})
 		out := map[string]any{
 			"messages": res.Messages, "blocks": res.Blocks, "total_tokens": res.TotalTok,
@@ -804,7 +842,7 @@ func main() {
 			model = defaultChatModel(s)
 		}
 		setActiveModel(fmt.Sprint(model))
-		ragItems, memInfo := resolveMCP(r.Context(), s, turns)
+		ragItems, memInfo := resolveMCP(r.Context(), s, cfg.DataRoot, session, turns)
 		res := engine.Assemble(engine.Input{Blocks: blocks, Cfg: ctx, Turns: turns, Lists: listInputs(blocks, ragItems, cfg.DataRoot, session, s.DistillRetainDays)})
 
 		// Build upstream body from assembled messages (attach fresh images).
@@ -1033,6 +1071,12 @@ func main() {
 		root := filepath.Join(cfg.DataRoot, "characters")
 		switch r.Method {
 		case "GET":
+			// Default: orphan dirs (chat-only leftovers like legacy main/test)
+			// are hidden unless ?all=1, so a real delete disappears from the
+			// UI while their chat files stay on disk until archived/purged.
+			// A card-less dir that still owns an avatar/meta (e.g. Leer乐儿
+			// before its first edit) is a real character and stays visible.
+			showAll := r.URL.Query().Get("all") == "1"
 			es, _ := os.ReadDir(root)
 			out := []map[string]any{}
 			for _, e := range es {
@@ -1040,11 +1084,25 @@ func main() {
 					continue
 				}
 				base := filepath.Join(root, e.Name())
+				card := loadCharCard(base)
+				hasCard := hasCharCard(base)
+				if isOrphanDir(base) && !showAll {
+					continue
+				}
+				// Orphan chat still counts for the cleanup affordance.
+				chatN := 0
+				if b, err := os.Stat(filepath.Join(base, "chat.jsonl")); err == nil && !b.IsDir() {
+					chatN = 1
+				}
 				out = append(out, map[string]any{
 					"name":        e.Name(),
-					"description": loadCharCard(base).Description,
+					"description": card.Description,
+					"created":     card.Created,
 					"avatar_url":  charAvatarURL(cfg.DataRoot, e.Name()),
 					"avatar_px":   charAvatarPx(base),
+					"has_card":    hasCard,
+					"has_chat":    chatN == 1,
+					"orphan":      isOrphanDir(base),
 				})
 			}
 			writeJSON(w, map[string]any{"characters": out})
@@ -1064,7 +1122,11 @@ func main() {
 				return
 			}
 			base := filepath.Join(root, name)
-			if _, err := os.Stat(base); err == nil {
+			// Reclaim: a directory may already exist from an avatar upload,
+			// a chat turn, or a legacy migration long before a card was
+			// written. Only a present card.json counts as "already exists";
+			// otherwise adopt the orphan instead of 409ing the user.
+			if hasCharCard(base) {
 				http.Error(w, "character already exists", 409)
 				return
 			}
@@ -1072,11 +1134,16 @@ func main() {
 				http.Error(w, "create failed", 500)
 				return
 			}
+			reclaimed := false
+			if es, err := os.ReadDir(base); err == nil && len(es) > 0 {
+				// Directory had content before the card landed.
+				reclaimed = true
+			}
 			if err := saveCharCard(base, CharCard{Name: name, Description: in.Description, Created: time.Now().Format(time.RFC3339)}); err != nil {
 				http.Error(w, "create failed", 500)
 				return
 			}
-			writeJSON(w, map[string]any{"ok": true, "name": name})
+			writeJSON(w, map[string]any{"ok": true, "name": name, "reclaimed": reclaimed})
 		default:
 			http.Error(w, "method not allowed", 405)
 		}
@@ -1089,31 +1156,107 @@ func main() {
 			http.Error(w, "bad name", 400)
 			return
 		}
+		// Canonicalize so the API layer and the chat store (which always
+		// goes through CleanSession) never address different directories.
+		name = store.CleanSession(name)
 		base := filepath.Join(cfg.DataRoot, "characters", name)
 		sub := ""
 		if len(parts) == 2 {
 			sub = parts[1]
 		}
+		// "cleanup" is a collection-level action, not a character name.
+		if name == "cleanup" && sub == "" {
+			if r.Method == "GET" {
+				es, _ := os.ReadDir(filepath.Join(cfg.DataRoot, "characters"))
+				orphans := []map[string]any{}
+				for _, e := range es {
+					if !e.IsDir() {
+						continue
+					}
+					b := filepath.Join(cfg.DataRoot, "characters", e.Name())
+					if !isOrphanDir(b) {
+						continue
+					}
+					chatN := 0
+					if st, err := os.Stat(filepath.Join(b, "chat.jsonl")); err == nil && !st.IsDir() {
+						chatN = 1
+					}
+					orphans = append(orphans, map[string]any{"name": e.Name(), "has_chat": chatN == 1})
+				}
+				writeJSON(w, map[string]any{"orphans": orphans})
+				return
+			}
+			if r.Method == "POST" {
+				// Archive orphan dirs under data/_trash/<ts>/ instead of
+				// deleting: recoverable via shell/rclone, gone from the UI.
+				es, _ := os.ReadDir(filepath.Join(cfg.DataRoot, "characters"))
+				moved := []string{}
+				trash := filepath.Join(cfg.DataRoot, "_trash", time.Now().Format("20060102-150405"))
+				for _, e := range es {
+					if !e.IsDir() {
+						continue
+					}
+					b := filepath.Join(cfg.DataRoot, "characters", e.Name())
+					if !isOrphanDir(b) {
+						continue
+					}
+					_ = os.MkdirAll(trash, 0o755)
+					if err := os.Rename(b, filepath.Join(trash, e.Name())); err == nil {
+						moved = append(moved, e.Name())
+						obs.Info("character orphan archived", map[string]any{"name": e.Name()})
+					}
+				}
+				writeJSON(w, map[string]any{"ok": true, "archived": moved})
+				return
+			}
+			http.Error(w, "method not allowed", 405)
+			return
+		}
 
 		switch {
 		case sub == "" && r.Method == "GET":
 			card := loadCharCard(base)
+			meta := loadCharMeta(base)
 			writeJSON(w, map[string]any{
 				"name": name, "description": card.Description, "created": card.Created,
 				"avatar_url": charAvatarURL(cfg.DataRoot, name), "avatar_px": charAvatarPx(base),
 				"expressions": listExpressions(base),
+				"mcp_collection":           meta["mcp_collection"],
+				"effective_mcp_collection": effectiveMCPCollection(cfg.DataRoot, rt.get(), name),
 			})
 		case sub == "" && r.Method == "DELETE":
 			// Default: keep chat data. ?chats=1 explicitly removes chat too.
-			if r.URL.Query().Get("chats") == "1" {
+			purge := r.URL.Query().Get("chats") == "1"
+			if purge {
 				_ = os.RemoveAll(base)
 			} else {
 				_ = os.Remove(filepath.Join(base, "card.json"))
-				for _, a := range []string{"avatar.webp", "avatar.png", "avatar.jpg", "avatar.gif", "avatar.jpeg"} {
+				for _, a := range []string{"avatar.webp", "avatar.png", "avatar.jpg", "avatar.jpeg", "avatar.gif"} {
 					_ = os.Remove(filepath.Join(base, a))
 				}
 			}
-			writeJSON(w, map[string]any{"ok": true, "chats_kept": r.URL.Query().Get("chats") != "1"})
+			// Never leave current_char pointing at a cardless/removed dir:
+			// fall back to the first remaining card so the next turn cannot
+			// write into a ghost session.
+			if rt.get().CurrentChar == name {
+				fallback := ""
+				if es, _ := os.ReadDir(filepath.Join(cfg.DataRoot, "characters")); es != nil {
+					for _, e := range es {
+						if !e.IsDir() {
+							continue
+						}
+						if hasCharCard(filepath.Join(cfg.DataRoot, "characters", e.Name())) {
+							fallback = e.Name()
+							break
+						}
+					}
+				}
+				if fallback == "" {
+					fallback = "Leer乐儿"
+				}
+				rt.update(cfg.DataRoot, map[string]any{"current_char": fallback})
+			}
+			writeJSON(w, map[string]any{"ok": true, "chats_kept": !purge})
 		case sub == "card" && r.Method == "PUT":
 			var in struct {
 				Description string `json:"description"`
@@ -1185,6 +1328,18 @@ func main() {
 			cur := loadCharMeta(base)
 			if v, ok := meta["avatar_px"].(float64); ok && v >= 24 && v <= 480 {
 				cur["avatar_px"] = int(v)
+			}
+			// Per-character RAG binding: empty/missing clears the override so
+			// the character follows the global mcp_collection again.
+			if v, ok := meta["mcp_collection"]; ok {
+				if s, ok := v.(string); ok {
+					s = strings.TrimSpace(s)
+					if s == "" {
+						delete(cur, "mcp_collection")
+					} else {
+						cur["mcp_collection"] = s
+					}
+				}
 			}
 			mb, _ := json.MarshalIndent(cur, "", "  ")
 			_ = os.WriteFile(filepath.Join(base, "meta.json"), mb, 0o644)
@@ -1615,7 +1770,7 @@ func main() {
 		turns := chatToTurns(cfg.DataRoot, session, all)
 		blocks := renderBlocks(cfg.DataRoot, session, s.UserName, loadBlocks())
 		setActiveModel(model)
-		ragItems, memInfo := resolveMCP(r.Context(), s, turns)
+		ragItems, memInfo := resolveMCP(r.Context(), s, cfg.DataRoot, session, turns)
 		res := engine.Assemble(engine.Input{Blocks: blocks, Cfg: ctxFromSettings(s), Turns: turns, Lists: listInputs(blocks, ragItems, cfg.DataRoot, session, s.DistillRetainDays)})
 		upMsgs := buildUpMessages(res.Messages, upImages)
 		mt := s.ReplyReserve
@@ -2563,7 +2718,7 @@ func mcpTimeout(s settings.Settings) time.Duration {
 	return time.Duration(seconds) * time.Second
 }
 
-func searchMCP(ctx context.Context, s settings.Settings, query string) (string, error) {
+func searchMCP(ctx context.Context, s settings.Settings, root, session, query string) (string, error) {
 	timeout := mcpTimeout(s)
 	// Detach from the request context: a mid-search client disconnect (or any
 	// parent cancel) used to abort search_memory and leave the turn with no
@@ -2573,32 +2728,66 @@ func searchMCP(ctx context.Context, s settings.Settings, query string) (string, 
 	searchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
 	defer cancel()
 	text, err := mcp.NewWithTimeout(firstNonEmpty(s.MCPURL, "http://192.168.10.2:8199"), timeout).
-		Search(searchCtx, query, s.MCPCollection)
+		Search(searchCtx, query, effectiveMCPCollection(root, s, session))
 	if err != nil && errors.Is(err, context.DeadlineExceeded) {
 		return "", fmt.Errorf("mcp search timeout (%s): %w", timeout, err)
 	}
 	return text, err
 }
 
+// effectiveMCPCollection resolves the recall collection for one character:
+// the character's meta.json override wins, then the global setting, then ""
+// (rag-mcp-server default). Switching characters therefore switches recall
+// with no extra client action; an empty override follows the global again.
+func effectiveMCPCollection(root string, s settings.Settings, session string) string {
+	session = store.CleanSession(session)
+	if session != "" {
+		if m := loadCharMeta(filepath.Join(root, "characters", session)); m != nil {
+			if v, ok := m["mcp_collection"].(string); ok && strings.TrimSpace(v) != "" {
+				return strings.TrimSpace(v)
+			}
+		}
+	}
+	return s.MCPCollection
+}
+
+// collectionSource reports where a character's recall collection came from
+// for the Memory UI ("character" override vs "global" vs server default).
+func collectionSource(root string, s settings.Settings, session string) string {
+	session = store.CleanSession(session)
+	if session != "" {
+		if m := loadCharMeta(filepath.Join(root, "characters", session)); m != nil {
+			if v, ok := m["mcp_collection"].(string); ok && strings.TrimSpace(v) != "" {
+				return "character"
+			}
+		}
+	}
+	if strings.TrimSpace(s.MCPCollection) != "" {
+		return "global"
+	}
+	return "server-default"
+}
 // resolveMCP searches rag-mcp-server with the latest user utterance and
 // returns the response as one engine item, byte for byte. Retrieval knobs
 // (top-k, threshold, chunk size) belong to the server; TavernLab only owns
 // how long it waits. Fail-open: errors are recorded and the chat continues.
 // The engine then decides what still fits under budget pressure.
-func resolveMCP(ctx context.Context, s settings.Settings, chat []engine.Message) ([]engine.Item, map[string]any) {
+func resolveMCP(ctx context.Context, s settings.Settings, root, session string, chat []engine.Message) ([]engine.Item, map[string]any) {
 	info := map[string]any{"enabled": false}
 	if !s.MCPEnabled {
 		return nil, info
 	}
 	info["enabled"] = true
-	info["collection"] = firstNonEmpty(s.MCPCollection, "(server default)")
+	col := effectiveMCPCollection(root, s, session)
+	info["collection"] = firstNonEmpty(col, "(server default)")
+	info["session"] = store.CleanSession(session)
 	query := lastUserText(chat)
 	info["query"] = query
 	if query == "" {
 		info["chars"] = 0
 		return nil, info
 	}
-	text, err := searchMCP(ctx, s, query)
+	text, err := searchMCP(ctx, s, root, session, query)
 	if err != nil {
 		info["error"] = err.Error()
 		info["chars"] = 0
@@ -3023,7 +3212,10 @@ func autoVectorize(root string, s settings.Settings, session, path string) {
 	timeout := mcpTimeout(s)
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(context.Background()), timeout)
 	defer cancel()
-	col := firstNonEmpty(s.DistillVectorizeCollection, s.MCPCollection)
+	// Follow the character's recall collection (per-character override wins):
+	// an explicit distill target still wins overall, but the default is the
+	// same library the character reads, never another character's.
+	col := firstNonEmpty(s.DistillVectorizeCollection, effectiveMCPCollection(root, s, session))
 	_, err = mcp.NewWithTimeout(firstNonEmpty(s.MCPURL, "http://192.168.10.2:8199"), timeout).
 		Store(ctx, string(b), col, map[string]string{"type": "distill-auto", "session": session})
 	if err != nil {

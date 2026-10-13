@@ -172,6 +172,7 @@ body[data-theme="st-dark"] .msg.user{background:rgba(125,211,252,.06)}
 .char-card.on{border-color:var(--acc);background:rgba(125,211,252,.12)}
 .char-card .avatar{width:88px;height:88px}
 .char-card .cc-name{font-weight:600}
+.char-card .badge{font-size:10px;font-weight:500;color:#ffd08a;border:1px solid rgba(255,208,138,.4);border-radius:8px;padding:0 6px;margin-left:6px;vertical-align:middle}
 .char-card .cc-desc{color:var(--mut);font-size:12px;max-height:52px;overflow:hidden;white-space:pre-wrap}
 .char-editor{display:flex;flex-direction:column;gap:10px;padding:14px}
 .char-editor.hidden{display:none}

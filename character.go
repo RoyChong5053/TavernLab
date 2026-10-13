@@ -12,6 +12,7 @@ import (
 	"github.com/RoyChong5053/TavernLab/internal/distill"
 	"github.com/RoyChong5053/TavernLab/internal/engine"
 	"github.com/RoyChong5053/TavernLab/internal/settings"
+	"github.com/RoyChong5053/TavernLab/internal/store"
 )
 
 // CharCard is the character description ("角色卡"). No SillyTavern macro
@@ -24,7 +25,44 @@ type CharCard struct {
 }
 
 func charBase(root, name string) string {
-	return filepath.Join(root, "characters", name)
+	// All character paths go through CleanSession so the API layer and the
+	// chat store never disagree on names with spaces/separators.
+	return filepath.Join(root, "characters", store.CleanSession(name))
+}
+
+// hasCharCard reports whether a character directory holds a real card.
+func hasCharCard(base string) bool {
+	if _, err := os.Stat(filepath.Join(base, "card.json")); err != nil {
+		return false
+	}
+	return true
+}
+
+// isOrphanDir reports a directory that is only a leftover chat session (the
+// legacy main/test cases): no card, no avatar, no meta, no distilled record,
+// no archive/media/expressions. A real character may legitimately lack
+// card.json (e.g. Leer乐儿 before its first edit) but still owns an avatar or
+// meta, so "no card" alone must not mark it an orphan.
+func isOrphanDir(base string) bool {
+	if hasCharCard(base) {
+		return false
+	}
+	for _, f := range []string{"meta.json", "distilled.md", "distilled.meta.json"} {
+		if _, err := os.Stat(filepath.Join(base, f)); err == nil {
+			return false
+		}
+	}
+	for _, d := range []string{"archive", "media", "expressions"} {
+		if st, err := os.Stat(filepath.Join(base, d)); err == nil && st.IsDir() {
+			return false
+		}
+	}
+	for _, a := range []string{"avatar.webp", "avatar.png", "avatar.jpg", "avatar.jpeg", "avatar.gif"} {
+		if _, err := os.Stat(filepath.Join(base, a)); err == nil {
+			return false
+		}
+	}
+	return true
 }
 
 // loadCharCard reads card.json (empty card when absent).
