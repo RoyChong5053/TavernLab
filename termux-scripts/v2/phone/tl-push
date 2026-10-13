@@ -1,0 +1,38 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# tl-push — 手机侧被动通知器（无循环，只被 m64 ssh 调用）
+#
+#   echo "正文" | tl-push '<id>' '<标题>'
+#
+# 干三件事：flock去重 → 超时包装弹通知 → 记 last.json 给 receiver 面板看。
+# 点跳复用 ~/bin/open-app.sh（v1 留下的，不动它）。
+set -uo pipefail
+export PATH="$HOME/bin:$PREFIX/bin:$PATH"
+
+D="$PREFIX/var/lib/tl-push"
+mkdir -p "$D"
+CH="${TL_PUSH_CHANNEL:-tavernlab-reply}"
+T_NOTIF="${TL_PUSH_T_NOTIF:-8}"
+
+id="${1:-}"; title="${2:-TavernLab}"
+body="$(cat)"   # m64 经 stdin 传正文，避免引号转义
+[ -n "$id" ] && [ -n "$body" ] || exit 0
+
+exec 8>"$D/deliver.lock"
+flock -w 3 8 || exit 0
+[ "$id" = "$(cat "$D/last_id" 2>/dev/null)" ] && { flock -u 8; exit 0; }
+echo "$id" >"$D/last_id"
+flock -u 8
+
+short=$(tr -s '[:space:]' ' ' <<<"$body" | cut -c1-140)
+extra=()
+[ -x "$HOME/bin/open-app.sh" ] && extra=(--action "$HOME/bin/open-app.sh")
+timeout "$T_NOTIF" termux-notification -i "$id" -t "$title" -c "$short" \
+  --channel "$CH" --priority high --sound --vibrate 400,150,400 \
+  "${extra[@]}" >/dev/null 2>&1
+
+# 给 tl-receiver.py 面板看的状态
+jq -n --arg id "$id" --arg t "$(date '+%F %T')" --arg h "${short:0:60}" \
+  '{id:$id, at:$t, head:$h}' >"$D/last.json" 2>/dev/null
+n=$(($(cat "$D/count" 2>/dev/null || echo 0) + 1))
+echo "$n" >"$D/count"
+exit 0

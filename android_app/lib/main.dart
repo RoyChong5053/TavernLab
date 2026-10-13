@@ -132,22 +132,62 @@ List<types.Message> messages = [];
 // Own the chat list's scroll position so a server sync can re-pin it to the
 // newest message (offset 0 on a reversed list) instead of leaving the viewport
 // wherever flutter_chat_ui's list diff happened to move it.
+//
+// Rule (locked): once the user's finger has touched the list, the app never
+// moves the viewport on its own. New messages land silently + an unread pill.
+// The pin decision is always made at apply time (when the fetch completes),
+// never at request time, so a touch mid-flight cancels the open-time pin.
 final AutoScrollController chatScrollController = AutoScrollController();
 
+/// Set as soon as the user drags/scrolls the chat list by hand. Cleared only
+/// on open (init/resumed), on tapping the unread pill, or on sending.
+bool userTouched = false;
+
+/// Count of new assistant messages that landed while [userTouched] was true.
+int unreadCount = 0;
+
+/// True while we move the list ourselves, so the scroll listener can tell a
+/// programmatic jumpTo apart from a human drag.
+bool programmaticScroll = false;
+
 /// Keep the chat list on the newest message after a rebuild. Only pins when the
-/// user is already near the bottom, so scrolling up to read history is never
-/// yanked away; [force] is for the first load after opening.
+/// user has not touched the list and is already near the bottom, so scrolling
+/// up to read history is never yanked away; [force] is for the open-time sync
+/// (still cancelled if the finger got there first).
 void pinChatToBottom({bool force = false}) {
   WidgetsBinding.instance.addPostFrameCallback((_) {
     try {
       if (!chatScrollController.hasClients) return;
-      if (!force && chatScrollController.position.pixels > 80) return;
+      if (userTouched) return;
+      if (!force && chatScrollController.position.pixels > 200) return;
+      programmaticScroll = true;
       chatScrollController.jumpTo(0);
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        programmaticScroll = false;
+      });
     } catch (_) {
       // The Chat widget disposes its scroll controller when it unmounts; a
       // sync that races that teardown is harmless, just skip the re-pin.
+      programmaticScroll = false;
     }
   });
+}
+
+/// Called from the scroll listener when a human drag is detected.
+void markUserTouched() {
+  if (programmaticScroll) return;
+  if (!userTouched) {
+    userTouched = true;
+    pokeUI();
+  }
+}
+
+/// Pill tap / own send: follow the tail again.
+void clearUserTouchAndPin() {
+  userTouched = false;
+  unreadCount = 0;
+  pokeUI();
+  pinChatToBottom(force: true);
 }
 
 String? chatUuid;
@@ -200,6 +240,9 @@ bool suppressChimeOnce = false;
 // Poller state.
 Timer? pollTimer;
 bool pollInFlight = false;
+/// Per-sync flag: did this sync observe a new assistant message? Set inside
+/// syncFromServer before lastSeenAssistantId advances; read at apply time.
+bool _syncSawNewAssistant = false;
 String? lastProbeFp; // "total:id,id" of the limit=1 probe
 String? lastSeenAssistantId;
 
@@ -1174,8 +1217,18 @@ class _HeaderStatusTextState extends State<HeaderStatusText> {
   }
 }
 
-Future<void> syncFromServer({bool silent = false}) async {
+Future<void> syncFromServer({bool silent = false, bool forcePin = false}) async {
+  // Snapshot scroll offset before the rebuild so we can hold it when the user
+  // is reading history (prevents passive drift on wholesale replace).
+  double? prevPixels;
+  double? prevMax;
   try {
+    if (chatScrollController.hasClients) {
+      try {
+        prevPixels = chatScrollController.position.pixels;
+        prevMax = chatScrollController.position.maxScrollExtent;
+      } catch (_) {}
+    }
     if (!silent) {
       // Adopt the server's current character so web and app share the floor.
       try {
@@ -1235,8 +1288,10 @@ Future<void> syncFromServer({bool silent = false}) async {
     sendEpoch++; // invalidate any zombie stream still patching the old list
     offlineMode = false;
     final firstLoad = lastSeenAssistantId == null;
-    if (newestAssistantId != null &&
-        newestAssistantId != lastSeenAssistantId) {
+    _syncSawNewAssistant = newestAssistantId != null &&
+        newestAssistantId != lastSeenAssistantId;
+    if (_syncSawNewAssistant) {
+      final String seenId = newestAssistantId ?? "";
       lastSeenAssistantId = newestAssistantId;
       if (!firstLoad) {
         if (suppressChimeOnce) {
@@ -1246,13 +1301,55 @@ Future<void> syncFromServer({bool silent = false}) async {
         }
       }
       if (awaitingReply) setAwaitingReply(false);
-      unawaited(classifyMood(newestAssistantId, newestAssistantText));
+      if (seenId.isNotEmpty) {
+        unawaited(classifyMood(seenId, newestAssistantText));
+      }
     } else {
       pokeUI();
     }
-    // Re-pin after the list rebuild: on open always jump to the newest, and
-    // afterwards only when the user had not scrolled up to read history.
-    pinChatToBottom(force: firstLoad);
+    // Pin decision at apply time: a touch mid-flight cancels the open pin.
+    // firstLoad keeps the old "open lands on newest" behaviour, but only when
+    // the finger has not got there first.
+    final bool isFirstLoad = firstLoad;
+    final bool arrivedWhileTouched = userTouched;
+    final bool isNewAssistant = _syncSawNewAssistant;
+    if (arrivedWhileTouched && _syncSawNewAssistant) {
+      unreadCount++;
+      pokeUI();
+    }
+    if (!arrivedWhileTouched && !isNewAssistant) {
+      // No new content and user untouched: still hold offset against passive
+      // drift from image/markdown reflow (restore pre-sync pixels).
+      if (prevPixels != null && chatScrollController.hasClients) {
+        final double curMax = (() {
+          try {
+            return chatScrollController.position.maxScrollExtent;
+          } catch (_) {
+            return prevMax ?? prevPixels!;
+          }
+        })();
+        double target = prevPixels!;
+        if (curMax < target) target = curMax;
+        if ((chatScrollController.position.pixels - target).abs() > 2) {
+          programmaticScroll = true;
+          try {
+            chatScrollController.jumpTo(target);
+          } catch (_) {}
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            programmaticScroll = false;
+          });
+        }
+      }
+    }
+    // Re-pin after the list rebuild: on open (forcePin/firstLoad) jump to the
+    // newest, but only when untouched; afterwards only when near the bottom.
+    // A touch that landed mid-flight cancels even the forced pin.
+    if (!arrivedWhileTouched && (forcePin || isFirstLoad)) {
+      unreadCount = 0;
+      pinChatToBottom(force: true);
+    } else {
+      pinChatToBottom();
+    }
     if (!silent) HapticFeedback.lightImpact();
   } catch (e) {
     offlineMode = true;
@@ -1547,6 +1644,7 @@ class _MainAppState extends State<MainApp> with WidgetsBindingObserver {
     };
     unawaited(initNotif());
     startOutboxDriver();
+    chatScrollController.addListener(_chatScrollListener);
     startPolling();
 
     WidgetsBinding.instance.addPostFrameCallback(
@@ -1656,7 +1754,11 @@ class _MainAppState extends State<MainApp> with WidgetsBindingObserver {
           // Anything left in the queue from a previous run goes out now.
           await Outbox.instance.load(prefs!);
           pokeUI();
-          syncFromServer();
+          // Open: clear the touch lock so the first sync may land on newest.
+          // If the finger touches mid-flight, the apply-time check cancels it.
+          userTouched = false;
+          unreadCount = 0;
+          syncFromServer(forcePin: true);
           startEvents();
           if (Outbox.instance.hasWork) {
             unawaited(Outbox.instance.flush(prefs!));
@@ -1683,7 +1785,12 @@ class _MainAppState extends State<MainApp> with WidgetsBindingObserver {
     if (resumed) {
       // Reopening the app instantly reconciles with server truth; the poller
       // keeps going every 5s until any awaited reply lands. No timeout UI.
-      syncFromServer(silent: true);
+      // Reset the touch lock on open; a mid-flight touch still cancels the pin
+      // at apply time.
+      userTouched = false;
+      unreadCount = 0;
+      pokeUI();
+      syncFromServer(silent: true, forcePin: true);
       startEvents();
       startPolling();
       if (prefs != null && Outbox.instance.hasWork) {
@@ -1695,9 +1802,45 @@ class _MainAppState extends State<MainApp> with WidgetsBindingObserver {
     }
   }
 
+  /// Human-scroll latch (no tree changes needed): programmatic jumpTo sets
+  /// [programmaticScroll], so only real drags set [userTouched]. Sliding back
+  /// to the newest (<=20px) auto-follows again and clears the unread pill.
+  void _chatScrollListener() {
+    if (programmaticScroll) return;
+    if (!chatScrollController.hasClients) return;
+    double px;
+    try {
+      px = chatScrollController.position.pixels;
+    } catch (_) {
+      return;
+    }
+    // A user-driven scroll event leaves pixels away from where a programmatic
+    // pin would put it; but the listener also fires on content-size changes.
+    // Only latch when the user is actually dragging (userScrollDirection set)
+    // or when clearly away from bottom after movement.
+    if (userTouched) {
+      if (px <= 20) {
+        userTouched = false;
+        unreadCount = 0;
+        pokeUI();
+      }
+      return;
+    }
+    // Not touched yet: latch on any meaningful manual offset. Programmatic
+    // pins always target 0, so anything clearly past the pin threshold that
+    // was not programmatic came from a finger.
+    if (px > 200) {
+      userTouched = true;
+      pokeUI();
+    }
+  }
+
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    try {
+      chatScrollController.removeListener(_chatScrollListener);
+    } catch (_) {}
     stopPolling();
     try {
       eventSub?.cancel();
@@ -1708,8 +1851,25 @@ class _MainAppState extends State<MainApp> with WidgetsBindingObserver {
 
   @override
   Widget build(BuildContext context) {
+    // Unread pill state is global (userTouched/unreadCount); the FAB reads
+    // it on every pokeUI rebuild. Tapping follows the tail again.
+    final Widget? unreadFab = unreadCount > 0
+        ? FloatingActionButton.extended(
+            heroTag: "unreadFab",
+            onPressed: () {
+              HapticFeedback.selectionClick();
+              clearUserTouchAndPin();
+            },
+            icon: const Icon(Icons.arrow_downward_rounded, size: 18),
+            label: Text("$unreadCount 条新消息",
+                style: const TextStyle(fontWeight: FontWeight.w600)),
+          )
+        : null;
     return Scaffold(
           extendBodyBehindAppBar: true,
+          floatingActionButton: unreadFab,
+          floatingActionButtonLocation:
+              FloatingActionButtonLocation.centerFloat,
           appBar: AppBar(
               backgroundColor: Colors.transparent,
               elevation: 0,
@@ -2005,10 +2165,18 @@ class _MainAppState extends State<MainApp> with WidgetsBindingObserver {
                                 ),
                                 imageBuilder: (uri, title, alt) {
                                   if (uri.isAbsolute) {
-                                    return Image.network(uri.toString(),
-                                        headers: serverHeaders(),
-                                        errorBuilder:
-                                            (context, error, stackTrace) {
+                                    // Fixed height: async decode must not push
+                                    // the reversed list while reading history.
+                                    return SizedBox(
+                                      height: 180,
+                                      width: double.infinity,
+                                      child: ClipRRect(
+                                        borderRadius: BorderRadius.circular(8),
+                                        child: Image.network(uri.toString(),
+                                            headers: serverHeaders(),
+                                            fit: BoxFit.cover,
+                                            errorBuilder:
+                                                (context, error, stackTrace) {
                                       return InkWell(
                                           onTap: () {
                                             HapticFeedback.selectionClick();
@@ -2036,8 +2204,8 @@ class _MainAppState extends State<MainApp> with WidgetsBindingObserver {
                                               child: const Image(
                                                   image: AssetImage(
                                                       "assets/logo512error.png"))));
-                                    });
-                                  } else {
+                                    })));
+                                    } else {
                                     return InkWell(
                                         onTap: () {
                                           HapticFeedback.selectionClick();
@@ -2386,8 +2554,11 @@ class _MainAppState extends State<MainApp> with WidgetsBindingObserver {
                           pendingImages.clear();
                         });
                         // Render the turn straight away; the queue owns its
-                        // lifecycle from here.
+                        // lifecycle from here. Own send always follows tail.
                         renderOutboxTurn(id, text, imgs);
+                        userTouched = false;
+                        unreadCount = 0;
+                        pinChatToBottom(force: true);
                         setAwaitingReply(true);
                         unawaited(Outbox.instance.flush(prefs!));
                       },
