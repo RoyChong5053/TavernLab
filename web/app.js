@@ -1723,6 +1723,76 @@ $('#btn-mem-save').onclick = () => asyncAction($('#btn-mem-save'), () => saveMem
 ['mem-url', 'mem-collection', 'mem-timeout', 'mem-enabled'].forEach((id) => {
   const el = document.getElementById(id); if (el) el.addEventListener('change', () => saveMemory(true).catch((e) => toast('Failed to save memory settings: ' + e.message, 'err')));
 });
+/* ---------- memory test search: card view ---------- */
+// The cards render exactly the chunks that would be injected into the prompt.
+// The body is set via textContent, so nothing is escaped, re-flowed or cut.
+function memoryHitCard(h) {
+  const card = document.createElement('div');
+  card.className = 'mem-hit';
+
+  const head = document.createElement('div');
+  head.className = 'mem-hit-head';
+
+  const score = document.createElement('span');
+  score.className = 'mem-score';
+  score.textContent = Number(h.score || 0).toFixed(3);
+  head.appendChild(score);
+
+  if (h.source) {
+    const src = document.createElement('span');
+    src.className = 'mem-src';
+    src.textContent = h.source;
+    head.appendChild(src);
+  }
+  if (h.collection) {
+    const col = document.createElement('span');
+    col.className = 'mem-col';
+    col.textContent = h.backend ? h.collection + ' [' + h.backend + ']' : h.collection;
+    head.appendChild(col);
+  }
+  if (h.tags && h.tags.length) {
+    const tags = document.createElement('span');
+    tags.className = 'mem-tags';
+    tags.textContent = h.tags.join(', ');
+    head.appendChild(tags);
+  }
+  card.appendChild(head);
+
+  const ids = [h.id && 'id ' + h.id, h.hash && 'hash ' + h.hash].filter(Boolean).join(' · ');
+  if (ids) {
+    const idEl = document.createElement('div');
+    idEl.className = 'mem-ids';
+    idEl.textContent = ids;
+    card.appendChild(idEl);
+  }
+
+  const body = document.createElement('div');
+  body.className = 'mem-hit-body';
+  body.textContent = h.text || '';
+  card.appendChild(body);
+  return card;
+}
+
+function renderMemoryHits(j) {
+  const out = $('#mem-test-out');
+  out.textContent = '';
+  const hits = Array.isArray(j.hits) ? j.hits : [];
+
+  const meta = document.createElement('div');
+  meta.className = 'mem-hits-meta meta';
+  meta.textContent = (j.chars || 0) + ' chars · ' + hits.length + ' hit(s) · ' + (j.collection || '(server default)');
+  out.appendChild(meta);
+
+  if (!hits.length) {
+    const raw = document.createElement('pre');
+    raw.className = 'mem-raw';
+    raw.textContent = j.text || '(no results)';
+    out.appendChild(raw);
+    return;
+  }
+  for (const h of hits) out.appendChild(memoryHitCard(h));
+}
+
 $('#btn-mem-test').onclick = async () => {
   const q = $('#mem-test-q').value.trim() || 'test';
   $('#mem-test-out').textContent = 'Searching…';
@@ -1730,7 +1800,8 @@ $('#btn-mem-test').onclick = async () => {
     const j = await (await api('/api/memory/search', {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ query: q }),
     })).json();
-    $('#mem-test-out').textContent = JSON.stringify(j, null, 2).slice(0, 4000);
+    if (!j.ok) { $('#mem-test-out').textContent = 'Failed: ' + (j.error || 'search failed'); return; }
+    renderMemoryHits(j);
   } catch (e) { $('#mem-test-out').textContent = 'Failed: ' + e; }
 };
 async function saveNtfy(silent) {

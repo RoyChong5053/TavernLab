@@ -622,9 +622,16 @@ func main() {
 			writeJSON(w, map[string]any{"ok": false, "error": err.Error()})
 			return
 		}
+		// hits is a parsed view of the same text that gets injected, for the
+		// card UI; text stays available so the page can fall back to the raw
+		// payload when the format is not recognised.
+		hits := parseMemoryHits(text)
+		if hits == nil {
+			hits = []memoryHit{}
+		}
 		writeJSON(w, map[string]any{
 			"ok": true, "collection": firstNonEmpty(s.MCPCollection, "(server default)"),
-			"chars": utf8.RuneCountInString(text), "text": text,
+			"chars": utf8.RuneCountInString(text), "text": text, "hits": hits,
 		})
 	})
 

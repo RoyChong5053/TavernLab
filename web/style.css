@@ -74,6 +74,20 @@ button.primary{background:var(--acc);color:#06222e;border:none;font-weight:700}
 .coll-meta{font-size:11px;color:var(--mut)}
 .coll-item input[type=checkbox]{width:auto;height:18px;padding:0;margin:0;background:transparent;border:none;accent-color:var(--acc);align-self:flex-start}
 body[data-theme="paper"] .coll-item{background:rgba(255,255,255,.6)}
+/* memory test-search cards: one card per recalled chunk so a human can audit
+   them one by one — score/source/collection header, raw body below. The body
+   is the verbatim chunk text, wrapped but never trimmed. */
+.mem-hits{display:flex;flex-direction:column;gap:8px;width:100%;max-height:520px;overflow:auto}
+.mem-hits-meta{position:sticky;top:0;z-index:1;background:var(--bg);padding:2px 0}
+.mem-hit{display:flex;flex-direction:column;gap:6px;padding:10px 12px;border:1px solid var(--line);border-left:3px solid var(--acc);border-radius:10px;background:var(--card)}
+.mem-hit-head{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap}
+.mem-score{font-weight:700;color:var(--acc);font-variant-numeric:tabular-nums}
+.mem-src{font-size:12px;word-break:break-all;opacity:.9}
+.mem-col{font-size:11px;color:var(--mut);border:1px solid var(--line);border-radius:999px;padding:1px 8px}
+.mem-tags{font-size:11px;color:var(--mut)}
+.mem-ids{font-size:11px;color:var(--mut);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;word-break:break-all}
+.mem-hit-body{white-space:pre-wrap;word-break:break-word;font-size:13px;line-height:1.5}
+.mem-raw{white-space:pre-wrap;word-break:break-word;margin:0;font-size:13px}
 /* chat */
 .page.on{width:100%}
 #page-chat{max-width:none}
