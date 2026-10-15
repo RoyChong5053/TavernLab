@@ -197,6 +197,7 @@ void main() {
   group('OutboxItem', () {
     OutboxItem fresh() => OutboxItem(
           id: 'turn-1',
+          session: 'A',
           text: 'hi',
           images: const [],
           createdAt: DateTime.now(),
@@ -237,13 +238,14 @@ void main() {
 
     test('an image-only turn is recognised', () {
       final it = OutboxItem(
-          id: 'x', text: '   ', images: const ['/tmp/a.jpg'], createdAt: DateTime.now());
+          id: 'x', session: 'A', text: '   ', images: const ['/tmp/a.jpg'], createdAt: DateTime.now());
       expect(it.isImageOnly, isTrue);
     });
 
     test('survives a JSON round trip', () {
       final it = OutboxItem(
         id: 'turn-9',
+        session: 'A',
         text: 'hello',
         images: const ['/tmp/a.jpg'],
         createdAt: DateTime.now(),

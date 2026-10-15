@@ -33,9 +33,13 @@ const int kOutboxMax = 30;
 enum OutboxState { queued, sending, failed }
 
 /// One pending user turn. [id] doubles as the server-side idempotency key.
+/// [session] pins the turn to a character package, so a turn for A keeps
+/// generating on the server while the phone is viewing B (previously every
+/// turn landed on CurrentChar and the two histories cross-contaminated).
 class OutboxItem {
   OutboxItem({
     required this.id,
+    required this.session,
     required this.text,
     required this.images,
     required this.createdAt,
@@ -46,6 +50,8 @@ class OutboxItem {
   });
 
   final String id;
+  // Mutable only for the one-time backfill of pre-session queue entries.
+  String session;
   final String text;
   /// Absolute paths into the outbox media dir, not data URLs: a 300KB base64
   /// string per pending turn in SharedPreferences is how you stall the main
@@ -74,6 +80,7 @@ class OutboxItem {
 
   Map<String, dynamic> toJson() => {
         'id': id,
+        'session': session,
         'text': text,
         'images': images,
         'created_at': createdAt.toIso8601String(),
@@ -88,6 +95,9 @@ class OutboxItem {
     if (id.isEmpty) return null;
     return OutboxItem(
       id: id,
+      // Pre-session queue entries have no character tag; they belong to the
+      // character that was current when the app restarts.
+      session: (j['session'] ?? '').toString(),
       text: (j['text'] ?? '').toString(),
       images: ((j['images'] as List?) ?? const []).map((e) => e.toString()).toList(),
       createdAt:
@@ -291,6 +301,7 @@ class Outbox {
   Future<OutboxItem> enqueue(
     SharedPreferences prefs, {
     required String id,
+    required String session,
     required String text,
     required List<String> imageDataUrls,
   }) async {
@@ -301,6 +312,7 @@ class Outbox {
     }
     final item = OutboxItem(
       id: id,
+      session: session,
       text: text,
       images: paths,
       createdAt: DateTime.now(),
@@ -354,6 +366,16 @@ class Outbox {
   }
 
   bool get hasWork => items.any((e) => e.state != OutboxState.failed);
+
+  /// Entries of one character that still need sending (failed excluded).
+  List<OutboxItem> itemsFor(String session) =>
+      items.where((e) => e.session == session).toList();
+
+  bool hasWorkFor(String session) =>
+      items.any((e) => e.session == session && e.state != OutboxState.failed);
+
+  /// True while any entry is mid-flight (used to avoid overlapping flushes).
+  bool get isSending => items.any((e) => e.state == OutboxState.sending);
 
   /// Try every entry that is due. Runs one entry at a time: a turn must not
   /// overtake an earlier one, or the chat order in the server JSONL is wrong.

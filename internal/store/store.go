@@ -496,6 +496,27 @@ func (s *Store) Tail(session string, limit, before int) (msgs []ChatMessage, tot
 	return all[start:end], total, nil
 }
 
+// TailAfter returns rows appended after the row with afterID (exclusive),
+// plus the total count. ok=false means afterID was not found (deleted,
+// archived, or unknown client state) and the caller should fall back to a
+// full Tail. An empty afterID returns all rows with ok=true.
+func (s *Store) TailAfter(session, afterID string) (msgs []ChatMessage, total int, ok bool, err error) {
+	all, err := s.LoadAll(session)
+	if err != nil {
+		return nil, 0, false, err
+	}
+	total = len(all)
+	if afterID == "" {
+		return all, total, true, nil
+	}
+	for i, m := range all {
+		if m.ID == afterID {
+			return all[i+1:], total, true, nil
+		}
+	}
+	return nil, total, false, nil
+}
+
 // Archive seals the current chat ("new chat" in ST terms): moves
 // <角色>/chat.jsonl to <角色>/archive/<ts>.jsonl and starts fresh.
 // Returns the archive filename ("" when there was nothing to archive).

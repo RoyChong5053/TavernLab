@@ -243,8 +243,43 @@ bool pollInFlight = false;
 /// Per-sync flag: did this sync observe a new assistant message? Set inside
 /// syncFromServer before lastSeenAssistantId advances; read at apply time.
 bool _syncSawNewAssistant = false;
-String? lastProbeFp; // "total:id,id" of the limit=1 probe
-String? lastSeenAssistantId;
+String? lastProbeFp; // "total:id,id" of the limit=1 probe (current view)
+String? lastSeenAssistantId; // newest assistant id (current view)
+
+// ---- Per-character session state (multi-queue isolation + cache) ----
+//
+// Bug history: every queue/stream/sync flag was global, so sending with A and
+// switching to B painted A's bubbles into B's list, and pressing Sync during
+// a stream hit `liveStreamMsgId != null → return` (looked like a crash), then
+// retried full `limit=0` downloads until the 15s timeout fired forever.
+// Each character now owns its queue slice, stream, probe fingerprint and
+// cached history; `messages/lastProbeFp/lastSeenAssistantId` stay as the
+// current view so the UI code below is untouched.
+
+/// Newest-first message lists for background characters (current view lives
+/// in `messages`). Switching characters stashes/loads here, so a revisit
+/// shows cache instantly and only pulls the delta.
+final Map<String, List<types.Message>> msgCache = {};
+/// Per-character limit=1 probe fingerprints and newest-assistant ids.
+final Map<String, String?> probeFpByChar = {};
+final Map<String, String?> seenAidByChar = {};
+/// Newest server row id per character (drives `after_id` incremental sync).
+final Map<String, String?> newestServerIdByChar = {};
+/// Sessions with a turn still awaiting its server reply (background-aware
+/// version of `awaitingReply`, which only tracks the visible character).
+final Set<String> awaitingChars = {};
+/// Live assistant-stream bubble per session (`live-<turnId>`). The global
+/// `liveStreamMsgId` below mirrors the visible session for the UI.
+final Map<String, String> liveMsgBySession = {};
+/// Epoch per session: a sync of session S only invalidates streams of S, so
+/// syncing B never kills A's in-flight reply (the old global sendEpoch did).
+final Map<String, int> epochBySession = {};
+/// Session that owns the visible `liveStreamMsgId` (null when none).
+String? liveStreamSession;
+/// In-flight sync sequence per session; a newer sync for the same session
+/// makes an older one's result stale (prevents a slow A-response from
+/// overwriting B's list after a switch).
+final Map<String, int> syncSeqByChar = {};
 
 // Local notifications (Android only, no Google/FCM involved).
 final FlutterLocalNotificationsPlugin notifPlugin =
@@ -254,18 +289,36 @@ const String notifChannelId = "tavernlab_reply";
 
 String headerStatus(int frame) {
   if (offlineMode) return "离线 · 重试中";
-  if (!chatAllowed || awaitingReply) {
+  if (!chatAllowed ||
+      awaitingReply ||
+      awaitingChars.contains(currentChar)) {
     return pendingFrames[frame % pendingFrames.length];
   }
   return moodText;
 }
 
 void setAwaitingReply(bool v) {
+  if (v) {
+    awaitingChars.add(currentChar);
+  } else {
+    awaitingChars.remove(currentChar);
+  }
   if (awaitingReply == v) {
     pokeUI();
     return;
   }
   awaitingReply = v;
+  pokeUI();
+}
+
+/// Background-session variant: never touches the visible `awaitingReply`
+/// flag, only the per-character set the header reads.
+void setAwaitingFor(String session, bool v) {
+  if (v) {
+    awaitingChars.add(session);
+  } else {
+    awaitingChars.remove(session);
+  }
   pokeUI();
 }
 
@@ -367,15 +420,47 @@ Future<void> setCurrentChar(String name) async {
   } catch (_) {}
 }
 
-/// Pull the full history for the current character (oldest-first from server,
+/// Pull the full history for a character (oldest-first from server,
 /// returned newest-first for the chat UI). Images become network URLs.
-Future<List<types.Message>> fetchServerMessages() async {
-  final j = await apiGet(
-      "/api/history?session=${Uri.encodeComponent(currentChar)}&limit=0");
+/// [session] defaults to the visible character; pass an explicit session for
+/// background syncs so a slow response can never paint the wrong list.
+Future<List<types.Message>> fetchServerMessages(
+    {String? session, String? afterId}) async {
+  final raw = await _fetchServerRaw(session: session, afterId: afterId);
+  return raw.msgs;
+}
+
+/// Raw history fetch: same as [fetchServerMessages] but also reports whether
+/// the server answered incrementally (and fell back to full when the anchor
+/// id was unknown, e.g. after an archive/regenerate that rewrote the tail).
+Future<({List<types.Message> msgs, int total, bool incremental})>
+    _fetchServerRaw({String? session, String? afterId}) async {
+  final s = session ?? currentChar;
+  final h = host;
+  final qp = afterId != null && afterId.isNotEmpty
+      ? "session=${Uri.encodeComponent(s)}&limit=0&after_id=${Uri.encodeComponent(afterId)}"
+      : "session=${Uri.encodeComponent(s)}&limit=0";
+  // Full downloads grow with chat length; give them room instead of surfacing
+  // a timeout the user then retries into a loop.
+  final j = await apiGet("/api/history?$qp",
+      seconds: afterId != null && afterId.isNotEmpty ? 15 : 30);
   final list = (j["messages"] as List?) ?? [];
+  final total = (j["total"] as num?)?.toInt() ?? list.length;
+  return (
+    msgs: msgsFromServerList(list, s, h),
+    total: total,
+    incremental: (j["incremental"] as bool?) ?? false,
+  );
+}
+
+/// Convert one `/api/history` message array (oldest-first) into UI messages
+/// (newest-first). Shared by full and incremental fetches so bubble ids and
+/// ordering stay identical.
+List<types.Message> msgsFromServerList(
+    List raw, String session, String? h) {
   final out = <types.Message>[]; // oldest first
-  for (final raw in list) {
-    final m = raw as Map<String, dynamic>;
+  for (final r in raw) {
+    final m = r as Map<String, dynamic>;
     final role = (m["role"] ?? "user").toString();
     if (role != "user" && role != "assistant") continue;
     final author = role == "user" ? user : assistant;
@@ -395,11 +480,34 @@ Future<List<types.Message>> fetchServerMessages() async {
         id: "$id-img-${imgIndex++}",
         name: "image",
         size: 0,
-        uri: "$host/chars/${Uri.encodeComponent(currentChar)}/$p",
+        uri: "$h/chars/${Uri.encodeComponent(session)}/$p",
       ));
     }
   }
   return out.reversed.toList(); // newest-first for flutter_chat_ui
+}
+
+/// Map a UI bubble id back to its server row id: image bubbles carry a
+/// `-img-N` suffix, live bubbles were never on the server (null).
+String? serverRowIdForBubble(String msgId) {
+  if (msgId.startsWith('live-') || msgId.startsWith('regen-')) return null;
+  final m = RegExp(r'^(.*)-img-\d+$').firstMatch(msgId);
+  return m != null ? m.group(1) : msgId;
+}
+
+/// Newest server row id in a newest-first list, skipping optimistic outbox
+/// bubbles and live stream bubbles (they are not `after_id` anchors).
+String? newestServerRowId(List<types.Message> newestFirst, String session) {
+  final pending =
+      <String>{for (final it in Outbox.instance.itemsFor(session)) it.id};
+  for (final m in newestFirst) {
+    if (pending.contains(m.id)) continue;
+    if (m.id == liveMsgBySession[session]) continue;
+    if (session == currentChar && m.id == liveStreamMsgId) continue;
+    final row = serverRowIdForBubble(m.id);
+    if (row != null && row.isNotEmpty) return row;
+  }
+  return null;
 }
 
 // ---- image helpers (attachments) ----
@@ -674,12 +782,12 @@ Future<void> playChime() async {
   } catch (_) {}
 }
 
-Future<void> showReplyNotification(String preview) async {
+Future<void> showReplyNotification(String preview, {String? session}) async {
   if (!Platform.isAndroid || !notifReady) return;
   try {
     await notifPlugin.show(
       id: 7,
-      title: currentChar,
+      title: session ?? currentChar,
       body: preview,
       notificationDetails: const NotificationDetails(
         android: AndroidNotificationDetails(
@@ -695,8 +803,10 @@ Future<void> showReplyNotification(String preview) async {
 }
 
 /// Foreground: chime. Backgrounded (process still alive): local notification
-/// plus a best-effort chime.
-Future<void> announceReply(String text) async {
+/// plus a best-effort chime. [session] titles the notification with the
+/// character that actually replied (a background character's reply must not
+/// be titled with the visible one).
+Future<void> announceReply(String text, {String? session}) async {
   final preview =
       text.trim().replaceAll(RegExp(r'\s+'), ' ').trim();
   final short =
@@ -704,7 +814,8 @@ Future<void> announceReply(String text) async {
   if (appActive) {
     await playChime();
   } else {
-    await showReplyNotification(short.isEmpty ? "（收到新回复）" : short);
+    await showReplyNotification(short.isEmpty ? "（收到新回复）" : short,
+        session: session);
     await playChime();
   }
 }
@@ -738,15 +849,26 @@ bool isRegenCommand(String t) => _regenCommands.contains(t.trim().toLowerCase())
 /// [msgId]. Returns the accumulated text. [myEpoch] lets the loop bail when a
 /// sync replaces the message list under it. Throws [OutboxHttpError] on a
 /// terminal error event (the server's cut signal).
+/// [session] routes the painting: a reply for a background character goes to
+/// its cache, never to the visible list.
 Future<String> _pumpChatStream(
-    http.StreamedResponse resp, String msgId, int myEpoch) async {
+    http.StreamedResponse resp, String msgId, int myEpoch,
+    {String? session}) async {
+  final sess = session ?? currentChar;
+  bool epochStale() {
+    if (epochBySession.containsKey(sess)) {
+      return myEpoch != epochBySession[sess];
+    }
+    return myEpoch != sendEpoch;
+  }
+
   var text = "";
   var lastPush = DateTime.fromMillisecondsSinceEpoch(0);
   var announced = false;
   await for (final line in resp.stream
       .transform(utf8.decoder)
       .transform(const LineSplitter())) {
-    if (myEpoch != sendEpoch) return text; // history was replaced under us
+    if (epochStale()) return text; // history was replaced under us
     final t = line.trim();
     if (t.isNotEmpty) {
       try {
@@ -771,7 +893,7 @@ Future<String> _pumpChatStream(
     // Upsert, not insert: a retried attempt reuses the same derived id, and a
     // plain insert would either duplicate the bubble or leave it frozen at
     // the previous attempt's text.
-    _upsertBubble(msgId, text);
+    _upsertBubble(msgId, text, session: sess);
     if (!announced) {
       announced = true;
       HapticFeedback.lightImpact();
@@ -802,10 +924,15 @@ Future<void> sendTurn(OutboxItem item) async {
   // a sync in the window between this call and the first streamed chunk: the
   // merge then kept the live bubble *and* picked up the server's copy of the
   // same turn, so the user's own message rendered twice until the stream ended.
-  chatAllowed = false;
+  // Only the visible character locks the composer: a background turn streams
+  // into its cache and reconciles at the end.
+  final sess = item.session.isNotEmpty ? item.session : currentChar;
+  final visible = sess == currentChar;
+  if (visible) chatAllowed = false;
+  setAwaitingFor(sess, true);
   var text = "";
   var started = DateTime.now();
-  final myEpoch = sendEpoch;
+  final myEpoch = epochBySession[sess] ?? sendEpoch;
   final msgId = liveMsgIdFor(item.id);
 
   // One guard for the whole attempt: the claim on the UI happens before the
@@ -826,6 +953,7 @@ Future<void> sendTurn(OutboxItem item) async {
       ..body = jsonEncode({
         "model": model ?? serverChatModel ?? "auto-chat",
         "stream": true,
+        "session": sess,
         "client_msg_id": item.id,
         "messages": [
           {
@@ -848,24 +976,38 @@ Future<void> sendTurn(OutboxItem item) async {
     }
 
     // The turn is on the server now; show its reply as it arrives.
-    liveStreamMsgId = msgId;
+    liveMsgBySession[sess] = msgId;
+    if (visible) {
+      liveStreamMsgId = msgId;
+      liveStreamSession = sess;
+    }
     liveStreamEpoch = myEpoch;
     started = DateTime.now();
 
-    text = await _pumpChatStream(resp, msgId, myEpoch);
+    text = await _pumpChatStream(resp, msgId, myEpoch, session: sess);
     if (text.trim().isEmpty) {
       throw OutboxHttpError(
           status: 502,
           body: "服务器没有返回内容（${DateTime.now().difference(started).inSeconds}s）");
     }
   } finally {
-    liveStreamMsgId = null;
-    chatAllowed = true;
-    if (myEpoch == sendEpoch) {
-      suppressChimeOnce = true;
-      setAwaitingReply(false);
-      pokeUI();
+    liveMsgBySession.remove(sess);
+    if (visible) {
+      liveStreamMsgId = null;
+      liveStreamSession = null;
+      chatAllowed = true;
     }
+    if ((epochBySession[sess] ?? sendEpoch) == myEpoch) {
+      suppressChimeOnce = true;
+      setAwaitingFor(sess, false);
+      if (visible) setAwaitingReply(false);
+    }
+    // A background turn reconciles into its cache (and notifies) instead of
+    // touching the visible list.
+    if (!visible) {
+      unawaited(syncFromServer(silent: true, session: sess));
+    }
+    pokeUI();
   }
 }
 /// `/regenerate`: ask the server to drop the trailing assistant reply and
@@ -903,6 +1045,7 @@ Future<void> regenerateTurn() async {
       ..body = jsonEncode({
         "model": model ?? serverChatModel ?? "auto-chat",
         "stream": true,
+        "session": currentChar,
         "regenerate": true,
         "messages": <Map<String, dynamic>>[],
       });
@@ -956,7 +1099,22 @@ void renderOutboxTurn(String id, String text, List<String> imgs) {
 
 /// Replace the text of bubble [msgId] if it is already on screen, otherwise put
 /// it on top. Used by the streaming loop so a retry reuses its own bubble.
-void _upsertBubble(String msgId, String text) {
+/// [session] routes background turns into their cache instead of the visible
+/// list (the fix for "B 的画面显示 A 的讯息").
+void _upsertBubble(String msgId, String text, {String? session}) {
+  final sess = session ?? currentChar;
+  if (sess != currentChar) {
+    final cached = msgCache[sess] ??= <types.Message>[];
+    for (var i = 0; i < cached.length; i++) {
+      if (cached[i].id == msgId) {
+        cached[i] = types.TextMessage(author: assistant, id: msgId, text: text);
+        return;
+      }
+    }
+    cached.insert(
+        0, types.TextMessage(author: assistant, id: msgId, text: text));
+    return;
+  }
   for (var i = 0; i < messages.length; i++) {
     if (messages[i].id == msgId) {
       messages[i] = types.TextMessage(author: assistant, id: msgId, text: text);
@@ -983,7 +1141,16 @@ void startOutboxDriver() {
       final o = Outbox.instance.byId(item.id);
       // Nothing left to wait for: stop the header spinner, otherwise a turn
       // that ended in `failed` would show "努力回复中" for the rest of time.
-      if (!Outbox.instance.hasWork) setAwaitingReply(false);
+      // Per-character: a failed background turn must not clear (or hold) the
+      // visible character's spinner.
+      final sess = item.session.isNotEmpty ? item.session : currentChar;
+      if (!Outbox.instance.hasWorkFor(sess)) {
+        if (sess == currentChar) {
+          setAwaitingReply(false);
+        } else {
+          setAwaitingFor(sess, false);
+        }
+      }
       if (o != null && o.state == OutboxState.failed) {
         messengerKey.currentState?.showSnackBar(SnackBar(
           content: Text("发送失败：${f.message}"),
@@ -1128,32 +1295,57 @@ Future<void> refreshCharHead() async {
 }
 
 /// 5s poller tick (only while the app is resumed). Cheap limit=1 probe;
-/// a full silent sync happens only when the tail actually changed.
+/// a silent sync happens only when the tail actually changed. The probe and
+/// the follow-up sync are pinned to the character visible at tick start, so a
+/// mid-tick switch can never paint A's rows into B's list.
 Future<void> pollTick() async {
   if (pollInFlight) return;
   if (host == null) return;
-  // Drive the send queue first: a turn that failed while offline is due for
-  // its next backoff step, and nothing else in the app will retry it.
-  if (prefs != null && Outbox.instance.hasWork && chatAllowed) {
+  final target = currentChar;
+  // Drive the send queue first (all sessions): a turn that failed while
+  // offline is due for its next backoff step, and a background character's
+  // turn keeps retrying while another character is visible.
+  if (prefs != null &&
+      Outbox.instance.hasWork &&
+      !Outbox.instance.isSending) {
     await Outbox.instance.flush(prefs!);
+    if (currentChar != target) return; // switched mid-flush
   }
-  if (!chatAllowed) return; // a local stream owns the UI right now
+  // A local stream owns its own session's list; other sessions still sync.
+  // chatAllowed is only ever locked by the visible session's own send, so it
+  // also covers the claim window before the live bubble id is registered.
+  if (!chatAllowed) return;
+  if ((liveStreamMsgId != null && liveStreamSession == target) ||
+      liveMsgBySession.containsKey(target)) {
+    return;
+  }
   pollInFlight = true;
   try {
     final j = await apiGet(
-        "/api/history?session=${Uri.encodeComponent(currentChar)}&limit=1",
+        "/api/history?session=${Uri.encodeComponent(target)}&limit=1",
         seconds: 4);
+    if (currentChar != target) return; // switched mid-probe
     final total = (j["total"] ?? -1).toString();
     final list = (j["messages"] as List?) ?? [];
     var fp = "$total:";
     for (final raw in list) {
       fp += "${(raw as Map)["id"] ?? ""},";
     }
-    if (lastProbeFp != null && fp != lastProbeFp) {
-      lastProbeFp = fp;
-      await syncFromServer(silent: true);
+    final prevFp =
+        target == currentChar ? lastProbeFp : probeFpByChar[target];
+    if (prevFp != null && fp != prevFp) {
+      if (target == currentChar) {
+        lastProbeFp = fp;
+      } else {
+        probeFpByChar[target] = fp;
+      }
+      await syncFromServer(silent: true, session: target);
     } else {
-      lastProbeFp = fp;
+      if (target == currentChar) {
+        lastProbeFp = fp;
+      } else {
+        probeFpByChar[target] = fp;
+      }
     }
     if (offlineMode) {
       offlineMode = false;
@@ -1217,82 +1409,155 @@ class _HeaderStatusTextState extends State<HeaderStatusText> {
   }
 }
 
-Future<void> syncFromServer({bool silent = false, bool forcePin = false}) async {
+/// Reconcile one character with server truth.
+///
+/// [session] pins the whole operation: the fetch, the merge and the apply all
+/// target that character. A result that arrives after the user switched away
+/// is stashed into [msgCache] instead of the visible list (the fix for B
+/// showing A's messages). When the cache already holds the character, only
+/// rows after [newestServerIdByChar] are pulled (`after_id`), so switching
+/// characters no longer re-downloads the full history every time.
+Future<void> syncFromServer(
+    {bool silent = false, bool forcePin = false, String? session}) async {
+  var target = session ?? currentChar;
+  final mySeq = (syncSeqByChar[target] ?? 0) + 1;
+  syncSeqByChar[target] = mySeq;
+  bool stale() => syncSeqByChar[target] != mySeq;
+
+  var visible = target == currentChar;
   // Snapshot scroll offset before the rebuild so we can hold it when the user
   // is reading history (prevents passive drift on wholesale replace).
   double? prevPixels;
   double? prevMax;
   try {
-    if (chatScrollController.hasClients) {
+    if (visible && chatScrollController.hasClients) {
       try {
         prevPixels = chatScrollController.position.pixels;
         prevMax = chatScrollController.position.maxScrollExtent;
       } catch (_) {}
     }
-    if (!silent) {
+    if (!silent && visible) {
       // Adopt the server's current character so web and app share the floor.
       try {
         final s = await apiGet("/api/settings");
+        if (stale()) return;
         final c = (s["current_char"] ?? "").toString();
         if (c.isNotEmpty && c != currentChar) {
+          // The web switched characters while we were away: stash the old
+          // view and follow, same as a manual switch.
+          msgCache[currentChar] = List<types.Message>.from(messages);
+          probeFpByChar[currentChar] = lastProbeFp;
+          seenAidByChar[currentChar] = lastSeenAssistantId;
           currentChar = c;
           await prefs?.setString("currentChar", c);
+          target = c;
+          visible = true;
+          syncSeqByChar[target] = (syncSeqByChar[target] ?? 0) + 1;
+          messages = msgCache[target] ?? <types.Message>[];
+          lastProbeFp = probeFpByChar[target];
+          lastSeenAssistantId = seenAidByChar[target];
+          chatUuid = null;
+          userTouched = false;
+          unreadCount = 0;
           await refreshCharHead();
+          pokeUI();
         }
         final ru = (s["rerank_url"] ?? "").toString();
         if (ru.isNotEmpty) serverRerankUrl = ru;
         await refreshCharHead();
       } catch (_) {}
     }
-    final msgs = await fetchServerMessages();
+    // A local stream owns its session's list: merging server truth into it
+    // mid-flight is what produced a doubled bubble, because the server's row
+    // for the turn and the local optimistic copy are both "the same message".
+    // Other sessions are unaffected and sync normally.
+    if (liveMsgBySession.containsKey(target) ||
+        (visible && liveStreamMsgId != null)) {
+      if (!silent && visible) {
+        messengerKey.currentState?.showSnackBar(const SnackBar(
+          content: Text("正在接收回复，稍候自动同步…"),
+          duration: Duration(seconds: 2),
+        ));
+      }
+      return;
+    }
+    // Incremental path: pull only rows after the newest one we hold.
+    final base = visible
+        ? List<types.Message>.from(messages)
+        : List<types.Message>.from(msgCache[target] ?? <types.Message>[]);
+    final anchor =
+        newestServerIdByChar[target] ?? newestServerRowId(base, target);
+    List<types.Message> serverMsgs;
+    bool didIncremental = false;
+    if (anchor != null && anchor.isNotEmpty) {
+      final raw = await _fetchServerRaw(session: target, afterId: anchor);
+      if (stale()) return;
+      if (raw.incremental) {
+        // Delta merge: fresh rows are newer than everything cached.
+        final known = <String>{for (final m in base) m.id};
+        final fresh = <types.Message>[
+          for (final m in raw.msgs)
+            if (!known.contains(m.id)) m
+        ];
+        serverMsgs = _mergeSync(base, fresh, target);
+        didIncremental = true;
+      } else {
+        serverMsgs = _mergeSync(base, raw.msgs, target, fullReplace: true);
+      }
+    } else {
+      final raw = await _fetchServerRaw(session: target);
+      if (stale()) return;
+      serverMsgs = _mergeSync(base, raw.msgs, target, fullReplace: true);
+    }
+    if (stale()) return;
+    // This session's epoch advances: any zombie stream of the same session
+    // still patching the old list stops (other sessions are untouched).
+    epochBySession[target] = (epochBySession[target] ?? 0) + 1;
+    if (visible) sendEpoch++;
+    offlineMode = false;
     // Newest-first list: find the newest assistant message for chime/mood.
     String? newestAssistantId;
     String newestAssistantText = "";
-    for (final m in msgs) {
+    for (final m in serverMsgs) {
       if (m is types.TextMessage && m.author.id == assistant.id) {
         newestAssistantId = m.id;
         newestAssistantText = m.text;
         break;
       }
     }
-
-    // A local stream owns the list right now: merging server truth into it
-    // mid-flight is what produced a doubled bubble, because the server's row
-    // for the turn and the local optimistic copy are both "the same message"
-    // and only one of them is in the queue. The poller already waits for this,
-    // but SSE and a manual Sync do not, so refuse here too.
-    if (liveStreamMsgId != null) return;
-
-    // A queued turn is not on the server yet, so a wholesale replace would
-    // silently delete the user's unsent message from the screen. Keep those
-    // bubbles and re-pin them on top; each one disappears as soon as its id
-    // shows up in the server's history.
-    final confirmed = <String>{for (final m in msgs) m.id};
-    for (final item in List<OutboxItem>.from(Outbox.instance.items)) {
-      if (confirmed.contains(item.id)) {
-        // The turn landed after all: the queue entry is done, so every local
-        // bubble belonging to it goes away and the server row is the only one.
-        await Outbox.instance.confirm(prefs!, item.id);
+    newestServerIdByChar[target] = newestServerRowId(serverMsgs, target);
+    if (!visible) {
+      // Background character: stash, notify, never touch the visible list.
+      msgCache[target] = serverMsgs;
+      final prevSeen = seenAidByChar[target];
+      final firstLoad = prevSeen == null;
+      final sawNew = newestAssistantId != null &&
+          newestAssistantId != prevSeen;
+      if (newestAssistantId != null) seenAidByChar[target] = newestAssistantId;
+      if (sawNew && !firstLoad) {
+        if (suppressChimeOnce) {
+          suppressChimeOnce = false; // server echo of our own background send
+        } else {
+          unawaited(announceReply(newestAssistantText, session: target));
+        }
       }
-    }
-    // Only turns still queued have no server copy yet, so only those are kept.
-    final kept = <types.Message>[];
-    for (final item in Outbox.instance.items) {
-      for (final m in messages) {
-        if (isTurnBubble(m.id, item.id)) kept.add(m);
+      if (awaitingChars.contains(target)) setAwaitingFor(target, false);
+      if (newestAssistantId != null && newestAssistantId.isNotEmpty) {
+        unawaited(classifyMood(newestAssistantId, newestAssistantText));
       }
+      pokeUI();
+      return;
     }
-    messages = <types.Message>[...kept, ...msgs];
+    messages = serverMsgs;
     chatUuid = null;
     pruneImgCache();
-    sendEpoch++; // invalidate any zombie stream still patching the old list
-    offlineMode = false;
     final firstLoad = lastSeenAssistantId == null;
     _syncSawNewAssistant = newestAssistantId != null &&
         newestAssistantId != lastSeenAssistantId;
     if (_syncSawNewAssistant) {
       final String seenId = newestAssistantId ?? "";
       lastSeenAssistantId = newestAssistantId;
+      seenAidByChar[target] = newestAssistantId;
       if (!firstLoad) {
         if (suppressChimeOnce) {
           suppressChimeOnce = false; // server echo of our own live stream
@@ -1301,11 +1566,19 @@ Future<void> syncFromServer({bool silent = false, bool forcePin = false}) async 
         }
       }
       if (awaitingReply) setAwaitingReply(false);
+      if (awaitingChars.contains(target)) setAwaitingFor(target, false);
       if (seenId.isNotEmpty) {
         unawaited(classifyMood(seenId, newestAssistantText));
       }
     } else {
       pokeUI();
+    }
+    if (didIncremental) {
+      // Delta applied on top of cache: nothing moved under the viewport, so
+      // only pin when there is actually new content.
+      if (_syncSawNewAssistant && !userTouched) pinChatToBottom();
+      if (!silent) HapticFeedback.lightImpact();
+      return;
     }
     // Pin decision at apply time: a touch mid-flight cancels the open pin.
     // firstLoad keeps the old "open lands on newest" behaviour, but only when
@@ -1328,12 +1601,12 @@ Future<void> syncFromServer({bool silent = false, bool forcePin = false}) async 
             return prevMax ?? prevPixels!;
           }
         })();
-        double target = prevPixels!;
-        if (curMax < target) target = curMax;
-        if ((chatScrollController.position.pixels - target).abs() > 2) {
+        double targetPx = prevPixels;
+        if (curMax < targetPx) targetPx = curMax;
+        if ((chatScrollController.position.pixels - targetPx).abs() > 2) {
           programmaticScroll = true;
           try {
-            chatScrollController.jumpTo(target);
+            chatScrollController.jumpTo(targetPx);
           } catch (_) {}
           WidgetsBinding.instance.addPostFrameCallback((_) {
             programmaticScroll = false;
@@ -1352,6 +1625,11 @@ Future<void> syncFromServer({bool silent = false, bool forcePin = false}) async 
     }
     if (!silent) HapticFeedback.lightImpact();
   } catch (e) {
+    if (target != currentChar) {
+      // Background syncs never flip the global offline flag or toast: the
+      // next foreground poller tick reports reachability for the visible char.
+      return;
+    }
     offlineMode = true;
     pokeUI();
     if (!silent) {
@@ -1365,17 +1643,80 @@ Future<void> syncFromServer({bool silent = false, bool forcePin = false}) async 
   }
 }
 
+/// Merge server rows with the still-queued optimistic bubbles of [session].
+/// [fresh] is either the full history (fullReplace) or just the delta rows.
+/// A queued turn is not on the server yet, so a wholesale replace would
+/// silently delete the user's unsent message from the screen. Kept bubbles
+/// are re-pinned on top; each one disappears as soon as its id shows up in
+/// the server's history. Only this session's queue is consulted, so A's
+/// unsent turn can never leak into B's list.
+List<types.Message> _mergeSync(List<types.Message> base,
+    List<types.Message> fresh, String session,
+    {bool fullReplace = false}) {
+  final serverIds = <String>{for (final m in fresh) m.id};
+  if (fullReplace) {
+    for (final m in base) {
+      serverIds.add(m.id);
+    }
+  }
+  // Only turns still queued have no server copy yet, so only those are kept.
+  // A stale live bubble (stream already gone) is dropped as well: anything
+  // belonging to a landed turn is excluded even if its queue-confirm hasn't
+  // run yet (background reconcile racing its own confirm).
+  final landed = <String>{};
+  for (final item in List<OutboxItem>.from(Outbox.instance.itemsFor(session))) {
+    if (_turnConfirmed(serverIds, item.id)) {
+      landed.add(item.id);
+      if (prefs != null) {
+        unawaited(Outbox.instance.confirm(prefs!, item.id));
+      }
+    }
+  }
+  final kept = <types.Message>[];
+  for (final item in Outbox.instance.itemsFor(session)) {
+    if (landed.contains(item.id)) continue;
+    for (final m in base) {
+      if (isTurnBubble(m.id, item.id)) kept.add(m);
+    }
+  }
+  final body = fullReplace ? fresh : <types.Message>[...fresh, ...base];
+  final out = <types.Message>[...kept, ...body];
+  // De-duplicate defensively: a background send's reconcile racing its own
+  // queue-confirm must never leave twin bubbles behind.
+  final seen = <String>{};
+  return [
+    for (final m in out)
+      if (seen.add(m.id)) m
+  ];
+}
+
+/// A turn counts as landed when its text row arrived, or — for image-only
+/// turns, which have no text bubble — when any of its derived image bubbles
+/// arrived.
+bool _turnConfirmed(Set<String> serverIds, String turnId) {
+  if (serverIds.contains(turnId)) return true;
+  final p = '$turnId-img-';
+  for (final id in serverIds) {
+    if (id.startsWith(p)) return true;
+  }
+  return false;
+}
+
 /// Subscribe to server-side live events so the app picks up messages written
 /// by the web UI (or background distillation) without manual Sync.
 /// The 5s poller is the primary path now; SSE is a best-effort accelerator.
 void startEvents() {
   eventSub?.cancel();
   if (host == null) return;
+  // Pin the subscription to the character visible right now. Events carry no
+  // session field (ChatMessage JSON), so the subscribed session IS the target
+  // for the follow-up sync — a late event after a switch stashes into cache.
+  final sess = currentChar;
   () async {
     try {
       final req = http.Request(
           "GET",
-          Uri.parse("$host/api/events?session=${Uri.encodeComponent(currentChar)}"));
+          Uri.parse("$host/api/events?session=${Uri.encodeComponent(sess)}"));
       req.headers["Accept"] = "text/event-stream";
       req.headers.addAll(serverHeaders());
       final resp = await http.Client().send(req);
@@ -1387,14 +1728,15 @@ void startEvents() {
           try {
             final m = jsonDecode(line.substring(5).trim());
             final role = (m is Map) ? (m["role"] ?? "").toString() : "";
-            // Only roles the list actually renders trigger a full re-sync;
+            // Only roles the list actually renders trigger a re-sync;
             // a background distilled_memory row would otherwise replace the
             // whole list for a message that never appears on screen.
             if (role == "user" || role == "assistant") {
-              // A local stream owns the UI while it runs; the poller will
-              // reconcile with server truth once it ends.
-              if (!chatAllowed) return;
-              syncFromServer(silent: true);
+              // A local stream owns its session's list; the poller (or the
+              // send's own reconcile) picks up server truth once it ends.
+              if (liveMsgBySession.containsKey(sess)) return;
+              if (sess == currentChar && !chatAllowed) return;
+              syncFromServer(silent: true, session: sess);
             }
           } catch (_) {}
         }
@@ -1449,10 +1791,28 @@ Future<void> chooseCharacter(BuildContext context, Function setState) async {
                   onTap: () async {
                     Navigator.of(ctx).pop();
                     if (name == currentChar) return;
+                    // Stash the visible list into its character cache first:
+                    // the old character's in-flight stream/queue keeps running
+                    // in the background and paints into that cache, never into
+                    // the newly visible list.
+                    msgCache[currentChar] =
+                        List<types.Message>.from(messages);
+                    probeFpByChar[currentChar] = lastProbeFp;
+                    seenAidByChar[currentChar] = lastSeenAssistantId;
                     await setCurrentChar(name);
-                    await syncFromServer();
+                    // Cache hit: show instantly, then pull only the delta.
+                    // Miss: blank list + full download (one-off per restart).
+                    messages = List<types.Message>.from(msgCache[name] ?? []);
+                    lastProbeFp = probeFpByChar[name];
+                    lastSeenAssistantId = seenAidByChar[name];
+                    chatUuid = null;
+                    userTouched = false;
+                    unreadCount = 0;
+                    setState(() {});
                     await refreshCharHead();
                     startEvents();
+                    await syncFromServer(session: name);
+                    await refreshCharHead();
                   },
                 );
               }),
@@ -1753,6 +2113,11 @@ class _MainAppState extends State<MainApp> with WidgetsBindingObserver {
           currentChar = prefs!.getString("currentChar") ?? currentChar;
           // Anything left in the queue from a previous run goes out now.
           await Outbox.instance.load(prefs!);
+          // One-time backfill: entries queued before the per-character update
+          // carry no session tag; they belong to the restored character.
+          for (final it in Outbox.instance.items) {
+            if (it.session.isEmpty) it.session = currentChar;
+          }
           pokeUI();
           // Open: clear the touch lock so the first sync may land on newest.
           // If the finger touches mid-flight, the apply-time check cancels it.
@@ -2546,6 +2911,7 @@ class _MainAppState extends State<MainApp> with WidgetsBindingObserver {
                         await Outbox.instance.enqueue(
                           prefs!,
                           id: id,
+                          session: currentChar,
                           text: text,
                           imageDataUrls: imgs,
                         );

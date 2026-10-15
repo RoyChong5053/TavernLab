@@ -1486,6 +1486,24 @@ func main() {
 		}
 		limit := atoiDefault(r.URL.Query().Get("limit"), 10)
 		before := atoiDefault(r.URL.Query().Get("before"), 0)
+		if afterID := strings.TrimSpace(r.URL.Query().Get("after_id")); afterID != "" && before == 0 {
+			msgs, total, ok, err := st.TailAfter(session, afterID)
+			if err != nil {
+				http.Error(w, "history read failed", 500)
+				return
+			}
+			if !ok {
+				msgs, total, err = st.Tail(session, limit, 0)
+				if err != nil {
+					http.Error(w, "history read failed", 500)
+					return
+				}
+				writeJSON(w, map[string]any{"session": session, "total": total, "messages": msgs, "has_more": false, "incremental": false, "fallback": "after_id not found"})
+				return
+			}
+			writeJSON(w, map[string]any{"session": session, "total": total, "messages": msgs, "has_more": false, "incremental": true})
+			return
+		}
 		msgs, total, err := st.Tail(session, limit, before)
 		if err != nil {
 			http.Error(w, "history read failed", 500)
@@ -1709,6 +1727,11 @@ func main() {
 		var in struct {
 			Model  string `json:"model"`
 			Stream bool   `json:"stream"`
+			// Session pins this turn to a character package. The app sends one
+			// turn per character queue, so a turn for A keeps generating while
+			// the phone is viewing B (previously everything landed on
+			// CurrentChar and the two histories cross-contaminated).
+			Session string `json:"session"`
 			// Regenerate re-runs the last user turn: the trailing assistant reply
 			// is dropped server-side first (so the partial leaves the context),
 			// then the turn is generated again. This is the manual last-resort
@@ -1728,7 +1751,7 @@ func main() {
 		b, _ := io.ReadAll(r.Body)
 		_ = json.Unmarshal(b, &in)
 		model := firstNonEmpty(in.Model, defaultChatModel(s))
-		session := store.CleanSession(firstNonEmpty(s.CurrentChar, "tavernlab"))
+		session := store.CleanSession(firstNonEmpty(in.Session, s.CurrentChar, "tavernlab"))
 		// Reply-side idempotency: derive a stable id from the phone's turn key so
 		// a retried turn that races the original generation persists exactly one
 		// assistant row. The second append is a no-op and returns the first row;
