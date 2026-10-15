@@ -1420,7 +1420,7 @@ class _HeaderStatusTextState extends State<HeaderStatusText> {
 Future<void> syncFromServer(
     {bool silent = false, bool forcePin = false, String? session}) async {
   var target = session ?? currentChar;
-  final mySeq = (syncSeqByChar[target] ?? 0) + 1;
+  var mySeq = (syncSeqByChar[target] ?? 0) + 1;
   syncSeqByChar[target] = mySeq;
   bool stale() => syncSeqByChar[target] != mySeq;
 
@@ -1452,7 +1452,11 @@ Future<void> syncFromServer(
           await prefs?.setString("currentChar", c);
           target = c;
           visible = true;
-          syncSeqByChar[target] = (syncSeqByChar[target] ?? 0) + 1;
+          // Rebase the staleness guard onto the adopted character: without
+          // this the seq bump below would instantly mark this very sync
+          // stale and abort it.
+          mySeq = (syncSeqByChar[target] ?? 0) + 1;
+          syncSeqByChar[target] = mySeq;
           messages = msgCache[target] ?? <types.Message>[];
           lastProbeFp = probeFpByChar[target];
           lastSeenAssistantId = seenAidByChar[target];
@@ -1460,6 +1464,7 @@ Future<void> syncFromServer(
           userTouched = false;
           unreadCount = 0;
           await refreshCharHead();
+          if (stale()) return;
           pokeUI();
         }
         final ru = (s["rerank_url"] ?? "").toString();
@@ -1510,6 +1515,11 @@ Future<void> syncFromServer(
       serverMsgs = _mergeSync(base, raw.msgs, target, fullReplace: true);
     }
     if (stale()) return;
+    // Re-evaluate visibility at apply time: the user may have switched
+    // characters while the fetch was in flight. Painting this result into the
+    // now-visible list of another character was the "B shows A's messages"
+    // bug; a stale view result is stashed into its own cache instead.
+    visible = target == currentChar;
     // This session's epoch advances: any zombie stream of the same session
     // still patching the old list stops (other sessions are untouched).
     epochBySession[target] = (epochBySession[target] ?? 0) + 1;
@@ -1791,6 +1801,10 @@ Future<void> chooseCharacter(BuildContext context, Function setState) async {
                   onTap: () async {
                     Navigator.of(ctx).pop();
                     if (name == currentChar) return;
+                    // Invalidate the old character's in-flight syncs so a slow
+                    // response can never paint its rows into the new view.
+                    syncSeqByChar[currentChar] =
+                        (syncSeqByChar[currentChar] ?? 0) + 1;
                     // Stash the visible list into its character cache first:
                     // the old character's in-flight stream/queue keeps running
                     // in the background and paints into that cache, never into
@@ -2159,7 +2173,13 @@ class _MainAppState extends State<MainApp> with WidgetsBindingObserver {
       startEvents();
       startPolling();
       if (prefs != null && Outbox.instance.hasWork) {
-        setAwaitingReply(true);
+        // Only spin the visible header when the visible character actually
+        // has queued work; background turns track their own await state.
+        if (Outbox.instance.hasWorkFor(currentChar)) {
+          setAwaitingReply(true);
+        } else {
+          setAwaitingFor(currentChar, false);
+        }
         unawaited(Outbox.instance.flush(prefs!));
       }
     } else {
