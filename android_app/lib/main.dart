@@ -20,6 +20,7 @@ import 'markdown_fix.dart';
 import 'markdown_math.dart';
 import 'markdown_widgets.dart';
 import 'outbox.dart';
+import 'sync_merge.dart';
 
 import 'package:shared_preferences/shared_preferences.dart';
 // ignore: depend_on_referenced_packages
@@ -487,14 +488,6 @@ List<types.Message> msgsFromServerList(
   return out.reversed.toList(); // newest-first for flutter_chat_ui
 }
 
-/// Map a UI bubble id back to its server row id: image bubbles carry a
-/// `-img-N` suffix, live bubbles were never on the server (null).
-String? serverRowIdForBubble(String msgId) {
-  if (msgId.startsWith('live-') || msgId.startsWith('regen-')) return null;
-  final m = RegExp(r'^(.*)-img-\d+$').firstMatch(msgId);
-  return m != null ? m.group(1) : msgId;
-}
-
 /// Newest server row id in a newest-first list, skipping optimistic outbox
 /// bubbles and live stream bubbles (they are not `after_id` anchors).
 String? newestServerRowId(List<types.Message> newestFirst, String session) {
@@ -825,16 +818,6 @@ Future<void> announceReply(String text, {String? session}) async {
 /// Id of the assistant bubble currently being streamed, so the poller can tell
 /// a live local stream from a server echo.
 String? liveStreamMsgId;
-
-/// Bubble id for the live reply to turn [turnId]. Derived rather than random so
-/// the sync merge can recognise and drop it once the server has the real row.
-String liveMsgIdFor(String turnId) => 'live-$turnId';
-
-/// Bubble ids that belong to one queued turn.
-bool isTurnBubble(String msgId, String turnId) =>
-    msgId == turnId ||
-    msgId == '$turnId-img' ||
-    msgId == liveMsgIdFor(turnId);
 
 /// Epoch of the send that owns [liveStreamMsgId]. A sync bumps sendEpoch; the
 /// stream notices and stops patching a list that no longer exists.
@@ -1653,70 +1636,23 @@ Future<void> syncFromServer(
   }
 }
 
-/// Merge server rows with the still-queued optimistic bubbles of [session].
-/// [fresh] is either the full history (fullReplace) or just the delta rows.
-/// A queued turn is not on the server yet, so a wholesale replace would
-/// silently delete the user's unsent message from the screen. Kept bubbles
-/// are re-pinned on top; each one disappears as soon as its id shows up in
-/// the server's history. Only this session's queue is consulted, so A's
-/// unsent turn can never leak into B's list.
+/// Merge server truth into the local list for [session] (see [mergeSync], which
+/// holds the rules) and confirm the turns the server now owns.
 List<types.Message> _mergeSync(List<types.Message> base,
     List<types.Message> fresh, String session,
     {bool fullReplace = false}) {
-  final serverIds = <String>{for (final m in fresh) m.id};
-  if (fullReplace) {
-    for (final m in base) {
-      serverIds.add(m.id);
-    }
-  }
-  // Only turns still queued have no server copy yet, so only those are kept.
-  // A stale live bubble (stream already gone) is dropped as well: anything
-  // belonging to a landed turn is excluded even if its queue-confirm hasn't
-  // run yet (background reconcile racing its own confirm).
-  final landed = <String>{};
-  for (final item in List<OutboxItem>.from(Outbox.instance.itemsFor(session))) {
-    if (_turnConfirmed(serverIds, item.id)) {
-      landed.add(item.id);
-      if (prefs != null) {
-        unawaited(Outbox.instance.confirm(prefs!, item.id));
-      }
-    }
-  }
-  final kept = <types.Message>[];
-  for (final item in Outbox.instance.itemsFor(session)) {
-    if (landed.contains(item.id)) continue;
-    for (final m in base) {
-      if (isTurnBubble(m.id, item.id)) kept.add(m);
-    }
-  }
-  final body = fullReplace ? fresh : <types.Message>[...fresh, ...base];
-  final out = <types.Message>[...kept, ...body];
-  // De-duplicate defensively: a background send's reconcile racing its own
-  // queue-confirm must never leave twin bubbles behind.
-  final seen = <String>{};
-  return [
-    for (final m in out)
-      if (seen.add(m.id)) m
+  // Snapshot the queue: confirming an item mutates it.
+  final queued = <String>[
+    for (final item in List<OutboxItem>.from(Outbox.instance.itemsFor(session)))
+      item.id
   ];
-}
-
-/// A turn counts as landed when its text row arrived, when the server's derived
-/// reply row for it arrived, or — for image-only turns, which have no text
-/// bubble — when any of its derived image bubbles arrived.
-///
-/// The `<turnId>-r` case matters: the server derives the assistant row's id from
-/// the turn key (`assistantReplyID`), and an incremental sync anchored on the
-/// user row returns ONLY that assistant row. Without this check the delta looked
-/// unconfirmed, so `_mergeSync` kept the local live bubble AND inserted the
-/// server row — one message answered twice on screen.
-bool _turnConfirmed(Set<String> serverIds, String turnId) {
-  if (serverIds.contains(turnId)) return true;
-  if (serverIds.contains('$turnId-r')) return true;
-  final p = '$turnId-img-';
-  for (final id in serverIds) {
-    if (id.startsWith(p)) return true;
+  final merged = mergeSync(base, fresh, queued, fullReplace: fullReplace);
+  for (final id in merged.landed) {
+    if (prefs != null) {
+      unawaited(Outbox.instance.confirm(prefs!, id));
+    }
   }
-  return false;
+  return merged.messages;
 }
 
 /// Subscribe to server-side live events so the app picks up messages written
