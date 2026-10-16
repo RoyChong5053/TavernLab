@@ -1700,11 +1700,18 @@ List<types.Message> _mergeSync(List<types.Message> base,
   ];
 }
 
-/// A turn counts as landed when its text row arrived, or — for image-only
-/// turns, which have no text bubble — when any of its derived image bubbles
-/// arrived.
+/// A turn counts as landed when its text row arrived, when the server's derived
+/// reply row for it arrived, or — for image-only turns, which have no text
+/// bubble — when any of its derived image bubbles arrived.
+///
+/// The `<turnId>-r` case matters: the server derives the assistant row's id from
+/// the turn key (`assistantReplyID`), and an incremental sync anchored on the
+/// user row returns ONLY that assistant row. Without this check the delta looked
+/// unconfirmed, so `_mergeSync` kept the local live bubble AND inserted the
+/// server row — one message answered twice on screen.
 bool _turnConfirmed(Set<String> serverIds, String turnId) {
   if (serverIds.contains(turnId)) return true;
+  if (serverIds.contains('$turnId-r')) return true;
   final p = '$turnId-img-';
   for (final id in serverIds) {
     if (id.startsWith(p)) return true;

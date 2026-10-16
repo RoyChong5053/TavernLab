@@ -360,50 +360,61 @@ func TestResolveMCPInjectsResponseVerbatim(t *testing.T) {
 	}
 }
 
-// TestIsUpstreamCut verifies the cut predicate: explicit upstream_cut wins,
-// the 030632-shaped heuristic (stop + no prompt usage + tiny completion)
-// fires, and real verdicts never retry.
-func TestIsUpstreamCut(t *testing.T) {
-	usage := func(prompt, comp float64) map[string]any {
-		m := map[string]any{}
-		if prompt >= 0 {
-			m["prompt_tokens"] = prompt
-		}
-		if comp >= 0 {
-			m["completion_tokens"] = comp
-		}
-		return m
+func TestTurnGatesSerialiseRetries(t *testing.T) {
+	g := newTurnGates()
+	key := "阿离\x00turn-1"
+
+	if !g.enter(context.Background(), key) {
+		t.Fatal("first enter must acquire a free gate")
 	}
-	cases := []struct {
-		name   string
-		status int
-		finish string
-		reply  int
-		usage  map[string]any
-		resp   map[string]any
-		want   bool
-	}{
-		{"explicit flag wins", 200, "error", 10, usage(0, 5),
-			map[string]any{"upstream_cut": true}, true},
-		{"030632 shape retries", 200, "stop", 46, usage(-1, 12),
-			map[string]any{}, true},
-		{"legit short reply with usage never retries", 200, "stop", 3, usage(12950, 2),
-			map[string]any{}, false},
-		{"length verdict never retries", 200, "length", 4000, usage(12950, 4096),
-			map[string]any{}, false},
-		{"content filter never retries", 200, "content_filter", 0, usage(12950, 0),
-			map[string]any{}, false},
-		{"non-200 never retries", 503, "stop", 10, usage(-1, 5),
-			map[string]any{}, false},
-		{"nil body never retries", 200, "stop", 10, usage(-1, 5), nil, false},
-		{"huge reply without usage never retries", 200, "stop", 100000, usage(-1, 12),
-			map[string]any{}, false},
+	if !g.busy(key) {
+		t.Fatal("gate must look busy while held")
 	}
-	for _, tc := range cases {
-		if got := isUpstreamCut(tc.status, tc.finish, tc.reply, tc.usage, tc.resp); got != tc.want {
-			t.Errorf("%s: isUpstreamCut = %v, want %v", tc.name, got, tc.want)
+	// A retry arriving now must wait for the in-flight turn, not run beside it.
+	got := make(chan bool, 1)
+	go func() { got <- g.enter(context.Background(), key) }()
+	select {
+	case <-got:
+		t.Fatal("second enter must not acquire a busy gate")
+	case <-time.After(50 * time.Millisecond):
+	}
+	g.leave(key) // the holder stored its reply and released
+	select {
+	case ok := <-got:
+		if !ok {
+			t.Fatal("waiter must acquire the gate after the holder leaves")
 		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("waiter never woke up")
 	}
+	if !g.busy(key) {
+		t.Fatal("the woken caller must now own the gate")
+	}
+	// leave is idempotent: callers release early and again on return.
+	g.leave(key)
+	g.leave(key)
+	g.leave("")
+	if g.busy(key) {
+		t.Fatal("gate must be free after leave")
+	}
+
+	// A caller that hung up gives up instead of generating.
+	if !g.enter(context.Background(), "k2") {
+		t.Fatal("free gate must be acquired")
+	}
+	cctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	waiting := make(chan bool, 1)
+	go func() { waiting <- g.enter(cctx, "k2") }()
+	select {
+	case ok := <-waiting:
+		if ok {
+			t.Fatal("a cancelled caller must not acquire a busy gate")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancelled waiter never returned")
+	}
+	g.leave("k2")
 }
 
 func TestDefaultChatModelNeverHardcodesGoneAlias(t *testing.T) {

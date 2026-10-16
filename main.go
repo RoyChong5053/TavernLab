@@ -291,6 +291,7 @@ func main() {
 	st.MigrateLegacyChats()
 	client := &http.Client{Timeout: 10 * time.Minute}
 	events = newHub()
+	gates := newTurnGates()
 	loadCalibration(cfg.DataRoot)
 	// Startup self-check: warn early if the configured chat model no longer
 	// exists upstream (renamed alias), rather than only on the first send.
@@ -867,40 +868,20 @@ func main() {
 			}
 			status, rebuilt, usage := proxy.Forward(client, s.Upstream, s.APIKey, upBody, true, w, flusher)
 			reply := strings.TrimSpace(rebuiltText(rebuilt))
-			if rm := respMap(rebuilt); isUpstreamCut(status, replyFinish(rebuilt), len(reply), usage, rm) {
-				// One silent retry with the identical body: the same model
-				// re-enters one-api's channel pool, so the retry usually lands on
-				// a different channel. The first partial was already relayed live
-				// (cosmetic duplication in the live view); the persisted message
-				// below is the retry's. Silent to the client: no toast, but both
-				// attempts are audited and logged. A second failure is used as-is.
-				firstID, reply1, usage1, status1 := auditID, reply, usage, status
-				a1 := toAudit(firstID, model, res, upBody, rebuilt, usage, memInfo)
-				a1.Cut = true
-				obs.Warn("upstream cut, silent retry", map[string]any{
-					"kind": "chat.stream", "model": fmt.Sprint(model), "session": session,
-					"reply_len": len(reply1), "completion": usageCompletionTokens(usage1),
-				})
-				status, rebuilt, usage = proxy.Forward(client, s.Upstream, s.APIKey, upBody, true, w, flusher)
-				reply = strings.TrimSpace(rebuiltText(rebuilt))
-				auditID = time.Now().Format("20060102-150405.000")
-				a1.Superseded = auditID
-				_ = st.SaveAudit(a1)
-				logTurn("chat.stream.cut1", status1, model, session, res, reply1, memInfo, usagePromptTokens(usage1))
-				a2note := toAudit(auditID, model, res, upBody, rebuilt, usage, memInfo)
-				a2note.RetriedFrom = firstID
-				_ = st.SaveAudit(a2note)
-				logTurn("chat.stream", status, model, session, res, reply, memInfo, usagePromptTokens(usage))
-				updateCalibration(cfg.DataRoot, fmt.Sprint(model), res.TotalTok, usagePromptTokens(usage))
-				if reply != "" {
-					msg, _ := st.AppendChat(session, "assistant", reply)
-					events.publish(session, msg)
-					publishNtfy(s, msg)
+			// No client-side cut retry. A cut is one-api's per-channel problem
+			// now, and re-running the same body here relayed a SECOND reply onto
+			// the same response — a streaming client then shows one turn answered
+			// twice (DeskSpirit, which concatenates the stream, shows the text
+			// doubled). The attempt is still audited (with one-api's own cut flag)
+			// and logged, so the cut stays visible; `/regenerate` is the manual
+			// last resort when a bad reply still gets through.
+			rec := toAudit(auditID, model, res, upBody, rebuilt, usage, memInfo)
+			if rm := respMap(rebuilt); rm != nil {
+				if v, _ := rm["upstream_cut"].(bool); v {
+					rec.Cut = true
 				}
-				maybeDistill(st, client, cfg.DataRoot, s, session)
-				return
 			}
-			_ = st.SaveAudit(toAudit(auditID, model, res, upBody, rebuilt, usage, memInfo))
+			_ = st.SaveAudit(rec)
 			logTurn("chat.stream", status, model, session, res, reply, memInfo, usagePromptTokens(usage))
 			updateCalibration(cfg.DataRoot, fmt.Sprint(model), res.TotalTok, usagePromptTokens(usage))
 			if reply != "" {
@@ -912,44 +893,19 @@ func main() {
 			return
 		}
 		status, respBody, usage := proxy.Forward(client, s.Upstream, s.APIKey, upBody, false, nil, nil)
-		reply := strings.TrimSpace(replyText(respBody))
-		if rm := respMap(respBody); isUpstreamCut(status, replyFinish(respBody), len(reply), usage, rm) {
-			// Same one-silent-retry contract as the stream path above; here
-			// nothing was sent to the client yet, so the retry is seamless.
-			firstID, reply1, usage1, status1 := auditID, reply, usage, status
-			a1 := toAudit(firstID, model, res, upBody, respBody, usage, memInfo)
-			a1.Cut = true
-			obs.Warn("upstream cut, silent retry", map[string]any{
-				"kind": "chat", "model": fmt.Sprint(model), "session": session,
-				"reply_len": len(reply1), "completion": usageCompletionTokens(usage1),
-			})
-			status, respBody, usage = proxy.Forward(client, s.Upstream, s.APIKey, upBody, false, nil, nil)
-			reply = strings.TrimSpace(replyText(respBody))
-			auditID = time.Now().Format("20060102-150405.000")
-			a1.Superseded = auditID
-			_ = st.SaveAudit(a1)
-			logTurn("chat.cut1", status1, model, session, res, reply1, memInfo, usagePromptTokens(usage1))
-			a2note := toAudit(auditID, model, res, upBody, respBody, usage, memInfo)
-			a2note.RetriedFrom = firstID
-			_ = st.SaveAudit(a2note)
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(status)
-			_, _ = w.Write(respBody)
-			logTurn("chat", status, model, session, res, reply, memInfo, usagePromptTokens(usage))
-			updateCalibration(cfg.DataRoot, fmt.Sprint(model), res.TotalTok, usagePromptTokens(usage))
-			if reply != "" {
-				msg, _ := st.AppendChat(session, "assistant", reply)
-				events.publish(session, msg)
-				publishNtfy(s, msg)
+		// No client-side cut retry (see the stream path above): report the single
+		// attempt as it came back, and audit one-api's own cut flag if it is set.
+		rec := toAudit(auditID, model, res, upBody, respBody, usage, memInfo)
+		if rm := respMap(respBody); rm != nil {
+			if v, _ := rm["upstream_cut"].(bool); v {
+				rec.Cut = true
 			}
-			maybeDistill(st, client, cfg.DataRoot, s, session)
-			return
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
 		_, _ = w.Write(respBody)
-		_ = st.SaveAudit(toAudit(auditID, model, res, upBody, respBody, usage, memInfo))
-		reply = strings.TrimSpace(replyText(respBody))
+		_ = st.SaveAudit(rec)
+		reply := strings.TrimSpace(replyText(respBody))
 		logTurn("chat", status, model, session, res, reply, memInfo, usagePromptTokens(usage))
 		updateCalibration(cfg.DataRoot, fmt.Sprint(model), res.TotalTok, usagePromptTokens(usage))
 		if status >= 400 {
@@ -1770,6 +1726,18 @@ func main() {
 			}
 			return msg.Text
 		}
+		// Serialise retries of one turn (see turnGates): a retry that lands while
+		// the original generation is still in flight waits here, and the
+		// idempotency check below then replays the stored reply instead of
+		// starting a second generation that streams a second answer to the phone.
+		var gateKey string
+		if in.ClientMsgID != "" && !in.Regenerate {
+			gateKey = session + "\x00" + in.ClientMsgID
+			if !gates.enter(r.Context(), gateKey) {
+				return // caller hung up while waiting; nothing to generate
+			}
+			defer gates.leave(gateKey)
+		}
 		// The app mirrors the server: only the newest user message matters;
 		// full context is slid server-side out of the character's JSONL.
 		var upImages []string
@@ -1859,48 +1827,24 @@ func main() {
 		if !in.Stream {
 			status, respBody, usage := proxy.Forward(client, s.Upstream, s.APIKey, upBody, false, nil, nil)
 			reply := replyText(respBody)
-			if rm := respMap(respBody); isUpstreamCut(status, replyFinish(respBody), len(strings.TrimSpace(reply)), usage, rm) {
-				firstID, reply1, usage1, status1 := auditID, reply, usage, status
-				a1 := toAudit(firstID, model, res, upBody, respBody, usage, memInfo)
-				a1.Cut = true
-				obs.Warn("upstream cut, silent retry", map[string]any{
-					"kind": "app.request", "model": fmt.Sprint(model), "session": session,
-					"reply_len": len(strings.TrimSpace(reply1)), "completion": usageCompletionTokens(usage1),
-				})
-				status, respBody, usage = proxy.Forward(client, s.Upstream, s.APIKey, upBody, false, nil, nil)
-				reply = replyText(respBody)
-				auditID = time.Now().Format("20060102-150405.000")
-				a1.Superseded = auditID
-				_ = st.SaveAudit(a1)
-				logTurn("app.request.cut1", status1, model, session, res, strings.TrimSpace(reply1), memInfo, usagePromptTokens(usage1))
-				a2note := toAudit(auditID, model, res, upBody, respBody, usage, memInfo)
-				a2note.RetriedFrom = firstID
-				_ = st.SaveAudit(a2note)
-				logTurn("app.request", status, model, session, res, strings.TrimSpace(reply), memInfo, usagePromptTokens(usage))
-				updateCalibration(cfg.DataRoot, fmt.Sprint(model), res.TotalTok, usagePromptTokens(usage))
-				reply = saveReply(reply)
-				maybeDistill(st, client, cfg.DataRoot, s, session)
-				doneReason := replyFinish(respBody)
-				if status >= 400 {
-					doneReason = "error"
-				} else if doneReason == "" {
-					doneReason = "stop"
+			// No client-side cut retry (see /v1/chat/completions): generate once,
+			// report it as it came back, and audit one-api's own cut flag.
+			rec := toAudit(auditID, model, res, upBody, respBody, usage, memInfo)
+			if rm := respMap(respBody); rm != nil {
+				if v, _ := rm["upstream_cut"].(bool); v {
+					rec.Cut = true
 				}
-				w.WriteHeader(status)
-				writeJSON(w, map[string]any{
-					"model": model, "created_at": time.Now().Format(time.RFC3339),
-					"message":     map[string]any{"role": "assistant", "content": reply},
-					"done_reason": doneReason, "done": true,
-				})
-				return
 			}
-			_ = st.SaveAudit(toAudit(auditID, model, res, upBody, respBody, usage, memInfo))
+			_ = st.SaveAudit(rec)
 			logTurn("app.request", status, model, session, res, reply, memInfo, usagePromptTokens(usage))
 			updateCalibration(cfg.DataRoot, fmt.Sprint(model), res.TotalTok, usagePromptTokens(usage))
 			if status >= 400 {
 				obs.Warn("upstream error", map[string]any{"path": "/api/chat", "status": status, "body": excerpt(string(respBody), 300)})
 			}
 			reply = saveReply(reply)
+			// The stored reply is all a waiting retry needs: release before the
+			// (slow) distillation tail so it can replay instead of waiting on it.
+			gates.leave(gateKey)
 			maybeDistill(st, client, cfg.DataRoot, s, session)
 			doneReason := replyFinish(respBody)
 			if status >= 400 {
@@ -1937,52 +1881,23 @@ func main() {
 			rebuiltBody["incomplete"] = true
 		}
 		rebuilt, _ := json.Marshal(rebuiltBody)
-		if cut || isUpstreamCut(status, finish, len(strings.TrimSpace(full)), usage, respMap(rebuilt)) {
-			// Same one-silent-retry contract as /v1/chat/completions above.
-			firstID, full1, usage1, status1 := auditID, full, usage, status
-			a1 := toAudit(firstID, model, res, upBody, rebuilt, usage, memInfo)
-			a1.Cut = true
-			obs.Warn("upstream cut, silent retry", map[string]any{
-				"kind": "app.stream", "model": fmt.Sprint(model), "session": session,
-				"reply_len": len(strings.TrimSpace(full1)), "completion": usageCompletionTokens(usage1),
-			})
-			var cut2 bool
-			status, full, usage, finish, cut2 = forwardOllamaStream(client, s.Upstream, s.APIKey, upBody, model, w, flusher)
-			rebuiltBody = map[string]any{
-				"choices": []map[string]any{{
-					"index":         0,
-					"message":       map[string]any{"role": "assistant", "content": full},
-					"finish_reason": finish,
-				}},
-				"stream_rebuilt": true, "via": "ollama-shim",
-			}
-			if cut2 {
-				rebuiltBody["upstream_cut"] = true
-			}
-			if finish == "error" {
-				rebuiltBody["incomplete"] = true
-			}
-			rebuilt, _ = json.Marshal(rebuiltBody)
-			auditID = time.Now().Format("20060102-150405.000")
-			a1.Superseded = auditID
-			_ = st.SaveAudit(a1)
-			logTurn("app.stream.cut1", status1, model, session, res, strings.TrimSpace(full1), memInfo, usagePromptTokens(usage1))
-			a2note := toAudit(auditID, model, res, upBody, rebuilt, usage, memInfo)
-			a2note.RetriedFrom = firstID
-			if cut2 {
-				a2note.Cut = true
-			}
-			_ = st.SaveAudit(a2note)
-			logTurn("app.stream", status, model, session, res, strings.TrimSpace(full), memInfo, usagePromptTokens(usage))
-			updateCalibration(cfg.DataRoot, fmt.Sprint(model), res.TotalTok, usagePromptTokens(usage))
-			full = saveReply(full)
-			maybeDistill(st, client, cfg.DataRoot, s, session)
-			return
+		// No silent cut retry. forwardOllamaStream has already written the
+		// terminal error frame for a cut, so the client treats this attempt as
+		// failed and retries on its own (idempotently — see turnGates). Retrying
+		// here streamed a SECOND reply onto the same response: the client had
+		// already given up on the first attempt, and anything that kept reading
+		// saw one turn answered twice. The cut stays visible in the audit.
+		rec := toAudit(auditID, model, res, upBody, rebuilt, usage, memInfo)
+		if cut {
+			rec.Cut = true
 		}
-		_ = st.SaveAudit(toAudit(auditID, model, res, upBody, rebuilt, usage, memInfo))
+		_ = st.SaveAudit(rec)
 		logTurn("app.stream", status, model, session, res, strings.TrimSpace(full), memInfo, usagePromptTokens(usage))
 		updateCalibration(cfg.DataRoot, fmt.Sprint(model), res.TotalTok, usagePromptTokens(usage))
 		full = saveReply(full)
+		// Release before the (slow) distillation tail: a waiting retry only
+		// needs the stored reply, so it should not queue behind distillation.
+		gates.leave(gateKey)
 		maybeDistill(st, client, cfg.DataRoot, s, session)
 	})
 
@@ -3372,46 +3287,4 @@ func usageCompletionTokens(usage map[string]any) int {
 		return int(v)
 	}
 	return 0
-}
-
-// cutRetryHeuristicCaps bounds the heuristic fallback below: without an
-// explicit upstream_cut signal we only retry when (almost) nothing came back,
-// so a weird-but-complete response can never trigger a retry loop.
-const (
-	cutMaxCompletion = 128 // usage.completion_tokens at or below this
-	cutMaxReplyChars = 512 // reply characters at or below this
-)
-
-// isUpstreamCut reports whether a finished attempt carries the provider-cut
-// signature and deserves one silent retry. Reply LENGTH is deliberately not a
-// criterion: legitimate short replies always arrive WITH usageMetadata, so the
-// discriminator is usage presence, not size.
-//
-// An explicit one-api upstream_cut terminal event always wins. The heuristic
-// fallback covers older one-api builds whose stream chunks never carry usage:
-// HTTP 200 + stop-ish finish + usage without prompt_tokens + tiny completion.
-// Any finish of length/content_filter/tool_calls, any error status, or any
-// usage WITH prompt_tokens is a real provider verdict and never retried.
-func isUpstreamCut(status int, finish string, replyLen int, usage map[string]any, resp map[string]any) bool {
-	if status != 200 || resp == nil {
-		return false
-	}
-	if v, ok := resp["upstream_cut"].(bool); ok && v {
-		return true
-	}
-	if se, _ := resp["stream_error"].(string); se != "" && strings.Contains(se, "upstream_cut") {
-		return true
-	}
-	switch finish {
-	case "stop", "":
-	default:
-		return false
-	}
-	if usagePromptTokens(usage) > 0 {
-		return false
-	}
-	if usageCompletionTokens(usage) > cutMaxCompletion || replyLen > cutMaxReplyChars {
-		return false
-	}
-	return true
 }
