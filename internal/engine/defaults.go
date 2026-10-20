@@ -44,6 +44,16 @@ func DefaultModules() []Module {
 			Template: "<RAG_qdrant>\n{{rag}}\n</RAG_qdrant>",
 		},
 		{
+			// The raw result of a web search, injected for the turn the
+			// /web_search command ran on. It is L2 so it can be dropped
+			// under budget pressure, and it keeps a higher evict priority
+			// than RAG: while it is there, it is the freshest thing in the
+			// context.
+			ID: "web_search", Kind: KindWebSearch, Role: "system", Order: 56, Enabled: true,
+			Level: LevelTrim, KeepTurns: 1,
+			Template: "<Web_Search>\n{{web_search}}\n</Web_Search>",
+		},
+		{
 			ID: "chat", Kind: KindChat, Role: "user", Order: 100, Enabled: true, Level: LevelTrim,
 		},
 	}

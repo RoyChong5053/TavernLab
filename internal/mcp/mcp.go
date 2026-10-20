@@ -157,6 +157,23 @@ func (c *Client) Store(ctx context.Context, text, collection string, metadata ma
 	return c.CallTool(ctx, "store_memory", args)
 }
 
+// WebSearch calls web_search and returns the provider's answer verbatim.
+//
+// No provider is named: the server has a default one, so a caller that only
+// wants "search the web" does not have to know which services are configured.
+// The result is also vectorized on the server side, which is what lets a
+// later turn recall the same material through the ordinary RAG path.
+func (c *Client) WebSearch(ctx context.Context, query string, count int) (string, error) {
+	if strings.TrimSpace(query) == "" {
+		return "", fmt.Errorf("empty query")
+	}
+	args := map[string]any{"query": query}
+	if count > 0 {
+		args["count"] = count
+	}
+	return c.CallTool(ctx, "web_search", args)
+}
+
 // splitCollectionCSV turns "a, b, a" into ["a", "b"] (trim + dedupe).
 func splitCollectionCSV(s string) []string {
 	var ids []string

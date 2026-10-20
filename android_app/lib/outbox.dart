@@ -47,6 +47,8 @@ class OutboxItem {
     this.state = OutboxState.queued,
     this.lastError,
     this.nextAttemptAt = 0,
+    this.webSearchMode = '',
+    this.webSearchQuery = '',
   });
 
   final String id;
@@ -62,6 +64,11 @@ class OutboxItem {
   OutboxState state;
   String? lastError;
   int nextAttemptAt; // epoch ms; 0 = send immediately
+
+  /// The /web_search command that travels with this turn, if any. Empty mode
+  /// means no command: the turn is an ordinary message.
+  String webSearchMode;
+  String webSearchQuery;
 
   bool get isImageOnly => text.trim().isEmpty && images.isNotEmpty;
 
@@ -88,6 +95,8 @@ class OutboxItem {
         'state': state.name,
         'last_error': lastError,
         'next_attempt_at': nextAttemptAt,
+        'web_search_mode': webSearchMode,
+        'web_search_query': webSearchQuery,
       };
 
   static OutboxItem? fromJson(Map<String, dynamic> j) {
@@ -103,6 +112,8 @@ class OutboxItem {
       createdAt:
           DateTime.tryParse((j['created_at'] ?? '').toString()) ?? DateTime.now(),
       attempts: (j['attempts'] as num?)?.toInt() ?? 0,
+      webSearchMode: (j['web_search_mode'] ?? '').toString(),
+      webSearchQuery: (j['web_search_query'] ?? '').toString(),
       state: OutboxState.values.firstWhere(
         (s) => s.name == (j['state'] ?? '').toString(),
         orElse: () => OutboxState.queued,
@@ -304,6 +315,8 @@ class Outbox {
     required String session,
     required String text,
     required List<String> imageDataUrls,
+    String webSearchMode = '',
+    String webSearchQuery = '',
   }) async {
     final paths = <String>[];
     for (final u in imageDataUrls) {
@@ -316,6 +329,8 @@ class Outbox {
       text: text,
       images: paths,
       createdAt: DateTime.now(),
+      webSearchMode: webSearchMode,
+      webSearchQuery: webSearchQuery,
     );
     items.insert(0, item);
     while (items.length > kOutboxMax) {

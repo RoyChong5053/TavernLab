@@ -729,6 +729,7 @@ function renderModules() {
           <label>role <select data-id="${m.id}" data-k="role">${roleOpts}</select></label>
           <label>level <select data-id="${m.id}" data-k="level" title="Eviction tier">${levelOpts}</select></label>
           <label>priority <input type="number" data-id="${m.id}" data-k="evict_priority" value="${m.evict_priority ?? ''}" placeholder="auto" style="width:64px"></label>
+          ${m.kind === 'web_search' ? `<label title="How many turns the raw search result stays in the context, counted from the turn the search ran on. 1 = that turn only; the vectorized copy carries it further.">keep turns <input type="number" min="1" max="20" data-id="${m.id}" data-k="keep_turns" value="${m.keep_turns || 1}" style="width:64px"></label>` : ''}
           ${m.collection ? `<span class="meta">collection: ${esc(m.collection)}</span>` : ''}
         </div>
       </details>`;
@@ -746,6 +747,10 @@ function renderModules() {
       else if (k === 'evict_priority') {
         const v = inp.value.trim();
         if (v === '') delete m.evict_priority; else m.evict_priority = +v;
+      }
+      else if (k === 'keep_turns') {
+        const v = +inp.value;
+        m.keep_turns = v > 0 ? v : 1;
       } else m[k] = inp.value;
       scheduleModuleSave();
     };
@@ -876,7 +881,7 @@ function renderMsg(role, text, who, prepend, images, id, time, mood) {
   content.className = 'msg-content';
   const w = document.createElement('div');
   w.className = 'who';
-  const defaultWho = role === 'user' ? (settings.user_name || 'You') : role === 'assistant' ? settings.char : (role === 'distilled_memory' ? 'Distilled Memory' : 'System');
+  const defaultWho = role === 'user' ? (settings.user_name || 'You') : role === 'assistant' ? settings.char : (role === 'distilled_memory' ? 'Distilled Memory' : role === 'web_search' ? 'Web Search' : 'System');
   const nameEl = document.createElement('span');
   nameEl.className = 'who-name';
   nameEl.textContent = who || defaultWho;
@@ -1138,6 +1143,72 @@ $('#img-file').onchange = async (e) => {
 const REGEN_COMMANDS = new Set(['/regenerate', '/regen']);
 function isRegenCommand(t) { return REGEN_COMMANDS.has((t || '').trim().toLowerCase()); }
 
+/* ---------- /web_search command ---------- */
+// The command is not a message. Typing it turns it into a chip above the
+// composer, the way an attached photo looks, and the message that follows is
+// what gets sent. The server turns the chip into an MCP web_search call and
+// drops the raw result into the Web Search module.
+//
+//   /web_search                      on, no query: just add web_cache to recall
+//   /web_search off                  take web_cache out of recall
+//   /web_search on "some query"      search, and add web_cache to recall
+const WEB_SEARCH_CMD = '/web_search';
+let pendingWebSearch = null;   // {mode, query} — travels with the next message
+
+// parseWebSearch reads a /web_search command out of the composer text.
+// It returns null when the text is not a command.
+function parseWebSearch(raw) {
+  const t = (raw || '').trim();
+  if (t.length < WEB_SEARCH_CMD.length) return null;
+  if (t.slice(0, WEB_SEARCH_CMD.length).toLowerCase() !== WEB_SEARCH_CMD) return null;
+  const rest0 = t.slice(WEB_SEARCH_CMD.length);
+  // The command name has to end here: "/web_searchfoo" is not a command.
+  if (rest0 && !/^[\s]/.test(rest0)) return null;
+  const rest = rest0.trim();
+  if (!rest) return { mode: 'on', query: '' };
+  const m = rest.match(/^(\S+)\s*([\s\S]*)$/);
+  const word = m[1].toLowerCase();
+  if (word === 'on' || word === 'off') {
+    return { mode: word, query: unquoteCmd(m[2].trim()) };
+  }
+  // No mode keyword: the rest is the query.
+  return { mode: 'on', query: unquoteCmd(rest) };
+}
+
+function unquoteCmd(s) {
+  s = (s || '').trim();
+  if (s.length >= 2) {
+    const a = s[0], b = s[s.length - 1];
+    if ((a === '"' && b === '"') || (a === "'" && b === "'")) return s.slice(1, -1).trim();
+  }
+  return s;
+}
+
+// webSearchLabel is the chip's text.
+function webSearchLabel(cmd) {
+  if (!cmd) return '';
+  if (cmd.mode === 'off') return 'web_search off';
+  return cmd.query ? `web_search on · "${cmd.query}"` : 'web_search on';
+}
+
+// renderCmdPreview draws the chip. A preview (live, while typing) is shown
+// dimmed; a committed one is the thing that travels with the next message.
+function renderCmdPreview(liveText) {
+  const box = $('#cmd-preview');
+  if (!box) return;
+  const live = liveText ? parseWebSearch(liveText) : null;
+  const cmd = pendingWebSearch || live;
+  if (!cmd) { box.classList.add('hidden'); box.innerHTML = ''; return; }
+  box.classList.remove('hidden');
+  const isLive = !pendingWebSearch && !!live;
+  const icon = cmd.mode === 'off' ? '🔕' : '🔍';
+  box.innerHTML = `<div class="cmd-chip${isLive ? ' live' : ''}">` +
+    `<span class="cmd-label">${icon} ${esc(webSearchLabel(cmd))}</span>` +
+    (isLive ? '' : '<button title="Remove">✕</button>') + '</div>';
+  const btn = box.querySelector('button');
+  if (btn) btn.onclick = () => { pendingWebSearch = null; renderCmdPreview(); };
+}
+
 async function send(regen = false) {
   const ta = $('#input');
   const text = ta.value.trim();
@@ -1145,7 +1216,22 @@ async function send(regen = false) {
   // assistant reply first, so the partial leaves the context and a fresh
   // reply is generated. No new user bubble is added.
   if (!regen && isRegenCommand(text)) { await send(true); return; }
+  // /web_search: a command, not a message. It becomes a chip above the
+  // composer and waits there; the message typed next travels with it.
+  if (!regen) {
+    const cmd = parseWebSearch(text);
+    if (cmd) {
+      pendingWebSearch = cmd;
+      ta.value = '';
+      growComposer();
+      renderCmdPreview();
+      toast('/web_search ' + cmd.mode + (cmd.query ? ' · "' + cmd.query + '"' : '') + ' — now type your message and send');
+      return;
+    }
+  }
   const imgs = regen ? [] : pendingImages.slice();
+  // A pending /web_search chip travels with a message; the chip alone is not
+  // a turn, so there has to be something to send.
   if (!regen && !text && !imgs.length) return;
   if (regen) {
     const ais = [...document.querySelectorAll('#chat .msg.ai')];
@@ -1167,6 +1253,11 @@ async function send(regen = false) {
   const body = regen
     ? { model: settings.model || undefined, session: settings.char, regenerate: true, stream, modules, context: ctxCfg(), max_tokens: maxTokens }
     : { model: settings.model || undefined, session: settings.char, text, images: imgs, stream, modules, context: ctxCfg(), max_tokens: maxTokens };
+  if (!regen && pendingWebSearch) {
+    body.web_search = { mode: pendingWebSearch.mode, query: pendingWebSearch.query };
+    pendingWebSearch = null;
+    renderCmdPreview();
+  }
   try {
       if (stream) {
       const r = await api('/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
@@ -1274,7 +1365,13 @@ function growComposer() {
   ta.style.height = 'auto';
   ta.style.height = Math.min(200, ta.scrollHeight) + 'px';
 }
-$('#input').addEventListener('input', growComposer);
+$('#input').addEventListener('input', () => {
+  growComposer();
+  // Live preview of a /web_search command: the chip appears while the user
+  // is still typing, so it is obvious the text is a command and not a
+  // message.
+  renderCmdPreview($('#input').value);
+});
 $('#input').addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); asyncAction($('#btn-send'), send); }
 });

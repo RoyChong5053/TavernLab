@@ -153,6 +153,15 @@ body[data-theme="st-dark"] .msg.user{background:rgba(125,211,252,.06)}
 .icon-btn{width:38px;height:38px;flex:none;font-size:20px;line-height:1;padding:0;border-radius:12px}
 .img-preview{display:flex;gap:6px;flex-wrap:wrap}
 .img-preview.hidden{display:none}
+/* The /web_search chip: a command waiting above the composer, shaped like
+   the photo attachment next to it. A live preview (still being typed) is
+   dimmed, so it never looks like something already queued. */
+.cmd-preview{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:6px}
+.cmd-preview.hidden{display:none}
+.cmd-chip{display:inline-flex;align-items:center;gap:8px;border:1px solid var(--line);border-radius:10px;padding:5px 10px;font-size:12px;background:rgba(0,0,0,.25)}
+.cmd-chip.live{opacity:.55;font-style:italic}
+.cmd-chip .cmd-label{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:min(46ch,60vw)}
+.cmd-chip button{border-radius:8px;padding:0 6px;font-size:11px}
 .img-chip{position:relative;width:56px;height:56px;border-radius:10px;overflow:hidden;border:1px solid var(--line)}
 .img-chip img{width:100%;height:100%;object-fit:cover}
 .img-chip button{position:absolute;top:0;right:0;border-radius:0 0 0 8px;padding:0 5px;font-size:11px;background:rgba(0,0,0,.6)}

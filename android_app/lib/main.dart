@@ -196,6 +196,59 @@ bool chatAllowed = true;
 
 final user = types.User(id: const Uuid().v4());
 final assistant = types.User(id: const Uuid().v4());
+/// The transcript note a /web_search command leaves behind. It is not a
+/// message from anybody: it records what the server did on the turn, for the
+/// human reading the chat.
+final websearch = types.User(id: const Uuid().v4());
+
+/// A parsed /web_search command.
+class WebSearchCmd {
+  WebSearchCmd(this.mode, this.query);
+  /// "on" or "off".
+  final String mode;
+  /// The search text; empty means "no search, just switch the collection".
+  final String query;
+
+  String get label => mode == 'off'
+      ? 'web_search off'
+      : (query.isEmpty ? 'web_search on' : 'web_search on · "$query"');
+}
+
+/// The /web_search command waiting above the composer. It travels with the
+/// next message that is sent.
+WebSearchCmd? pendingWebSearch;
+
+/// Read a /web_search command out of the composer text. Returns null when
+/// the text is not a command. The rules match the server's parser.
+WebSearchCmd? parseWebSearch(String raw) {
+  const name = '/web_search';
+  final t = raw.trim();
+  if (t.length < name.length) return null;
+  if (t.substring(0, name.length).toLowerCase() != name) return null;
+  final rest0 = t.substring(name.length);
+  // The command name has to end here: "/web_searchfoo" is not a command.
+  if (rest0.isNotEmpty && !RegExp(r'^\s').hasMatch(rest0)) return null;
+  final rest = rest0.trim();
+  if (rest.isEmpty) return WebSearchCmd('on', '');
+  final m = RegExp(r'^(\S+)\s*([\s\S]*)$').firstMatch(rest);
+  if (m == null) return WebSearchCmd('on', '');
+  final word = m.group(1)!.toLowerCase();
+  if (word == 'on' || word == 'off') {
+    return WebSearchCmd(word, _unquoteCmd(m.group(2) ?? ''));
+  }
+  return WebSearchCmd('on', _unquoteCmd(rest));
+}
+
+String _unquoteCmd(String s) {
+  final t = s.trim();
+  if (t.length >= 2) {
+    final a = t[0], b = t[t.length - 1];
+    if ((a == '"' && b == '"') || (a == "'" && b == "'")) {
+      return t.substring(1, t.length - 1).trim();
+    }
+  }
+  return t;
+}
 
 bool settingsOpen = false;
 
@@ -390,6 +443,7 @@ Future<void> seedModelFromServer() async {
 /// Slash-command palette. Typing a leading "/" surfaces these in the composer
 /// (Telegram-bot style) so commands are discoverable instead of silent.
 const List<List<String>> kSlashCommands = [
+  ['/web_search', '搜索网页（可带查询词）'],
   ['/regenerate', '重新生成上一条回复'],
   ['/regen', '重新生成（简写）'],
   ['/重发', '重新发送上一条'],
@@ -463,8 +517,10 @@ List<types.Message> msgsFromServerList(
   for (final r in raw) {
     final m = r as Map<String, dynamic>;
     final role = (m["role"] ?? "user").toString();
-    if (role != "user" && role != "assistant") continue;
-    final author = role == "user" ? user : assistant;
+    if (role != "user" && role != "assistant" && role != "web_search") continue;
+    final author = role == "user"
+        ? user
+        : (role == "assistant" ? assistant : websearch);
     final text = (m["text"] ?? "").toString();
     final id = (m["id"] ?? const Uuid().v4()).toString();
     if (text.isNotEmpty) {
@@ -938,6 +994,11 @@ Future<void> sendTurn(OutboxItem item) async {
         "stream": true,
         "session": sess,
         "client_msg_id": item.id,
+        if (item.webSearchMode.isNotEmpty)
+          "web_search": {
+            "mode": item.webSearchMode,
+            "query": item.webSearchQuery,
+          },
         "messages": [
           {
             "role": "user",
@@ -1684,7 +1745,7 @@ void startEvents() {
             // Only roles the list actually renders trigger a re-sync;
             // a background distilled_memory row would otherwise replace the
             // whole list for a message that never appears on screen.
-            if (role == "user" || role == "assistant") {
+            if (role == "user" || role == "assistant" || role == "web_search") {
               // A local stream owns its session's list; the poller (or the
               // send's own reconcile) picks up server truth once it ends.
               if (liveMsgBySession.containsKey(sess)) return;
@@ -2353,6 +2414,17 @@ class _MainAppState extends State<MainApp> with WidgetsBindingObserver {
                         return Builder(builder: (innerCtx) {
                           final bool isUser =
                               message.author.id == user.id;
+                          // The /web_search record is a transcript note:
+                          // a centred dim line, not a chat bubble.
+                          if (message.author.id == websearch.id) {
+                            return Container(
+                              width: double.infinity,
+                              alignment: Alignment.center,
+                              padding: const EdgeInsets.symmetric(
+                                  vertical: 4, horizontal: 12),
+                              child: Opacity(opacity: 0.62, child: child),
+                            );
+                          }
                           final th =
                               InheritedChatTheme.of(innerCtx).theme;
                           final double sw =
@@ -2705,11 +2777,51 @@ class _MainAppState extends State<MainApp> with WidgetsBindingObserver {
                       listBottomWidget: () {
                         final slash = shouldShowSlashMenu(composer.text);
                         final hasImg = pendingImages.isNotEmpty;
-                        if (!slash && !hasImg) return null;
+                        final cmd = pendingWebSearch;
+                        if (!slash && !hasImg && cmd == null) return null;
                         return Column(
                           mainAxisSize: MainAxisSize.min,
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
+                            if (cmd != null)
+                              Container(
+                                margin: const EdgeInsets.only(
+                                    left: 12, right: 12, top: 6, bottom: 2),
+                                alignment: Alignment.centerLeft,
+                                child: Container(
+                                  padding: const EdgeInsets.symmetric(
+                                      horizontal: 10, vertical: 5),
+                                  decoration: BoxDecoration(
+                                    borderRadius: BorderRadius.circular(10),
+                                    border: Border.all(
+                                        color: Theme.of(context)
+                                            .dividerColor),
+                                  ),
+                                  child: Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      Flexible(
+                                        child: Text(
+                                          '${cmd.mode == 'off' ? '🔕' : '🔍'} ${cmd.label}',
+                                          style: const TextStyle(fontSize: 12),
+                                          overflow: TextOverflow.ellipsis,
+                                        ),
+                                      ),
+                                      const SizedBox(width: 8),
+                                      InkWell(
+                                        onTap: () {
+                                          HapticFeedback.selectionClick();
+                                          setState(() {
+                                            pendingWebSearch = null;
+                                          });
+                                        },
+                                        child: const Text('✕',
+                                            style: TextStyle(fontSize: 12)),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              ),
                             if (slash)
                               Container(
                                 margin: const EdgeInsets.only(
@@ -2843,6 +2955,17 @@ class _MainAppState extends State<MainApp> with WidgetsBindingObserver {
                           await regenerateTurn();
                           return;
                         }
+                        final WebSearchCmd? cmd = parseWebSearch(text);
+                        if (cmd != null) {
+                          // A command, not a message. It becomes a chip above
+                          // the composer and waits there; the message typed
+                          // next travels with it.
+                          HapticFeedback.selectionClick();
+                          setState(() {
+                            pendingWebSearch = cmd;
+                          });
+                          return;
+                        }
 
                         // The library clears the composer synchronously right
                         // after this callback, so anything rejected from here on
@@ -2871,16 +2994,20 @@ class _MainAppState extends State<MainApp> with WidgetsBindingObserver {
                         // backoff, and reports the real reason (401 / 400 /
                         // network) from the actual response.
                         final id = const Uuid().v4();
+                        final WebSearchCmd? cmd2 = pendingWebSearch;
                         await Outbox.instance.enqueue(
                           prefs!,
                           id: id,
                           session: currentChar,
                           text: text,
                           imageDataUrls: imgs,
+                          webSearchMode: cmd2?.mode ?? '',
+                          webSearchQuery: cmd2?.query ?? '',
                         );
                         setState(() {
                           sendable = false;
                           pendingImages.clear();
+                          pendingWebSearch = null;
                         });
                         // Render the turn straight away; the queue owns its
                         // lifecycle from here. Own send always follows tail.

@@ -130,6 +130,18 @@ func NewID() string {
 	return hex.EncodeToString(b)
 }
 
+// isNoteRole reports whether a row is a transcript note: a record of
+// something the server did on a turn. Notes are kept for the human reading
+// the transcript and left out of the prompt, so they never count as the
+// user message of a turn.
+func isNoteRole(role string) bool {
+	switch role {
+	case "user", "assistant", "system":
+		return false
+	}
+	return true
+}
+
 // AppendChat appends one message and returns the stored row (with id/time)
 // so callers can broadcast it to SSE/ntfy subscribers. images are media
 // paths relative to the character package.
@@ -324,9 +336,18 @@ func (s *Store) DropTrailingAssistant(session string) (lastUser ChatMessage, rem
 	}
 	removed = append(removed, all[cut:]...)
 	kept := all[:cut]
-	if len(kept) > 0 && kept[len(kept)-1].Role == "user" {
-		lastUser = kept[len(kept)-1]
-		hasUser = true
+	// The last user row can sit behind a transcript note (the /web_search
+	// record). The note stays — it is part of the transcript — but the turn
+	// it belongs to is still the user message.
+	for i := len(kept) - 1; i >= 0; i-- {
+		if kept[i].Role == "user" {
+			lastUser = kept[i]
+			hasUser = true
+			break
+		}
+		if !isNoteRole(kept[i].Role) {
+			break // something else is in the way; do not guess
+		}
 	}
 	if len(removed) == 0 {
 		return lastUser, nil, hasUser, nil

@@ -300,6 +300,17 @@ func renderModules(root, session, userName string, modules []engine.Module) []en
 			} else {
 				out[i].Content = state
 			}
+		case engine.KindWebSearch:
+			// The content is set by the caller before this call: it is the
+			// raw result of the search that ran on this turn. Empty means
+			// no search ran, and the module is left unresolved so the
+			// engine drops it instead of sending a literal placeholder.
+			if out[i].Content == "" {
+				continue
+			}
+			if strings.Contains(rendered, "{{web_search}}") {
+				out[i].Content = strings.ReplaceAll(rendered, "{{web_search}}", out[i].Content)
+			}
 		default:
 			// rag/chat/distilled_log are resolved elsewhere; keep any resolved
 			// Content the caller already set (e.g. preview overrides).
@@ -323,7 +334,7 @@ func normalizeModules(modules []engine.Module) []engine.Module {
 			m.Level = defaultLevel(m)
 		}
 		switch m.Kind {
-		case engine.KindChat, engine.KindRAG, engine.KindDistilledLog:
+		case engine.KindChat, engine.KindRAG, engine.KindDistilledLog, engine.KindWebSearch:
 			m.Level = engine.LevelTrim
 		case engine.KindDistilledState:
 			m.Level = engine.LevelLocked
@@ -338,7 +349,7 @@ func normalizeModules(modules []engine.Module) []engine.Module {
 // Kind existed).
 func inferKind(id string) string {
 	switch id {
-	case "system", "time_anchor", "character", "distilled_state", "distilled_log", "rag", "chat":
+	case "system", "time_anchor", "character", "distilled_state", "distilled_log", "rag", "chat", "web_search":
 		return id
 	case "rag_mcp", "rag_vectra":
 		return engine.KindRAG

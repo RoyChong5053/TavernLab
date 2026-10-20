@@ -52,7 +52,11 @@ type Module struct {
 	// next tier is touched. nil = infer from Kind so heterogeneous lists
 	// never share one 0..1 scale (the "average everyone" bug).
 	EvictPriority *int `json:"evict_priority,omitempty"`
-	Budget        Budget `json:"budget"`
+	// KeepTurns is how many turns a one-shot web_search result stays in
+	// the context, counted from the turn the search ran on. 0 = that turn
+	// only. Only meaningful for the web_search kind.
+	KeepTurns int    `json:"keep_turns,omitempty"`
+	Budget    Budget `json:"budget"`
 	// Content is resolved text for this turn (after source fetch +
 	// template render). Empty means "use Template as-is" or "filled from a
 	// list source at assemble time".

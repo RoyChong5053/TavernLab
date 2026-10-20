@@ -43,15 +43,16 @@ import (
 	"github.com/RoyChong5053/TavernLab/internal/settings"
 	"github.com/RoyChong5053/TavernLab/internal/store"
 	"github.com/RoyChong5053/TavernLab/internal/vectorize"
+	"github.com/RoyChong5053/TavernLab/internal/websearch"
 )
 
 //go:embed web
 var webFS embed.FS
 
 type Config struct {
-	Port          int
-	DataRoot      string
-	Upstream      string // one-api base URL (startup snapshot; live value in runtimeSettings)
+	Port           int
+	DataRoot       string
+	Upstream       string // one-api base URL (startup snapshot; live value in runtimeSettings)
 	APIKey         string
 	DefaultModules []engine.Module
 	Ctx            engine.ContextConfig
@@ -283,9 +284,9 @@ func main() {
 
 	cfg := Config{
 		Port: *port, DataRoot: *data, Upstream: rt.get().Upstream,
-		APIKey:        rt.get().APIKey,
+		APIKey:         rt.get().APIKey,
 		DefaultModules: engine.DefaultModules(),
-		Ctx:           ctxFromSettings(rt.get()),
+		Ctx:            ctxFromSettings(rt.get()),
 	}
 	st := store.New(cfg.DataRoot)
 	st.MigrateLegacyChats()
@@ -688,7 +689,7 @@ func main() {
 		if err := json.Unmarshal(b, &ms); err != nil {
 			return normalizeModules(cfg.DefaultModules)
 		}
-		return normalizeModules(ms)
+		return normalizeModules(seedMissingKinds(ms, cfg.DefaultModules))
 	}
 	mux.HandleFunc("/api/modules", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
@@ -740,6 +741,7 @@ func main() {
 				turns = chatToTurns(cfg.DataRoot, session, all)
 			}
 		}
+		setWebSearchContent(modules, webSearchContent(session, userTurnCount(turns), webSearchKeepTurns(modules)))
 		modules = renderModules(cfg.DataRoot, session, rt.get().UserName, modules)
 		ragItems, memInfo := resolveMCP(r.Context(), rt.get(), cfg.DataRoot, session, turns)
 		res := engine.Assemble(engine.Input{Modules: modules, Cfg: ctx, Turns: turns, Lists: listInputs(modules, ragItems, cfg.DataRoot, session)})
@@ -771,6 +773,9 @@ func main() {
 			// re-runs the last user turn (no new user row is written). The
 			// `/regenerate` command in the web UI drives this.
 			Regenerate bool `json:"regenerate"`
+			// WebSearch is set when the composer held a /web_search command:
+			// the mode ("on"/"off") and the query to search, if any.
+			WebSearch *webSearchRequest `json:"web_search"`
 		}
 		_ = json.Unmarshal(body, &in)
 		modules := in.Modules
@@ -831,6 +836,18 @@ func main() {
 			// classic OpenAI path: convert caller messages to turns
 			turns = rawToTurns(in.Messages)
 		}
+		// /web_search: search the web, and/or switch the web collection into
+		// this character's recall set. The raw result is injected into the
+		// web_search module for as many turns as that module asks for.
+		var webInfo map[string]any
+		if in.WebSearch != nil {
+			cmd := websearch.Command{Mode: in.WebSearch.Mode, Query: in.WebSearch.Query}
+			if cmd.Mode == "" {
+				cmd.Mode = websearch.ModeOn
+			}
+			webInfo = handleWebSearchTurn(r.Context(), st, s, cfg.DataRoot, session, cmd, turns)
+		}
+		setWebSearchContent(modules, webSearchContent(session, userTurnCount(turns), webSearchKeepTurns(modules)))
 		modules = renderModules(cfg.DataRoot, session, s.UserName, modules)
 		model := in.Model
 		if model == nil || model == "" {
@@ -838,6 +855,11 @@ func main() {
 		}
 		setActiveModel(fmt.Sprint(model))
 		ragItems, memInfo := resolveMCP(r.Context(), s, cfg.DataRoot, session, turns)
+		if webInfo != nil {
+			// Folded into the memory info so the audit shows what the
+			// /web_search command did on this turn.
+			memInfo["web_search"] = webInfo
+		}
 		res := engine.Assemble(engine.Input{Modules: modules, Cfg: ctx, Turns: turns, Lists: listInputs(modules, ragItems, cfg.DataRoot, session)})
 
 		// Build upstream body from assembled messages (attach fresh images).
@@ -1698,7 +1720,9 @@ func main() {
 			// it is not sure landed, so the same id can arrive twice; the store
 			// returns the original row instead of writing a second copy.
 			ClientMsgID string `json:"client_msg_id"`
-			Messages    []struct {
+			// WebSearch is set when the composer held a /web_search command.
+			WebSearch *webSearchRequest `json:"web_search"`
+			Messages  []struct {
 				Role    string   `json:"role"`
 				Content string   `json:"content"`
 				Images  []string `json:"images"`
@@ -1812,7 +1836,16 @@ func main() {
 		}
 		all, _ := st.LoadAll(session)
 		turns := chatToTurns(cfg.DataRoot, session, all)
-		modules := renderModules(cfg.DataRoot, session, s.UserName, loadModules())
+		mods := loadModules()
+		if in.WebSearch != nil {
+			cmd := websearch.Command{Mode: in.WebSearch.Mode, Query: in.WebSearch.Query}
+			if cmd.Mode == "" {
+				cmd.Mode = websearch.ModeOn
+			}
+			handleWebSearchTurn(r.Context(), st, s, cfg.DataRoot, session, cmd, turns)
+		}
+		setWebSearchContent(mods, webSearchContent(session, userTurnCount(turns), webSearchKeepTurns(mods)))
+		modules := renderModules(cfg.DataRoot, session, s.UserName, mods)
 		setActiveModel(model)
 		ragItems, memInfo := resolveMCP(r.Context(), s, cfg.DataRoot, session, turns)
 		res := engine.Assemble(engine.Input{Modules: modules, Cfg: ctxFromSettings(s), Turns: turns, Lists: listInputs(modules, ragItems, cfg.DataRoot, session)})
