@@ -1837,17 +1837,21 @@ func main() {
 		all, _ := st.LoadAll(session)
 		turns := chatToTurns(cfg.DataRoot, session, all)
 		mods := loadModules()
+		var webInfo map[string]any
 		if in.WebSearch != nil {
 			cmd := websearch.Command{Mode: in.WebSearch.Mode, Query: in.WebSearch.Query}
 			if cmd.Mode == "" {
 				cmd.Mode = websearch.ModeOn
 			}
-			handleWebSearchTurn(r.Context(), st, s, cfg.DataRoot, session, cmd, turns)
+			webInfo = handleWebSearchTurn(r.Context(), st, s, cfg.DataRoot, session, cmd, turns)
 		}
 		setWebSearchContent(mods, webSearchContent(session, userTurnCount(turns), webSearchKeepTurns(mods)))
 		modules := renderModules(cfg.DataRoot, session, s.UserName, mods)
 		setActiveModel(model)
 		ragItems, memInfo := resolveMCP(r.Context(), s, cfg.DataRoot, session, turns)
+		if webInfo != nil {
+			memInfo["web_search"] = webInfo
+		}
 		res := engine.Assemble(engine.Input{Modules: modules, Cfg: ctxFromSettings(s), Turns: turns, Lists: listInputs(modules, ragItems, cfg.DataRoot, session)})
 		upMsgs := buildUpMessages(res.Messages, upImages)
 		mt := s.ReplyReserve
