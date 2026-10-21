@@ -124,3 +124,62 @@ func TestDropTrailingAssistantNoUser(t *testing.T) {
 		t.Fatalf("assistant-only: hasUser=%v err=%v", hasUser, err)
 	}
 }
+
+// A /web_search command leaves a transcript note between the user row and the
+// reply. The reply still belongs to that turn, so a retry must find it and
+// replay it instead of running the whole turn again.
+func TestFindTurnSkipsWebSearchNote(t *testing.T) {
+	s := New(t.TempDir())
+	writeChat(t, s, "test",
+		`{"id":"u1","role":"user","text":"hi","time":"t"}`,
+		`{"id":"n1","role":"web_search","text":"🔍 web_search on · \"x\"","time":"t"}`,
+		`{"id":"u1-r","role":"assistant","text":"hello","time":"t"}`,
+	)
+
+	row, reply, hasRow, hasReply := s.FindTurn("test", "u1")
+	if !hasRow || row.ID != "u1" {
+		t.Fatalf("row: hasRow=%v row=%+v", hasRow, row)
+	}
+	if !hasReply || reply.ID != "u1-r" || reply.Text != "hello" {
+		t.Fatalf("reply: hasReply=%v reply=%+v", hasReply, reply)
+	}
+}
+
+// A user row with only a note after it (the generation never stored a reply)
+// must still report "no reply", so a genuine retry runs the turn.
+func TestFindTurnNoteWithoutReply(t *testing.T) {
+	s := New(t.TempDir())
+	writeChat(t, s, "test",
+		`{"id":"u1","role":"user","text":"hi","time":"t"}`,
+		`{"id":"n1","role":"web_search","text":"🔍 web_search on · \"x\"","time":"t"}`,
+	)
+
+	_, _, hasRow, hasReply := s.FindTurn("test", "u1")
+	if !hasRow {
+		t.Fatal("expected the user row to be found")
+	}
+	if hasReply {
+		t.Fatal("expected no reply: the generation never stored one")
+	}
+}
+
+// A note after the reply must not confuse the scan either, and a note that
+// follows one turn must not be mistaken for the next turn's reply.
+func TestFindTurnNoteBetweenTurns(t *testing.T) {
+	s := New(t.TempDir())
+	writeChat(t, s, "test",
+		`{"id":"u1","role":"user","text":"hi","time":"t"}`,
+		`{"id":"u1-r","role":"assistant","text":"hello","time":"t"}`,
+		`{"id":"n1","role":"web_search","text":"🔍 web_search on · \"x\"","time":"t"}`,
+		`{"id":"u2","role":"user","text":"again","time":"t"}`,
+	)
+
+	_, reply, hasRow, hasReply := s.FindTurn("test", "u1")
+	if !hasRow || !hasReply || reply.Text != "hello" {
+		t.Fatalf("u1: hasRow=%v hasReply=%v reply=%+v", hasRow, hasReply, reply)
+	}
+	_, reply2, hasRow2, hasReply2 := s.FindTurn("test", "u2")
+	if !hasRow2 || hasReply2 || reply2.Text != "" {
+		t.Fatalf("u2: hasRow=%v hasReply=%v reply=%+v", hasRow2, hasReply2, reply2)
+	}
+}

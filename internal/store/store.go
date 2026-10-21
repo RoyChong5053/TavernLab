@@ -237,9 +237,17 @@ func (s *Store) tailHasID(session, id string) (ChatMessage, bool) {
 }
 
 // findTurn locates the row with id in the session tail and reports the
-// assistant row that immediately follows it. A retried user turn with no
-// following reply means the previous attempt died mid-generation; one with a
-// reply means the turn is fully done and the caller must not generate again.
+// assistant row that belongs to it. A retried user turn with no reply means
+// the previous attempt died mid-generation; one with a reply means the turn
+// is fully done and the caller must not generate again.
+//
+// The reply is not always the very next row: a /web_search command leaves a
+// transcript note ("web_search" role) between the user row and the assistant
+// reply, because the note is written when the command runs and the reply
+// comes after the generation. Treating that note as "no reply" made the phone's
+// idempotent retry look unanswered, so the whole turn ran twice (a second
+// web_search, a second generation). Note rows are therefore skipped while
+// looking for the reply, exactly like DropTrailingAssistant does.
 // Caller must hold s.mu.
 func (s *Store) findTurn(session, id string) (row ChatMessage, next ChatMessage, hasRow, hasNext bool) {
 	if id == "" {
@@ -290,8 +298,18 @@ func (s *Store) findTurn(session, id string) (row ChatMessage, next ChatMessage,
 		if parsed[i].ID != id {
 			continue
 		}
-		if i+1 < len(parsed) && parsed[i+1].Role == "assistant" {
-			return parsed[i], parsed[i+1], true, true
+		// Scan forward for the reply. Transcript notes (web_search records)
+		// sit between the user row and the reply and do not end the turn.
+		for j := i + 1; j < len(parsed); j++ {
+			if parsed[j].Role == "assistant" {
+				return parsed[i], parsed[j], true, true
+			}
+			if parsed[j].Role == "user" {
+				break // the next turn starts here: this one has no reply
+			}
+			if !isNoteRole(parsed[j].Role) {
+				break // something unexpected: do not guess
+			}
 		}
 		return parsed[i], ChatMessage{}, true, false
 	}
