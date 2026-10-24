@@ -589,7 +589,7 @@ document.querySelectorAll('.nav button').forEach((b) => {
     document.getElementById('page-' + b.dataset.page).classList.add('on');
     document.body.classList.remove('nav-open');
     syncHamburger();
-    if (b.dataset.page === 'audit') refreshAudit();
+    if (b.dataset.page === 'audit') { refreshAudit(); refreshDistillAudit(); }
     if (b.dataset.page === 'chars') refreshChars();
     if (b.dataset.page === 'logs') openLogs(); else stopLogStream();
     if (b.dataset.page === 'gps') refreshGPS();
@@ -1486,6 +1486,46 @@ $('#btn-compile').onclick = () => asyncAction($('#btn-compile'), compile);
 $('#btn-audit-list').onclick = refreshAudit;
 $('#btn-audit-view').onclick = viewAudit;
 
+/* ---------- audit: distilled memory ---------- */
+// Shows the parameters and the exact prompt the extractor receives, plus what
+// the last run captured (cursor position, pending messages, vectorize state).
+// Without this the only way to debug distillation is guessing at settings.
+async function refreshDistillAudit() {
+  const sum = $('#distill-audit-summary');
+  if (!sum) return;
+  try {
+    const j = await (await api('/api/audit/distilled?session=' + encodeURIComponent(settings.char))).json();
+    const m = j.meta || {};
+    const state = j.enabled ? `every ${j.interval} user turns` : 'auto-distill off';
+    const last = m.last_run ? m.last_run.replace('T', ' ').replace(/\+.*$/, '') : 'never';
+    const vec = j.vectorize_enabled ? `on → ${j.vectorize_collection}` : 'off';
+    sum.innerHTML =
+      `<b>${esc(j.session)}</b> · ${esc(state)} · last run <b>${esc(last)}</b>` +
+      ` · status <b>${esc(m.last_status || '?')}</b> · runs ${m.runs || 0}` +
+      ` · ${j.days || 0} days / ${j.sheet_chars || 0} chars` +
+      `<br>captured: ${j.fresh_msgs || 0} message(s), ${j.fresh_user_turns || 0} user turn(s)` +
+      ` · last index ${m.last_index || 0}` +
+      ` · vectorize ${esc(vec)}${m.last_vectorize_error ? ' · ⚠ ' + esc(m.last_vectorize_error) : ''}`;
+    const params = $('#distill-audit-params');
+    if (params) {
+      params.textContent = [
+        'model ' + (j.model || '(main chat model)'),
+        'max_tokens ' + (j.max_tokens ?? '?'),
+        'max input msgs ' + (j.max_input_msgs ?? '?'),
+        'fact sheet cap ' + (j.max_chars ?? '?') + ' chars',
+        'entry cap ' + (j.max_entry_chars ?? '?'),
+        'recent logs ' + (j.recent_logs ?? '?'),
+        'vectorize ' + (j.vectorize_enabled ? 'on' : 'off') + ' → ' + (j.vectorize_collection || '(none)'),
+      ].join(' · ');
+    }
+    const pre = $('#distill-audit-prompt');
+    if (pre) pre.textContent = j.prompt || '(empty)';
+  } catch (e) {
+    sum.textContent = 'Failed to load distilled-memory audit: ' + e.message;
+  }
+}
+$('#btn-distill-audit-refresh') && ($('#btn-distill-audit-refresh').onclick = () => asyncAction($('#btn-distill-audit-refresh'), refreshDistillAudit));
+
 /* ---------- logs ---------- */
 let logSince = 0, logES = null;
 const LOG_RANK = { debug: 0, info: 1, warn: 2, error: 3 };
@@ -1755,8 +1795,8 @@ $('#char-file').onchange = async (e) => {
 // collections it RECALLS from (multi-select) and the SINGLE collection the
 // distiller WRITES into. Switching characters switches the whole setup, so this
 // page always shows the ACTIVE character's values — never a hidden global.
-let distillDefaultPrompt = '';
 let memAvailable = null; // cached /api/mcp/collections
+let memPromptDefault = ''; // built-in distill prompt, used to keep "untouched" = default
 
 async function ensureCollections() {
   if (memAvailable) return memAvailable;
@@ -1905,10 +1945,22 @@ async function loadMemoryProfile() {
     }
     if ($('#mem-distill-enabled')) $('#mem-distill-enabled').checked = !!dist.enabled;
     if ($('#mem-distill-interval')) $('#mem-distill-interval').value = dist.interval || 8;
+    // The prompt box always shows the prompt that will actually be sent: the
+    // character's own prompt when set, otherwise the built-in default. There is
+    // no hidden "default" state any more — clearing the box means "use default".
     if ($('#mem-distill-prompt')) {
-      $('#mem-distill-prompt').value = (dist.prompt && dist.prompt !== dist.default_prompt) ? dist.prompt : '';
+      $('#mem-distill-prompt').value = dist.prompt || dist.default_prompt || '';
     }
-    distillDefaultPrompt = dist.default_prompt || '';
+    memPromptDefault = dist.default_prompt || '';
+    if ($('#mem-distill-model')) {
+      const want = dist.model || '';
+      const sel = $('#mem-distill-model');
+      if (!sel.options.length || !Array.from(sel.options).some((o) => o.value === want)) {
+        sel.appendChild(new Option(want || '(main chat model)', want));
+      }
+      sel.value = want;
+    }
+    if ($('#mem-distill-tokens')) $('#mem-distill-tokens').value = dist.max_tokens || 8192;
     if ($('#mem-distill-meta')) {
       const state = dist.enabled
         ? (dist.need_turns > 0 ? `~${dist.need_turns} more user turns until auto-distill` : 'Ready')
@@ -1943,12 +1995,18 @@ async function saveMemoryGlobal() {
 }
 
 async function saveMemoryProfile() {
+  // The prompt box always shows the effective prompt (custom, or the built-in
+  // default when the character has none). Sending the default text verbatim
+  // back as "custom" would freeze it at today's default, so an untouched box
+  // still saves as empty = "use the built-in default".
+  const promptEl = $('#mem-distill-prompt');
+  const promptVal = promptEl ? promptEl.value : '';
   const body = {
     collections: selectedRecall(),
     write_collection: $('#mem-write') ? $('#mem-write').value : '',
     enabled: $('#mem-distill-enabled') ? $('#mem-distill-enabled').checked : true,
     interval: $('#mem-distill-interval') ? (+$('#mem-distill-interval').value || 8) : 8,
-    prompt: $('#mem-distill-prompt') ? $('#mem-distill-prompt').value : '',
+    prompt: promptVal === memPromptDefault ? '' : promptVal,
   };
   const r = await api('/api/characters/' + encodeURIComponent(settings.char) + '/profile', {
     method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
@@ -1983,11 +2041,25 @@ async function loadServerSettings() {
 }
 $('#btn-mem-save') && ($('#btn-mem-save').onclick = () => asyncAction($('#btn-mem-save'), () => saveMemoryGlobal()));
 $('#btn-mem-profile-save') && ($('#btn-mem-profile-save').onclick = () => asyncAction($('#btn-mem-profile-save'), () => saveMemoryProfile()));
-$('#btn-mem-prompt-default') && ($('#btn-mem-prompt-default').onclick = () => {
-  if ($('#mem-distill-prompt')) $('#mem-distill-prompt').value = distillDefaultPrompt;
-});
-$('#btn-mem-prompt-restore') && ($('#btn-mem-prompt-restore').onclick = () => {
-  if ($('#mem-distill-prompt')) $('#mem-distill-prompt').value = '';
+// Module settings that live in server settings.json (not the character
+// profile): persist on change so they behave like the other autosaved knobs.
+async function saveDistillModuleSetting(patch, label) {
+  const r = await api('/api/settings', {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(patch),
+  });
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  toast(label + ' saved');
+}
+['mem-distill-model', 'mem-distill-tokens', 'mem-maxchars'].forEach((id) => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('change', () => {
+    const patch = {};
+    let label = '';
+    if (id === 'mem-distill-model') { patch.distill_model = el.value.trim(); label = 'Distill model'; }
+    if (id === 'mem-distill-tokens') { patch.distill_max_tokens = +el.value || 0; label = 'Distill reply tokens'; }
+    if (id === 'mem-maxchars') { patch.distill_max_chars = +el.value || 0; label = 'Fact sheet char cap'; }
+    saveDistillModuleSetting(patch, label).catch((e) => toast('Save failed: ' + e.message, 'err'));
+  });
 });
 $('#btn-mem-distill-run') && ($('#btn-mem-distill-run').onclick = () => asyncAction($('#btn-mem-distill-run'), async () => {
   if ($('#mem-distill-meta')) $('#mem-distill-meta').textContent = 'Distilling… (may take a while, keep this page open)';
@@ -2128,6 +2200,19 @@ async function refreshModels() {
     sel.innerHTML = ids.map((id) => `<option value="${id}">${id}</option>`).join('');
     if (ids.includes(settings.model)) sel.value = settings.model;
     else if (ids.length) { setChatModel(ids[0], true); sel.value = ids[0]; }
+    // Same alias list feeds the dedicated distill-model picker. Keep the
+    // current value even if one-api no longer offers it, so a temporarily
+    // disabled alias stays visible instead of silently resetting.
+    const dsel = $('#mem-distill-model');
+    if (dsel) {
+      const cur = dsel.value;
+      dsel.innerHTML = '<option value="">(main chat model)</option>' +
+        ids.map((id) => `<option value="${id}">${id}</option>`).join('');
+      if (cur) {
+        if (!ids.includes(cur)) dsel.appendChild(new Option(cur + ' (not offered)', cur));
+        dsel.value = cur;
+      }
+    }
   } catch { /* silent while upstream is unreachable */ }
   checkModelStatus();
 }

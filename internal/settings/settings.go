@@ -44,6 +44,7 @@ type Settings struct {
 	DistillStateMaxDays  int    `json:"distill_state_max_days,omitempty"`  // max [USER STATE] days (default 30)
 	DistillMaxLogPerDay  int    `json:"distill_max_log_per_day,omitempty"` // max [LOG] entries per day (default 40)
 	DistillMaxEntryChars int    `json:"distill_max_entry_chars,omitempty"` // max chars per log entry (default 300)
+	DistillMaxTokens     int    `json:"distill_max_tokens,omitempty"`      // reply tokens per extraction (default 8192; thinking models spend it on reasoning)
 	DistillModel         string `json:"distill_model,omitempty"`           // empty = main model
 	DistillPrompt        string `json:"distill_prompt,omitempty"`          // empty = built-in default
 	// ChatModel is the single source of truth for the main chat model used by
@@ -105,6 +106,7 @@ func Defaults() Settings {
 		DistillStateMaxDays:  30,
 		DistillMaxLogPerDay:  40,
 		DistillMaxEntryChars: 300,
+		DistillMaxTokens:     8192,
 		DistillRecentLogs:    30,
 		DistillTmpKeep:       1000,
 		ChatModel:            "auto-chat",
@@ -214,6 +216,9 @@ func Load(root string) Settings {
 	}
 	if f.DistillMaxEntryChars > 0 {
 		s.DistillMaxEntryChars = f.DistillMaxEntryChars
+	}
+	if f.DistillMaxTokens > 0 {
+		s.DistillMaxTokens = f.DistillMaxTokens
 	}
 	if f.DistillModel != "" {
 		s.DistillModel = f.DistillModel

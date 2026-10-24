@@ -195,6 +195,9 @@ func (r *runtimeSettings) update(root string, patch map[string]any) settings.Set
 	if v, ok := patch["distill_max_entry_chars"].(float64); ok && v > 0 {
 		r.cur.DistillMaxEntryChars = int(v)
 	}
+	if v, ok := patch["distill_max_tokens"].(float64); ok && v > 0 {
+		r.cur.DistillMaxTokens = int(v)
+	}
 	if v, ok := patch["distill_model"]; ok {
 		if s, ok := v.(string); ok {
 			r.cur.DistillModel = s
@@ -424,8 +427,9 @@ func main() {
 				"distill_max_chars": s.DistillMaxChars, "distill_retain_days": s.DistillRetainDays,
 				"distill_state_max_days":  s.DistillStateMaxDays,
 				"distill_max_log_per_day": s.DistillMaxLogPerDay, "distill_max_entry_chars": s.DistillMaxEntryChars,
-				"distill_model":  s.DistillModel,
-				"distill_prompt": s.DistillPrompt, "distill_prompt_default": distill.DefaultPrompt,
+				"distill_max_tokens": s.DistillMaxTokens,
+				"distill_model":      s.DistillModel,
+				"distill_prompt":     s.DistillPrompt, "distill_prompt_default": distill.DefaultPrompt,
 				"distill_recent_logs":          s.DistillRecentLogs,
 				"distill_vectorize_enabled":    s.DistillVectorizeEnabled,
 				"distill_vectorize_collection": s.DistillVectorizeCollection, "distill_tmp_keep": s.DistillTmpKeep,
@@ -557,6 +561,10 @@ func main() {
 				}
 			}
 		}
+		maxTokens := s.DistillMaxTokens
+		if maxTokens <= 0 {
+			maxTokens = distillMaxTokens
+		}
 		writeJSON(w, map[string]any{
 			"session": session, "sheet": sheet, "sections": distill.Sections(cfg.DataRoot, session),
 			"meta":    distill.LoadMeta(cfg.DataRoot, session),
@@ -565,6 +573,7 @@ func main() {
 			"enabled": prof.Distill.Enabled, "interval": prof.Distill.Interval,
 			"max_chars":       s.DistillMaxChars,
 			"max_entry_chars": s.DistillMaxEntryChars,
+			"max_tokens":      maxTokens,
 			"recent_logs":     s.DistillRecentLogs,
 			"model":           s.DistillModel,
 			"prompt":          prompt, "default_prompt": distill.DefaultPrompt,
@@ -1399,6 +1408,63 @@ func main() {
 	mux.HandleFunc("/api/audit", func(w http.ResponseWriter, r *http.Request) {
 		ids, _ := st.ListAudits()
 		writeJSON(w, map[string]any{"ids": ids})
+	})
+	// Distilled-memory audit: what the extractor was asked to do, with what
+	// model/budget, and what the last run returned. Answers "what did the
+	// system actually capture and send to the API?" without digging through
+	// chat.jsonl or the process log.
+	mux.HandleFunc("/api/audit/distilled", func(w http.ResponseWriter, r *http.Request) {
+		s := rt.get()
+		session := store.CleanSession(firstNonEmpty(r.URL.Query().Get("session"), s.CurrentChar, "main"))
+		prof := profileFor(cfg.DataRoot, s, session)
+		interval := prof.Distill.Interval
+		if interval <= 0 {
+			interval = 8
+		}
+		maxTokens := s.DistillMaxTokens
+		if maxTokens <= 0 {
+			maxTokens = distillMaxTokens
+		}
+		meta := distill.LoadMeta(cfg.DataRoot, session)
+		// Captured window: everything after the cursor, bounded exactly like a
+		// real run would bound it.
+		freshMsgs, freshUsers := 0, 0
+		if all, err := st.LoadAll(session); err == nil {
+			start := meta.LastIndex
+			if start < 0 || start > len(all) {
+				start = 0
+			}
+			pending := all[start:]
+			if len(pending) > distillInputMaxMsgs {
+				pending = pending[len(pending)-distillInputMaxMsgs:]
+			}
+			freshMsgs = len(pending)
+			for _, m := range pending {
+				if m.Role == "user" {
+					freshUsers++
+				}
+			}
+		}
+		prompt := prof.Distill.Prompt
+		if prompt == "" {
+			prompt = distill.DefaultPrompt
+		}
+		sheet := distill.Load(cfg.DataRoot, session)
+		writeJSON(w, map[string]any{
+			"session": session, "enabled": prof.Distill.Enabled, "interval": interval,
+			"model":      firstNonEmpty(s.DistillModel, defaultChatModel(s)),
+			"max_tokens": maxTokens, "max_input_msgs": distillInputMaxMsgs,
+			"max_chars": s.DistillMaxChars, "max_entry_chars": s.DistillMaxEntryChars,
+			"retain_days": s.DistillRetainDays, "state_max_days": s.DistillStateMaxDays,
+			"max_log_per_day": s.DistillMaxLogPerDay, "recent_logs": s.DistillRecentLogs,
+			"vectorize_enabled":    s.DistillVectorizeEnabled,
+			"vectorize_collection": firstNonEmpty(writeCollection(cfg.DataRoot, s, session), "(none)"),
+			"prompt":               prompt, "default_prompt": distill.DefaultPrompt,
+			"prompt_is_default": prof.Distill.Prompt == "",
+			"meta":              meta,
+			"fresh_msgs":        freshMsgs, "fresh_user_turns": freshUsers,
+			"days": distill.DayCount(sheet), "sheet_chars": len([]rune(sheet)),
+		})
 	})
 	mux.HandleFunc("/api/audit/", func(w http.ResponseWriter, r *http.Request) {
 		rest := strings.TrimPrefix(r.URL.Path, "/api/audit/")
@@ -3057,6 +3123,10 @@ func runDistill(ctx context.Context, st *store.Store, client *http.Client, root 
 	if maxEntryChars <= 0 {
 		maxEntryChars = 300
 	}
+	maxTokens := s.DistillMaxTokens
+	if maxTokens <= 0 {
+		maxTokens = distillMaxTokens
+	}
 	all, err := st.LoadAll(session)
 	if err != nil {
 		return "", err
@@ -3103,14 +3173,24 @@ func runDistill(ctx context.Context, st *store.Store, client *http.Client, root 
 	}
 	prompt := applyMacros(promptTpl, time.Now(), firstNonEmpty(s.UserName, "user"))
 	model := firstNonEmpty(s.DistillModel, defaultChatModel(s))
+	userContent := distill.BuildUser(state, recentLogs, movement, timeline)
 	upBody, _ := json.Marshal(map[string]any{
 		"model":      model,
 		"stream":     false,
-		"max_tokens": distillMaxTokens,
+		"max_tokens": maxTokens,
 		"messages": []map[string]any{
 			{"role": "system", "content": prompt},
-			{"role": "user", "content": distill.BuildUser(state, recentLogs, movement, timeline)},
+			{"role": "user", "content": userContent},
 		},
+	})
+	// One structured record per run so the Audit page can show exactly what was
+	// captured and sent to the extractor (prompt/model/budget/input sizes)
+	// without having to guess from the chat log afterwards.
+	obs.Info("distill start", map[string]any{
+		"session": session, "model": model, "max_tokens": maxTokens,
+		"fresh_msgs": len(fresh), "prompt_chars": len(prompt), "input_chars": len(userContent),
+		"state_chars": len(state), "recent_logs": len(recentLogs),
+		"movement": movement != "", "force": force,
 	})
 	// Even with an explicit budget a weak/free channel can still cut the turn
 	// (finish_reason=length) or drop the [STATE]/[LOG] envelope, so retry once
@@ -3129,7 +3209,8 @@ func runDistill(ctx context.Context, st *store.Store, client *http.Client, root 
 		obs.Warn("distill attempt rejected", map[string]any{
 			"session": session, "model": model, "attempt": attempt,
 			"finish_reason": finish, "completion": usageCompletionTokens(usage),
-			"delta_len": len(delta), "excerpt": excerpt(delta, 200),
+			"delta_len": len(delta), "reasoning_len": replyReasoningLen(respBody),
+			"excerpt": excerpt(delta, 200),
 		})
 		if attempt == 2 {
 			if delta == "" {
@@ -3172,6 +3253,7 @@ func runDistill(ctx context.Context, st *store.Store, client *http.Client, root 
 	obs.Info("distill ok", map[string]any{
 		"session": session, "chars": len(final), "days": distill.DayCount(final),
 		"added": distill.DayCount(delta), "runs": meta.Runs, "model": model,
+		"max_tokens": maxTokens, "fresh_msgs": len(fresh),
 	})
 	return final, nil
 }
@@ -3303,6 +3385,33 @@ func replyFinish(respBody []byte) string {
 		}
 	}
 	return ""
+}
+
+// replyReasoningLen returns the length of a reasoning/thinking payload, which
+// OpenAI-compatible reasoning models put in message.reasoning_content (or
+// message.reasoning). It exists so a "finish=length, content empty" distill
+// failure can be told apart from "the model actually returned nothing".
+func replyReasoningLen(respBody []byte) int {
+	var resp map[string]any
+	_ = json.Unmarshal(respBody, &resp)
+	if resp == nil {
+		return 0
+	}
+	ch, _ := resp["choices"].([]any)
+	if len(ch) == 0 {
+		return 0
+	}
+	m, _ := ch[0].(map[string]any)
+	msg, _ := m["message"].(map[string]any)
+	if msg == nil {
+		return 0
+	}
+	for _, k := range []string{"reasoning_content", "reasoning"} {
+		if s, ok := msg[k].(string); ok && s != "" {
+			return len([]rune(s))
+		}
+	}
+	return 0
 }
 
 // respMap unmarshals an upstream/rebuilt body for flag inspection. Nil when

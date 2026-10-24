@@ -142,6 +142,17 @@
       <div id="audit-summary" class="glass budget"></div>
       <div id="audit-modules" class="glass pad"></div>
       <pre id="audit" class="glass audit"></pre>
+
+      <div class="glass pad">
+        <div class="row">
+          <b>Distilled Memory audit</b>
+          <button id="btn-distill-audit-refresh">Refresh</button>
+          <span class="meta">Exactly what the extractor was given: model, budget, prompt and the captured window.</span>
+        </div>
+        <div id="distill-audit-summary" class="budget">—</div>
+        <div id="distill-audit-params" class="meta"></div>
+        <pre id="distill-audit-prompt" class="preview-text"></pre>
+      </div>
     </section>
     <!-- MEMORY -->
     <section class="page" id="page-memory">
@@ -151,6 +162,24 @@
         <div class="row"><b id="mem-char-title">Current character profile</b><span id="mem-char-badges" class="membadges"></span></div>
         <div id="mem-char-warn" class="meta hidden"></div>
 
+        <b>Distilled Memory <span class="meta">module settings (pinned at top)</span></b>
+        <div class="row">
+          <label class="meta"><input type="checkbox" id="mem-distill-enabled"> Auto-distill this character</label>
+          <label>Every <input id="mem-distill-interval" type="number" min="1" value="8" style="width:56px"> user turns</label>
+          <button id="btn-mem-profile-save" class="primary">Save profile</button>
+          <span id="mem-profile-saved" class="meta"></span>
+        </div>
+        <div class="row">
+          <label>Distill model <select id="mem-distill-model" style="max-width:320px"><option value="">(main chat model)</option></select>
+            <span class="meta">dedicated extractor model; empty = main chat model</span></label>
+        </div>
+        <div class="row">
+          <label>Reply tokens (max_tokens) <input id="mem-distill-tokens" type="number" min="1" value="8192" style="width:96px">
+            <span class="meta">budget for one extraction; thinking models spend it on reasoning</span></label>
+          <label>Fact sheet char cap <input id="mem-maxchars" type="number" min="0" value="5000" style="width:96px">
+            <span class="meta">safety valve: oldest data is dropped past this</span></label>
+        </div>
+
         <label>Recall collections <span class="meta">multi-select; none = no recall this turn (keep a new character clean)</span></label>
         <div id="mem-recall" class="collist" role="group" aria-label="Recall collections"></div>
 
@@ -158,18 +187,10 @@
           <select id="mem-write" style="max-width:260px"><option value="">(none)</option></select>
         </label>
 
-        <div class="row">
-          <label class="meta"><input type="checkbox" id="mem-distill-enabled"> Auto-distill this character</label>
-          <label>Every <input id="mem-distill-interval" type="number" min="1" value="8" style="width:56px"> user turns</label>
-          <button id="btn-mem-profile-save" class="primary">Save profile</button>
-          <span id="mem-profile-saved" class="meta"></span>
-        </div>
-        <label>Distill prompt (per character; empty = built-in STATE/LOG extractor)
-          <textarea id="mem-distill-prompt" rows="5" placeholder="Empty uses the built-in extractor (STATE/LOG)"></textarea>
+        <label>Distill prompt (per character; always shown, edit freely)
+          <textarea id="mem-distill-prompt" rows="8"></textarea>
         </label>
         <div class="row">
-          <button id="btn-mem-prompt-default">Load built-in default</button>
-          <button id="btn-mem-prompt-restore">Clear (use default)</button>
           <button id="btn-mem-distill-run" class="primary">Distill now</button>
           <span id="mem-distill-meta" class="meta">—</span>
         </div>
@@ -191,7 +212,6 @@
           <label class="meta" title="After each distill, append the audit file into this character's auto-write collection"><input type="checkbox" id="dmem-vec-enabled"> Auto-index to RAG</label>
         </div>
         <div class="row">
-          <label>Memory char cap <input id="mem-maxchars" type="number" min="0" value="5000" style="width:88px"> <span class="meta">Safety valve: oldest data is dropped past this</span></label>
           <button id="btn-mem-save" class="primary">Save global</button>
         </div>
       </details>
