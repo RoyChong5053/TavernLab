@@ -1450,6 +1450,17 @@ func main() {
 			prompt = distill.DefaultPrompt
 		}
 		sheet := distill.Load(cfg.DataRoot, session)
+		// The ring buffer keeps the last attempts even when the run failed (meta
+		// only advances on success), so the audit shows "last attempt" truthfully.
+		recent := make([]obs.Entry, 0, 16)
+		for _, e := range obs.Recent(400) {
+			if strings.HasPrefix(e.Msg, "distill ") {
+				recent = append(recent, e)
+			}
+		}
+		if len(recent) > 12 {
+			recent = recent[len(recent)-12:]
+		}
 		writeJSON(w, map[string]any{
 			"session": session, "enabled": prof.Distill.Enabled, "interval": interval,
 			"model":      firstNonEmpty(s.DistillModel, defaultChatModel(s)),
@@ -1464,6 +1475,7 @@ func main() {
 			"meta":              meta,
 			"fresh_msgs":        freshMsgs, "fresh_user_turns": freshUsers,
 			"days": distill.DayCount(sheet), "sheet_chars": len([]rune(sheet)),
+			"recent": recent,
 		})
 	})
 	mux.HandleFunc("/api/audit/", func(w http.ResponseWriter, r *http.Request) {

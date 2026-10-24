@@ -1499,9 +1499,10 @@ async function refreshDistillAudit() {
     const state = j.enabled ? `every ${j.interval} user turns` : 'auto-distill off';
     const last = m.last_run ? m.last_run.replace('T', ' ').replace(/\+.*$/, '') : 'never';
     const vec = j.vectorize_enabled ? `on → ${j.vectorize_collection}` : 'off';
+    const lastEvt = (j.recent || []).slice(-1)[0];
     sum.innerHTML =
-      `<b>${esc(j.session)}</b> · ${esc(state)} · last run <b>${esc(last)}</b>` +
-      ` · status <b>${esc(m.last_status || '?')}</b> · runs ${m.runs || 0}` +
+      `<b>${esc(j.session)}</b> · ${esc(state)} · last ok <b>${esc(last)}</b>` +
+      ` · runs ${m.runs || 0} · latest attempt <b>${esc(lastEvt ? lastEvt.msg : '?')}</b>` +
       ` · ${j.days || 0} days / ${j.sheet_chars || 0} chars` +
       `<br>captured: ${j.fresh_msgs || 0} message(s), ${j.fresh_user_turns || 0} user turn(s)` +
       ` · last index ${m.last_index || 0}` +
@@ -1520,6 +1521,29 @@ async function refreshDistillAudit() {
     }
     const pre = $('#distill-audit-prompt');
     if (pre) pre.textContent = j.prompt || '(empty)';
+    // Attempt history: meta.last_status only advances on success, so a failing
+    // run would otherwise look like "everything is fine" here.
+    const rec = $('#distill-audit-recent');
+    if (rec) {
+      const lines = (j.recent || []).map((e) => {
+        const t = (e.time || '').replace('T', ' ').replace(/\+\d\d:\d\d$/, '');
+        const f = e.fields || {};
+        const pick = [];
+        if (f.model) pick.push('model ' + f.model);
+        if (f.max_tokens != null) pick.push('max_tokens ' + f.max_tokens);
+        if (f.fresh_msgs != null) pick.push('msgs ' + f.fresh_msgs);
+        if (f.prompt_chars != null) pick.push('prompt ' + f.prompt_chars + 'c');
+        if (f.input_chars != null) pick.push('input ' + f.input_chars + 'c');
+        if (f.finish_reason) pick.push('finish ' + f.finish_reason);
+        if (f.completion != null) pick.push('completion ' + f.completion);
+        if (f.delta_len != null) pick.push('delta ' + f.delta_len);
+        if (f.reasoning_len != null) pick.push('reasoning ' + f.reasoning_len);
+        if (f.added != null) pick.push('added ' + f.added + 'd');
+        if (f.error) pick.push('error ' + f.error);
+        return `${t} [${e.level}] ${e.msg} — ${pick.join(' · ')}`;
+      });
+      rec.textContent = lines.length ? lines.join('\n') : '(no distill activity in the log ring yet)';
+    }
   } catch (e) {
     sum.textContent = 'Failed to load distilled-memory audit: ' + e.message;
   }
