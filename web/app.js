@@ -1427,41 +1427,137 @@ function moduleTable(rows) {
   return `<table><tr><th>module</th><th>tier</th><th>role</th><th>tokens</th><th>cut</th><th>note</th></tr>` +
     rows.map((b) => `<tr><td>${esc(b.id)}</td><td>L${b.level || '?'}</td><td>${esc(b.role)}</td><td>${b.tokens}</td><td>${b.truncated ? '✂' : ''}</td><td class="meta">${esc(b.note || '')}</td></tr>`).join('') + `</table>`;
 }
-function compileLine(res) {
-  const drop = (res.dropped || []).join(', ') || 'none';
-  const mods = (res.modules || []).map((b) => `${b.id}(L${b.level}):${b.tokens}${b.truncated ? '✂' : ''}`).join(' · ');
-  const overflow = res.overflow ? ' · <span style="color:#ffb4b4">⚠ OVERFLOW (over input budget)</span>' : '';
-  const win = res.window ? `window ${Math.round(res.window / 1024)}k · ` : '';
-  return `<b>${res.total_tokens}</b> / ${res.budget_tokens} input tokens · ${win}dropped: ${drop}${overflow}<br>${mods}`;
+function fmtNum(n) {
+  return Number(n || 0).toLocaleString('en-US');
 }
-async function compile() {
-  const r = await api('/api/assemble', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ modules, context: ctxCfg(), session: settings.char }),
-  });
-  const res = await r.json();
-  const m = res.memory || {};
-  const memTxt = m.enabled
-    ? `Memory: ${esc(m.collection || '')} · query="${esc((m.query || '').slice(0, 60))}" · ${m.chars ?? 0} chars${m.error ? ' · ⚠ ' + esc(m.error) : ''}`
-    : 'Memory: disabled (no recall this turn)';
-  $('#compile-summary').innerHTML = compileLine(res) + `<br><span class="meta">${memTxt}</span>`;
-  $('#compile-modules').innerHTML = moduleTable(res.modules || []);
-  const pre = $('#compile-text');
-  pre.textContent = res.prompt_text || '(empty)';
-  pre.classList.remove('hidden');
-  return res;
+// Audit ids are timestamps: 20261026-063858.661. The dropdown shows them in a
+// readable form; the value stays the raw id (that is the filename).
+function fmtAuditID(id) {
+  const m = /^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})\.(\d{3})$/.exec(id || '');
+  if (!m) return id || '';
+  return `${m[1]}-${m[2]}-${m[3]} ${m[4]}:${m[5]}:${m[6]}.${m[7]}`;
 }
+function contentText(c) {
+  if (typeof c === 'string') return c;
+  if (Array.isArray(c)) {
+    return c.map((p) => {
+      if (typeof p === 'string') return p;
+      if (p && p.type === 'text') return p.text || '';
+      if (p && p.type === 'image_url') return '[image]';
+      return '';
+    }).filter(Boolean).join('\n');
+  }
+  return c == null ? '' : String(c);
+}
+function indent(s, p) {
+  return String(s).split('\n').map((l) => p + l).join('\n');
+}
+function usageLine(up) {
+  if (!up) return '';
+  return Object.keys(up)
+    .filter((k) => typeof up[k] === 'number' || typeof up[k] === 'string')
+    .map((k) => `${k} ${typeof up[k] === 'number' ? fmtNum(up[k]) : up[k]}`)
+    .join(' · ');
+}
+// The chat audit used to dump raw JSON. The request is now rendered as the
+// messages the model actually saw, which is what a human can read.
+function renderChatAuditText(a) {
+  const raw = a.raw_request || {};
+  const msgs = Array.isArray(raw.messages) ? raw.messages : [];
+  const out = [];
+  out.push('── REQUEST ─────────────────────────────');
+  out.push(`model ${raw.model || a.model || '?'} · stream ${raw.stream ? 'yes' : 'no'} · max_tokens ${raw.max_tokens ?? a.max_tokens ?? '?'}`);
+  for (const m of msgs) {
+    out.push('');
+    out.push(`── ${String(m.role || '?').toUpperCase()} ─────────────────────────`);
+    out.push(contentText(m.content) || '(empty)');
+  }
+  if (a.reply_text) {
+    out.push('');
+    out.push('── REPLY ───────────────────────────────');
+    out.push(a.reply_text);
+  }
+  if (a.stream_error) {
+    out.push('');
+    out.push('── STREAM ERROR ────────────────────────');
+    out.push(a.stream_error);
+  }
+  const up = usageLine(a.upstream_usage);
+  if (up) {
+    out.push('');
+    out.push('── USAGE ───────────────────────────────');
+    out.push(up);
+  }
+  return out.join('\n');
+}
+// A distill run is one system message + one user message, then the attempts.
+// This is the "what did the extractor actually receive" view.
+function renderDistillAuditText(a) {
+  const msgs = (a.request && a.request.messages) || [];
+  const sys = msgs.find((m) => m && m.role === 'system');
+  const usr = msgs.find((m) => m && m.role === 'user');
+  const out = [];
+  out.push(`OUTCOME ${String(a.outcome || '?').toUpperCase()}${a.error ? ' — ' + a.error : ''}`);
+  out.push(
+    `captured ${fmtNum(a.fresh_msgs)} msgs (index ${a.fresh_from ?? '?'} → ${a.fresh_to ?? '?'})` +
+    ` · state ${fmtNum(a.state_chars)}c · recent ${fmtNum(a.recent_log_chars)}c` +
+    ` · movement ${fmtNum(a.movement_chars)}c · timeline ${fmtNum(a.timeline_chars)}c` +
+    ` · ${fmtNum(a.elapsed_ms)} ms`
+  );
+  out.push('');
+  out.push('── SYSTEM (sent) ───────────────────────');
+  out.push(contentText(sys && sys.content) || '(empty)');
+  out.push('');
+  out.push('── USER (sent) ─────────────────────────');
+  out.push(contentText(usr && usr.content) || '(empty)');
+  out.push('');
+  out.push('── ATTEMPTS ────────────────────────────');
+  const ats = a.attempts || [];
+  if (!ats.length) out.push('(none)');
+  for (const at of ats) {
+    out.push(`#${at.n} finish=${at.finish_reason || '?'} · completion=${fmtNum(at.completion_tokens)} · reasoning=${fmtNum(at.reasoning_chars)}c · delta=${fmtNum(at.delta_chars)}c`);
+    if (at.reasoning) {
+      const r = at.reasoning.length > 3000 ? at.reasoning.slice(0, 3000) + '\n… [reasoning truncated for display; full text is in the audit file]' : at.reasoning;
+      out.push(indent(r, '    '));
+    }
+  }
+  out.push('');
+  out.push('── RESPONSE ────────────────────────────');
+  out.push(a.delta || '(empty)');
+  return out.join('\n');
+}
+
+// Refresh always re-reads data/audit from disk. That is what makes an rclone
+// backup + folder clear show up immediately instead of leaving stale ids that
+// then fail to load.
 async function refreshAudit() {
-  const j = await (await api('/api/audit')).json().catch(() => ({}));
+  const sel = $('#audit-list');
+  const prev = sel.value;
+  let j = {};
+  try { j = await (await api('/api/audit')).json(); } catch (e) { j = {}; }
   const ids = Array.isArray(j.ids) ? j.ids : [];
-  $('#audit-list').innerHTML = ids.map((id) => `<option>${id}</option>`).join('');
-  if (ids.length) { $('#audit-list').value = ids[0]; viewAudit(); }
-  else { $('#audit').textContent = 'No records yet — send a message first.'; $('#audit-summary').textContent = ''; $('#audit-modules').innerHTML = ''; }
+  sel.innerHTML = ids.map((id) => `<option value="${esc(id)}">${esc(fmtAuditID(id))}</option>`).join('');
+  if (!ids.length) {
+    $('#audit-summary').textContent = '';
+    $('#audit-modules').innerHTML = '';
+    $('#audit').textContent = 'No audit records on disk. If you just moved data/audit away with rclone, this is expected — Refresh re-reads the folder every time.';
+    return;
+  }
+  sel.value = ids.includes(prev) ? prev : ids[0];
+  await loadAudit(sel.value, false);
 }
 async function viewAudit() {
   const id = $('#audit-list').value;
-  if (!id) return;
-  const a = await (await api('/api/audit/' + id)).json();
+  if (id) await loadAudit(id, true);
+}
+async function loadAudit(id, allowRefresh) {
+  const r = await api('/api/audit/' + encodeURIComponent(id));
+  if (!r.ok) {
+    if (allowRefresh) { await refreshAudit(); return; }
+    $('#audit').textContent = `Record ${fmtAuditID(id)} could not be read — it may have been removed from data/audit. Click Refresh to re-sync the list.`;
+    return;
+  }
+  const a = await r.json();
   const mem = a.memory || {};
   const up = a.upstream_usage || {};
   const est = a.estimate_tokens ?? a.total_tokens;
@@ -1480,19 +1576,20 @@ async function viewAudit() {
     `${truncWarn}${overWarn}<br>${memTxt}` +
     `<br><span class="meta">Sliding window: input budget = window − reply reserve. L1 is never trimmed; L3 is dropped first; L2 is evicted by tier (RAG drops the lowest score, chat drops the oldest, keeping the floor).</span>`;
   $('#audit-modules').innerHTML = moduleTable(a.modules || []);
-  $('#audit').textContent = JSON.stringify(a, null, 2);
+  $('#audit').textContent = renderChatAuditText(a);
 }
-$('#btn-compile').onclick = () => asyncAction($('#btn-compile'), compile);
 $('#btn-audit-list').onclick = refreshAudit;
 $('#btn-audit-view').onclick = viewAudit;
 
 /* ---------- audit: distilled memory ---------- */
-// Shows the parameters and the exact prompt the extractor receives, plus what
-// the last run captured (cursor position, pending messages, vectorize state).
-// Without this the only way to debug distillation is guessing at settings.
+// One record per run, same id/folder model as the chat audits. The text view
+// shows the exact system + user message and the attempts, so a failure can be
+// diagnosed without guessing at settings or reading raw JSON.
 async function refreshDistillAudit() {
   const sum = $('#distill-audit-summary');
   if (!sum) return;
+  const sel = $('#distill-audit-list');
+  const prev = sel ? sel.value : '';
   try {
     const j = await (await api('/api/audit/distilled?session=' + encodeURIComponent(settings.char))).json();
     const m = j.meta || {};
@@ -1519,8 +1616,16 @@ async function refreshDistillAudit() {
         'vectorize ' + (j.vectorize_enabled ? 'on' : 'off') + ' → ' + (j.vectorize_collection || '(none)'),
       ].join(' · ');
     }
-    const pre = $('#distill-audit-prompt');
-    if (pre) pre.textContent = j.prompt || '(empty)';
+    const ids = Array.isArray(j.ids) ? j.ids : [];
+    if (sel) {
+      sel.innerHTML = ids.map((id) => `<option value="${esc(id)}">${esc(fmtAuditID(id))}</option>`).join('');
+      if (ids.length) {
+        sel.value = ids.includes(prev) ? prev : ids[0];
+        await loadDistillAudit(sel.value);
+      } else {
+        $('#distill-audit-text').textContent = 'No distill runs recorded yet. The first run writes one file per attempt to data/audit.';
+      }
+    }
     // Attempt history: meta.last_status only advances on success, so a failing
     // run would otherwise look like "everything is fine" here.
     const rec = $('#distill-audit-recent');
@@ -1548,7 +1653,19 @@ async function refreshDistillAudit() {
     sum.textContent = 'Failed to load distilled-memory audit: ' + e.message;
   }
 }
+async function loadDistillAudit(id) {
+  const pre = $('#distill-audit-text');
+  if (!pre) return;
+  const r = await api('/api/audit/distilled/' + encodeURIComponent(id));
+  if (!r.ok) {
+    pre.textContent = `Run ${fmtAuditID(id)} could not be read — it may have been removed from data/audit. Click Refresh to re-sync the list.`;
+    return;
+  }
+  const a = await r.json();
+  pre.textContent = renderDistillAuditText(a);
+}
 $('#btn-distill-audit-refresh') && ($('#btn-distill-audit-refresh').onclick = () => asyncAction($('#btn-distill-audit-refresh'), refreshDistillAudit));
+$('#distill-audit-list') && ($('#distill-audit-list').onchange = () => loadDistillAudit($('#distill-audit-list').value));
 
 /* ---------- logs ---------- */
 let logSince = 0, logES = null;

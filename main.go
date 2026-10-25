@@ -1461,6 +1461,8 @@ func main() {
 		if len(recent) > 12 {
 			recent = recent[len(recent)-12:]
 		}
+		// One file per run in data/audit, same id shape as the chat audits.
+		ids, _ := distill.ListRunAudits(cfg.DataRoot)
 		writeJSON(w, map[string]any{
 			"session": session, "enabled": prof.Distill.Enabled, "interval": interval,
 			"model":      firstNonEmpty(s.DistillModel, defaultChatModel(s)),
@@ -1475,11 +1477,28 @@ func main() {
 			"meta":              meta,
 			"fresh_msgs":        freshMsgs, "fresh_user_turns": freshUsers,
 			"days": distill.DayCount(sheet), "sheet_chars": len([]rune(sheet)),
-			"recent": recent,
+			"recent": recent, "ids": ids,
 		})
+	})
+	mux.HandleFunc("/api/audit/distilled/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", 405)
+			return
+		}
+		id := strings.TrimPrefix(r.URL.Path, "/api/audit/distilled/")
+		a, err := distill.LoadRunAudit(cfg.DataRoot, id)
+		if err != nil {
+			http.Error(w, "distill audit not found", 404)
+			return
+		}
+		writeJSON(w, a)
 	})
 	mux.HandleFunc("/api/audit/", func(w http.ResponseWriter, r *http.Request) {
 		rest := strings.TrimPrefix(r.URL.Path, "/api/audit/")
+		if strings.HasSuffix(rest, "-distill") {
+			http.Error(w, "use /api/audit/distilled/<id>", 400)
+			return
+		}
 		if strings.HasSuffix(rest, "/replay") && r.Method == "POST" {
 			id := strings.TrimSuffix(rest, "/replay")
 			a, err := st.LoadAudit(id)
@@ -3195,6 +3214,26 @@ func runDistill(ctx context.Context, st *store.Store, client *http.Client, root 
 			{"role": "user", "content": userContent},
 		},
 	})
+	// Persist the exact request BEFORE calling upstream: a timeout, a crash or
+	// an empty delta must still leave behind what was actually sent. The file
+	// lives in data/audit/<id>-distill.json next to the chat audits, so one
+	// rclone backup of data/audit covers everything.
+	runID := time.Now().Format("20060102-150405.000")
+	started := time.Now()
+	rec := distill.RunAudit{
+		ID: runID, Time: started.Format(time.RFC3339), Session: session, Force: force,
+		Model: model, MaxTokens: maxTokens, Request: upBody,
+		FreshFrom: len(all) - len(fresh), FreshTo: len(all), FreshMsgs: len(fresh),
+		StateChars: len([]rune(state)), RecentLogChars: len([]rune(recentLogs)),
+		MovementChars: len([]rune(movement)), TimelineChars: len([]rune(timeline)),
+	}
+	saveAudit := func() {
+		rec.ElapsedMS = time.Since(started).Milliseconds()
+		if err := distill.SaveRunAudit(root, rec); err != nil {
+			obs.Warn("distill audit write failed", map[string]any{"session": session, "error": err.Error()})
+		}
+	}
+	saveAudit()
 	// One structured record per run so the Audit page can show exactly what was
 	// captured and sent to the extractor (prompt/model/budget/input sizes)
 	// without having to guess from the chat log afterwards.
@@ -3211,11 +3250,21 @@ func runDistill(ctx context.Context, st *store.Store, client *http.Client, root 
 	for attempt := 1; attempt <= 2; attempt++ {
 		status, respBody, usage := proxy.Forward(client, s.Upstream, s.APIKey, upBody, false, nil, nil)
 		if status >= 400 {
+			rec.Outcome = "http-error"
+			rec.Error = fmt.Sprintf("HTTP %d: %s", status, excerpt(string(respBody), 200))
+			saveAudit()
 			return "", fmt.Errorf("上游 HTTP %d: %s", status, excerpt(string(respBody), 200))
 		}
 		finish = replyFinish(respBody)
 		delta = strings.TrimSpace(replyText(respBody))
+		rec.Attempts = append(rec.Attempts, distill.Attempt{
+			N: attempt, Finish: finish, Completion: usageCompletionTokens(usage),
+			ReasoningChars: replyReasoningLen(respBody),
+			Reasoning:      capRunes(replyReasoning(respBody), 30000),
+			DeltaChars:     len([]rune(delta)),
+		})
 		if delta != "" && finish != "length" && distill.IsValid(delta) {
+			saveAudit()
 			break
 		}
 		obs.Warn("distill attempt rejected", map[string]any{
@@ -3226,14 +3275,22 @@ func runDistill(ctx context.Context, st *store.Store, client *http.Client, root 
 		})
 		if attempt == 2 {
 			if delta == "" {
+				rec.Outcome = "empty-delta"
+				rec.Error = "upstream returned an empty delta"
+				saveAudit()
 				p := writeDistillTmp(root, s, session, fresh, len(all)-len(fresh), len(all), "", "empty", movement, time.Now())
 				autoVectorize(root, s, session, p)
 				return "", fmt.Errorf("upstream returned an empty delta")
 			}
+			rec.Outcome = "parse-failed"
+			rec.Error = "distill output could not be parsed (keeping old records)"
+			rec.Delta = delta
+			saveAudit()
 			p := writeDistillTmp(root, s, session, fresh, len(all)-len(fresh), len(all), delta, "parse-failed", movement, time.Now())
 			autoVectorize(root, s, session, p)
 			return "", fmt.Errorf("distill output could not be parsed (keeping old records)")
 		}
+		saveAudit()
 	}
 	if bad := distill.UnparsedDatedLines(delta); len(bad) > 0 {
 		obs.Warn("distill unparsed lines", map[string]any{"session": session, "n": len(bad), "sample": excerpt(bad[0], 120)})
@@ -3246,6 +3303,9 @@ func runDistill(ctx context.Context, st *store.Store, client *http.Client, root 
 	if err := distill.Save(root, session, final); err != nil {
 		return "", err
 	}
+	rec.Outcome = "ok"
+	rec.Delta = delta
+	saveAudit()
 	meta.LastRun = time.Now().Format(time.RFC3339)
 	meta.LastIndex = len(all)
 	meta.Runs++
@@ -3404,26 +3464,45 @@ func replyFinish(respBody []byte) string {
 // message.reasoning). It exists so a "finish=length, content empty" distill
 // failure can be told apart from "the model actually returned nothing".
 func replyReasoningLen(respBody []byte) int {
+	return len([]rune(replyReasoning(respBody)))
+}
+
+// replyReasoning returns the raw thinking text, so the distill audit can show
+// why a reasoning model produced an empty content field.
+func replyReasoning(respBody []byte) string {
 	var resp map[string]any
 	_ = json.Unmarshal(respBody, &resp)
 	if resp == nil {
-		return 0
+		return ""
 	}
 	ch, _ := resp["choices"].([]any)
 	if len(ch) == 0 {
-		return 0
+		return ""
 	}
 	m, _ := ch[0].(map[string]any)
 	msg, _ := m["message"].(map[string]any)
 	if msg == nil {
-		return 0
+		return ""
 	}
 	for _, k := range []string{"reasoning_content", "reasoning"} {
 		if s, ok := msg[k].(string); ok && s != "" {
-			return len([]rune(s))
+			return s
 		}
 	}
-	return 0
+	return ""
+}
+
+// capRunes bounds a debug field (thinking can be 25k+ runes) without cutting a
+// multi-byte character in half.
+func capRunes(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "\n… [truncated]"
 }
 
 // respMap unmarshals an upstream/rebuilt body for flag inspection. Nil when

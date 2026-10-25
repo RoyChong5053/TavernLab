@@ -644,12 +644,18 @@ func (s *Store) ListAudits() ([]string, error) {
 	dir := filepath.Join(s.Root, "audit")
 	es, err := os.ReadDir(dir)
 	if err != nil {
-		return nil, nil
+		return []string{}, nil
 	}
-	var ids []string
+	ids := make([]string, 0, len(es))
 	for _, e := range es {
-		if strings.HasSuffix(e.Name(), ".json") {
-			ids = append(ids, strings.TrimSuffix(e.Name(), ".json"))
+		n := e.Name()
+		// Distill runs share data/audit (one rclone backup) but belong to the
+		// Distilled Memory panel, not the chat generation dropdown.
+		if strings.HasSuffix(n, "-distill.json") {
+			continue
+		}
+		if strings.HasSuffix(n, ".json") {
+			ids = append(ids, strings.TrimSuffix(n, ".json"))
 		}
 	}
 	sort.Sort(sort.Reverse(sort.StringSlice(ids)))

@@ -119,21 +119,12 @@
         <button id="btn-reload-modules">Reload</button>
         <span id="modules-state" class="meta"></span>
       </div>
-      <p class="meta">Modules are compiled into the binary — the list below is fixed; only <b>text modules</b> expose a prompt you can edit. Toggle a module on/off, reorder with ↑/↓, and edit its prompt where shown. Full token accounting and a dry-run preview of the final request live on the <b>Audit</b> page.</p>
+      <p class="meta">Modules are compiled into the binary — the list below is fixed; only <b>text modules</b> expose a prompt you can edit. Toggle a module on/off, reorder with ↑/↓, and edit its prompt where shown. Full token accounting and the exact request sent live on the <b>Audit</b> page.</p>
       <div id="modules"></div>
     </section>
     <!-- AUDIT -->
     <section class="page" id="page-audit">
-      <h2>Audit <small>Dry-run preview, per-generation tokens and Replay.</small></h2>
-      <div class="glass pad">
-        <div class="row">
-          <button id="btn-compile" class="primary">Compile (dry-run)</button>
-          <span class="meta">Assemble the current modules into the final request — no model call, no cost.</span>
-        </div>
-        <div id="compile-summary" class="budget"></div>
-        <div id="compile-modules" class="pad"></div>
-        <pre id="compile-text" class="preview-text hidden"></pre>
-      </div>
+      <h2>Audit <small>One record per generation: the exact request as text, token accounting, and the reply.</small></h2>
       <div class="row">
         <button id="btn-audit-list">Refresh</button>
         <select id="audit-list"></select>
@@ -147,12 +138,16 @@
         <div class="row">
           <b>Distilled Memory audit</b>
           <button id="btn-distill-audit-refresh">Refresh</button>
-          <span class="meta">Exactly what the extractor was given: model, budget, prompt and the captured window.</span>
+          <select id="distill-audit-list"></select>
+          <span class="meta">One record per run, newest first. The text below is exactly what was sent to the extractor and what came back.</span>
         </div>
         <div id="distill-audit-summary" class="budget">—</div>
         <div id="distill-audit-params" class="meta"></div>
-        <pre id="distill-audit-recent" class="preview-text"></pre>
-        <pre id="distill-audit-prompt" class="preview-text"></pre>
+        <pre id="distill-audit-text" class="preview-text"></pre>
+        <details class="pad">
+          <summary class="meta">Recent distill log lines</summary>
+          <pre id="distill-audit-recent" class="preview-text"></pre>
+        </details>
       </div>
     </section>
     <!-- MEMORY -->

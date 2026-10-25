@@ -183,3 +183,23 @@ func TestFindTurnNoteBetweenTurns(t *testing.T) {
 		t.Fatalf("u2: hasRow=%v hasReply=%v reply=%+v", hasRow2, hasReply2, reply2)
 	}
 }
+
+func TestListAuditsSkipsDistillRuns(t *testing.T) {
+	s := New(t.TempDir())
+	dir := filepath.Join(s.Root, "audit")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range []string{"20261026-063858.661.json", "20261026-063900.000-distill.json"} {
+		if err := os.WriteFile(filepath.Join(dir, n), []byte("{}"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ids, err := s.ListAudits()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ids) != 1 || ids[0] != "20261026-063858.661" {
+		t.Fatalf("ids = %v, want only the chat audit", ids)
+	}
+}
