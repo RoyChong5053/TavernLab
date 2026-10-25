@@ -1601,7 +1601,7 @@ async function refreshDistillAudit() {
       `<b>${esc(j.session)}</b> · ${esc(state)} · last ok <b>${esc(last)}</b>` +
       ` · runs ${m.runs || 0} · latest attempt <b>${esc(lastEvt ? lastEvt.msg : '?')}</b>` +
       ` · ${j.days || 0} days / ${j.sheet_chars || 0} chars` +
-      `<br>captured: ${j.fresh_msgs || 0} message(s), ${j.fresh_user_turns || 0} user turn(s)` +
+      `<br>pending now: ${j.fresh_msgs || 0} message(s), ${j.fresh_user_turns || 0} user turn(s)` +
       ` · last index ${m.last_index || 0}` +
       ` · vectorize ${esc(vec)}${m.last_vectorize_error ? ' · ⚠ ' + esc(m.last_vectorize_error) : ''}`;
     const params = $('#distill-audit-params');
