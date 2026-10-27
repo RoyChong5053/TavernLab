@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>tavernlab-desktop</title>
+    <style>
+      :root { color-scheme: dark; }
+      html, body { height: 100%; margin: 0; }
+      body {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+        background: #0d1117;
+        color: #c9d1d9;
+        text-align: center;
+        padding: 24px;
+      }
+      .card { max-width: 480px; }
+      h1 { font-size: 20px; margin: 0 0 8px; }
+      p { font-size: 14px; line-height: 1.6; color: #8b949e; }
+      code {
+        display: inline-block;
+        margin-top: 16px;
+        padding: 6px 10px;
+        background: #161b22;
+        border: 1px solid #30363d;
+        border-radius: 6px;
+        font-size: 12px;
+        color: #58a6ff;
+        word-break: break-all;
+      }
+      .dot {
+        display: inline-block;
+        width: 8px; height: 8px;
+        margin-right: 6px;
+        border-radius: 50%;
+        background: #d29922;
+        vertical-align: middle;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1><span class="dot"></span>tavernlab-desktop</h1>
+      <p>
+        Connecting to the remote web UI&hellip;
+        If this screen does not swap away, the target server is unreachable or
+        the network is down. Start the server, or point this app at another host
+        with the <code>--base</code> flag or the <code>tavernlab_server_url</code> env var.
+      </p>
+      <code>http://192.168.10.2:8888/</code>
+    </div>
+  </body>
+</html>

@@ -1,0 +1,15 @@
+# Tauri build artifacts (never commit these)
+src-tauri/target/
+**/dist/
+node_modules/
+
+# Built release binaries / packages — keep out of git; rebuild locally.
+src-tauri/bin/
+*.AppImage
+*.deb
+*.dmg
+/src-tauri/dist/
+
+# Local runtime state (settings file written here at runtime by the app)
+.settings.json
+.tavernlab-desktop-state/
