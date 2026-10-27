@@ -32,6 +32,16 @@ fn resolve_base() -> String {
 }
 
 fn main() {
+    // NVIDIA proprietary driver + Wayland: WebKitGTK's DMA-BUF/GPU renderer cannot create
+    // GPU surfaces here (`Failed to create GBM buffer`), which surfaces as either a hard
+    // crash (~6s, "Protocol error 71" -> WebKit fatal) or a blank webview. Disable the
+    // DMA-BUF renderer so WebKit falls back to the CPU/SHM renderer and the embedded web
+    // UI actually paints. Set BEFORE run() so the child WebProcess inherits it.
+    // (No-op on machines where DMA-BUF works fine.)
+    unsafe {
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    }
+
     let base = resolve_base();
     app_lib::run(base);
 }
