@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+
+	"github.com/RoyChong5053/TavernLab/internal/sanitize"
 )
 
 // Settings is the runtime-tunable config. Empty APIKey on PUT means "keep".
@@ -81,6 +83,12 @@ type Settings struct {
 	AdminPasswordSHA256 string `json:"admin_password_sha256,omitempty"` // hex(sha256(password))
 	SessionDays         int    `json:"session_days,omitempty"`          // login token TTL, default 30
 	AppToken            string `json:"app_token,omitempty"`             // static Bearer for the Flutter app
+	// ContextSanitize strips emoji/kaomoji/rare glyphs from the context that
+	// gets packaged for the API. chat.jsonl and the web UI keep the raw text
+	// verbatim. Global switch, OFF by default: it targets the "pattern
+	// reinforcement loop" (overfitting) on small local models. See
+	// internal/sanitize for the category ranges.
+	ContextSanitize *sanitize.Config `json:"context_sanitize,omitempty"`
 }
 
 // Defaults for a fresh checkout talking to the home LAN.
@@ -265,6 +273,11 @@ func Load(root string) Settings {
 	}
 	if f.AppToken != "" {
 		s.AppToken = f.AppToken
+	}
+	// ContextSanitize defaults to nil (off). Only an explicit object enables it;
+	// absent key leaves Defaults() (disabled) untouched.
+	if f.ContextSanitize != nil {
+		s.ContextSanitize = f.ContextSanitize
 	}
 	return s
 }

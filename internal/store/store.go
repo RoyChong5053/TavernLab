@@ -59,6 +59,13 @@ type Audit struct {
 	ReplyText   string         `json:"reply_text,omitempty"`
 	Upstream    map[string]any `json:"upstream_usage,omitempty"`
 	Memory      map[string]any `json:"memory,omitempty"` // mcp recall: query/collection/hits/error
+	// PromptText is the human-readable prompt actually sent to the provider,
+	// i.e. AFTER any context_sanitize cleaning. When the audit Sanitize block
+	// is present, PromptText == "what the model saw".
+	PromptText string `json:"prompt_text,omitempty"`
+	// Sanitize is the symbol-cleaning report (enabled / total_dropped /
+	// by_category / per_message). Nil unless context_sanitize is enabled.
+	Sanitize map[string]any `json:"sanitize,omitempty"`
 }
 
 // ModuleRow mirrors engine.ModuleUsage for storage.

@@ -132,6 +132,7 @@
       </div>
       <div id="audit-summary" class="glass budget"></div>
       <div id="audit-modules" class="glass pad"></div>
+      <div id="audit-sanitize" class="glass pad"></div>
       <pre id="audit" class="glass audit"></pre>
 
       <div class="glass pad">
@@ -275,6 +276,7 @@
           <label>Min kept turns <input id="set-minrounds" type="number" min="1" max="50" value="4" style="width:56px" title="Minimum conversation turns kept by the sliding window"></label>
         </div>
         <p class="meta">Input budget = context window − reply reserve (e.g. 16384 − 4096 = 12288). Locked modules are placed first; RAG and chat are evicted by tier.</p>
+        <label><input type="checkbox" id="set-sanitize"> Clean symbols (emoji/kaomoji/decorative) from API context — stops local-model overfitting. chat.jsonl and the chat view are untouched; the audit shows what was stripped.</label>
         <div class="row">
           <label>UI scale <input id="set-uiscale" type="number" min="80" max="150" value="100" style="width:64px"> % (stored locally)</label>
         </div>

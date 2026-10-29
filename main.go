@@ -40,6 +40,7 @@ import (
 	"github.com/RoyChong5053/TavernLab/internal/obs"
 	"github.com/RoyChong5053/TavernLab/internal/proxy"
 	"github.com/RoyChong5053/TavernLab/internal/reitti"
+	"github.com/RoyChong5053/TavernLab/internal/sanitize"
 	"github.com/RoyChong5053/TavernLab/internal/settings"
 	"github.com/RoyChong5053/TavernLab/internal/store"
 	"github.com/RoyChong5053/TavernLab/internal/vectorize"
@@ -79,6 +80,17 @@ func ctxFromSettings(s settings.Settings) engine.ContextConfig {
 		c.HistoryMinTurns = s.HistoryMinTurns
 	}
 	return c
+}
+
+// sanitizeEngine compiles the context sanitizer from settings. It returns nil
+// when context_sanitize is unset (the default), so the default path is a strict
+// no-op over Assemble. When set, it strips unwanted symbols from every L2 list
+// item before those tokens are counted and emitted.
+func sanitizeEngine(s settings.Settings) *sanitize.Engine {
+	if s.ContextSanitize == nil {
+		return nil
+	}
+	return s.ContextSanitize.Compile()
 }
 
 func (r *runtimeSettings) get() settings.Settings {
@@ -250,6 +262,17 @@ func (r *runtimeSettings) update(root string, patch map[string]any) settings.Set
 	}
 	if v, ok := patch["reitti_timeout_sec"].(float64); ok && v > 0 {
 		r.cur.ReittiTimeoutSec = int(v)
+	}
+	// context_sanitize: the web page sends {enabled:bool}. Decode it so a simple
+	// toggle both enables and disables cleaning. Compile() fills the three
+	// default categories when enabled with none listed.
+	if v, ok := patch["context_sanitize"]; ok {
+		if raw, err := json.Marshal(v); err == nil {
+			var cfg sanitize.Config
+			if json.Unmarshal(raw, &cfg) == nil {
+				r.cur.ContextSanitize = &cfg
+			}
+		}
 	}
 	_ = settings.Save(root, r.cur) // best-effort; key stays usable in memory regardless
 	return r.cur
@@ -437,6 +460,7 @@ func main() {
 				"reitti_enabled": s.ReittiEnabled, "reitti_mcp_url": s.ReittiMCPURL,
 				"reitti_timezone": s.ReittiTimezone, "reitti_window_hours": s.ReittiWindowHours,
 				"reitti_timeout_sec": s.ReittiTimeoutSec,
+				"sanitize_enabled": s.ContextSanitize != nil && s.ContextSanitize.Enabled,
 				"estimate_scale":     engine.TextScale(),
 				"auth_enabled":       auth.Enabled(), "admin_user": auth.User(),
 			})
@@ -753,12 +777,16 @@ func main() {
 		setWebSearchContent(modules, webSearchContent(session, userTurnCount(turns), webSearchKeepTurns(modules)))
 		modules = renderModules(cfg.DataRoot, session, rt.get().UserName, modules)
 		ragItems, memInfo := resolveMCP(r.Context(), rt.get(), cfg.DataRoot, session, turns)
-		res := engine.Assemble(engine.Input{Modules: modules, Cfg: ctx, Turns: turns, Lists: listInputs(modules, ragItems, cfg.DataRoot, session)})
+		res := engine.Assemble(engine.Input{Modules: modules, Cfg: ctx, Turns: turns, Lists: listInputs(modules, ragItems, cfg.DataRoot, session), Sanitize: sanitizeEngine(rt.get())})
 		out := map[string]any{
 			"messages": res.Messages, "modules": res.Modules, "total_tokens": res.TotalTok,
 			"budget_tokens": res.BudgetTok, "window": res.Window, "overflow": res.Overflow,
 			"dropped": res.Dropped, "prompt_text": res.PromptText,
 			"memory": memInfo,
+		}
+		// Sanitize report is only non-nil when context_sanitize is enabled.
+		if res.Sanitize != nil {
+			out["sanitize"] = res.Sanitize
 		}
 		writeJSON(w, out)
 	})
@@ -869,7 +897,7 @@ func main() {
 			// /web_search command did on this turn.
 			memInfo["web_search"] = webInfo
 		}
-		res := engine.Assemble(engine.Input{Modules: modules, Cfg: ctx, Turns: turns, Lists: listInputs(modules, ragItems, cfg.DataRoot, session)})
+		res := engine.Assemble(engine.Input{Modules: modules, Cfg: ctx, Turns: turns, Lists: listInputs(modules, ragItems, cfg.DataRoot, session), Sanitize: sanitizeEngine(s)})
 
 		// Build upstream body from assembled messages (attach fresh images).
 		upMsgs := buildUpMessages(res.Messages, upImages)
@@ -1949,7 +1977,7 @@ func main() {
 		if webInfo != nil {
 			memInfo["web_search"] = webInfo
 		}
-		res := engine.Assemble(engine.Input{Modules: modules, Cfg: ctxFromSettings(s), Turns: turns, Lists: listInputs(modules, ragItems, cfg.DataRoot, session)})
+		res := engine.Assemble(engine.Input{Modules: modules, Cfg: ctxFromSettings(s), Turns: turns, Lists: listInputs(modules, ragItems, cfg.DataRoot, session), Sanitize: sanitizeEngine(s)})
 		upMsgs := buildUpMessages(res.Messages, upImages)
 		mt := s.ReplyReserve
 		if mt <= 0 {
@@ -2211,6 +2239,14 @@ func toAudit(id string, model any, res engine.AssembleResult, upBody, respBody [
 			}
 		}
 	}
+	// Round-trip the sanitize report through JSON so we never import engine
+	// into store (which would risk an import cycle). Nil unless enabled.
+	var san map[string]any
+	if res.Sanitize != nil {
+		if b, err := json.Marshal(res.Sanitize); err == nil {
+			_ = json.Unmarshal(b, &san)
+		}
+	}
 	return store.Audit{
 		ID: id, Time: time.Now().Format(time.RFC3339), Model: mName,
 		Window: res.Window, Overflow: res.Overflow,
@@ -2220,6 +2256,7 @@ func toAudit(id string, model any, res engine.AssembleResult, upBody, respBody [
 		Modules: rows,
 		Dropped: res.Dropped, Raw: raw, ReplyText: reply, Upstream: usage,
 		Memory: mem,
+		PromptText: res.PromptText, Sanitize: san,
 	}
 }
 

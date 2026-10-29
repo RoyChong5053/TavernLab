@@ -1430,6 +1430,44 @@ function moduleTable(rows) {
 function fmtNum(n) {
   return Number(n || 0).toLocaleString('en-US');
 }
+// Sanitize panel: shows what context_sanitize stripped on this turn. The stored
+// record carries a.map['sanitize'] as an object {enabled, total_dropped,
+// by_category:{cat:n}, per_message:[{module_id, role, index, before, after,
+// dropped}]}. Rendered only when enabled; the element is cleared otherwise.
+function renderSanitizePanel(san) {
+  const el = $('#audit-sanitize');
+  if (!el) return;
+  if (!san || !san.enabled) {
+    el.innerHTML = '';
+    return;
+  }
+  const cats = san.by_category || {};
+  const catLine = Object.keys(cats)
+    .map((k) => `${esc(k)}: ${fmtNum(cats[k])}`)
+    .join(' · ');
+  const edited = (san.per_message || []).filter((m) => m.dropped > 0);
+  const catHtml = catLine
+    ? `<span class="meta">categories — ${catLine}</span>`
+    : '';
+  const rows = edited
+    .map((m) => {
+      const before = String(m.before || '').slice(0, 240);
+      const after = String(m.after || '').slice(0, 240);
+      return (
+        `<div class="san-row">` +
+        `<div class="san-meta">${esc(m.role || '?')} · index ${m.index ?? '?'} · dropped ${fmtNum(m.dropped)}</div>` +
+        `<div class="san-before">${esc(before)}</div>` +
+        `<div class="san-after">${esc(after)}</div>` +
+        `</div>`
+      );
+    })
+    .join('');
+  el.innerHTML =
+    `<b>Symbol cleaning</b> · stripped <b>${fmtNum(san.total_dropped)}</b> symbol(s)` +
+    `<br>${catHtml}` +
+    `<div class="meta">${edited.length} turn(s) edited; below = before (raw) → after (what the model saw). chat.jsonl keeps the raw text.</div>` +
+    (rows ? `<div class="san-list">${rows}</div>` : `<div class="meta">no stripped turns in this batch</div>`);
+}
 // Audit ids are timestamps: 20261026-063858.661. The dropdown shows them in a
 // readable form; the value stays the raw id (that is the filename).
 function fmtAuditID(id) {
@@ -1540,6 +1578,7 @@ async function refreshAudit() {
   if (!ids.length) {
     $('#audit-summary').textContent = '';
     $('#audit-modules').innerHTML = '';
+    $('#audit-sanitize').innerHTML = '';
     $('#audit').textContent = 'No audit records on disk. If you just moved data/audit away with rclone, this is expected — Refresh re-reads the folder every time.';
     return;
   }
@@ -1576,6 +1615,7 @@ async function loadAudit(id, allowRefresh) {
     `${truncWarn}${overWarn}<br>${memTxt}` +
     `<br><span class="meta">Sliding window: input budget = window − reply reserve. L1 is never trimmed; L3 is dropped first; L2 is evicted by tier (RAG drops the lowest score, chat drops the oldest, keeping the floor).</span>`;
   $('#audit-modules').innerHTML = moduleTable(a.modules || []);
+  renderSanitizePanel(a.sanitize);
   $('#audit').textContent = renderChatAuditText(a);
 }
 $('#btn-audit-list').onclick = refreshAudit;
@@ -2165,6 +2205,7 @@ async function loadServerSettings() {
     if (s.context_window) settings.context_window = s.context_window;
     if (s.reply_reserve) settings.reply_reserve = s.reply_reserve;
     if (s.history_min_turns) settings.history_min_turns = s.history_min_turns;
+    if (s.sanitize_enabled) settings.sanitize_enabled = true;
     store.set('settings', settings);
     $('#set-key-state').textContent = s.api_key_set ? ('API Key set ' + (s.api_key_hint || '')) : 'API Key not set';
     $('#mem-url').value = s.mcp_url || '';
@@ -2387,6 +2428,7 @@ function fillSettingsForm() {
   $('#set-reserve').value = settings.reply_reserve || 4096;
   $('#set-uiscale').value = settings.ui_scale || 100;
   $('#set-minrounds').value = settings.history_min_turns || 4;
+  $('#set-sanitize').checked = !!settings.sanitize_enabled;
   $('#set-rerank').value = settings.rerank_url;
   $('#set-stream').checked = !!settings.stream;
   $('#set-visible').value = settings.visible_turns || 10;
@@ -2417,6 +2459,7 @@ async function saveSettings(silent) {
     reply_reserve: settings.reply_reserve,
     history_min_turns: settings.history_min_turns,
     chat_model: settings.model || '',
+    context_sanitize: { enabled: $('#set-sanitize').checked },
   };
   if (upstreamDirty) body.upstream = $('#set-upstream').value.trim();
   if (apiKeyDirty && $('#set-apikey').value) body.api_key = $('#set-apikey').value;

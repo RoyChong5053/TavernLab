@@ -21,6 +21,8 @@ import (
 	"math"
 	"sort"
 	"strings"
+
+	"github.com/RoyChong5053/TavernLab/internal/sanitize"
 )
 
 // Level is the eviction tier. Zero value is treated as LevelLocked for
@@ -134,6 +136,31 @@ type AssembleResult struct {
 	Overflow   bool          `json:"overflow"`
 	Dropped    []string      `json:"dropped"`
 	PromptText string        `json:"prompt_text"`
+	// Sanitize is non-nil whenever a Cleaner was supplied to Input (i.e.
+	// context_sanitize is enabled). It reports exactly what was stripped so
+	// the audit page can show "what the model saw" == "what was cleaned".
+	Sanitize *SanitizeReport `json:"sanitize,omitempty"`
+}
+
+// SanitizeReport records the per-turn symbol cleaning the Cleaner performed.
+// It is only populated when Sanitize is enabled; audit renders it so the
+// operator can verify the cleaning is correct (not over- or under-stripping).
+type SanitizeReport struct {
+	Enabled      bool                       `json:"enabled"`
+	TotalDropped int                        `json:"total_dropped"`
+	ByCategory   map[string]int             `json:"by_category"`
+	PerMessage   []SanitizeReportItem       `json:"per_message,omitempty"`
+}
+
+// SanitizeReportItem is one before/after sample for a single emitted turn.
+// before is the raw text, after is what the model actually received.
+type SanitizeReportItem struct {
+	ModuleID string `json:"module_id"`
+	Role     string `json:"role"`
+	Index    int    `json:"index"`
+	Before   string `json:"before"`
+	After    string `json:"after"`
+	Dropped  int    `json:"dropped"`
 }
 
 // Input is the full assemble request.
@@ -142,6 +169,11 @@ type Input struct {
 	Cfg     ContextConfig
 	Turns   []Message  // structured chat history, oldest first (newest last)
 	Lists   []ItemList // extra L2 list sources (RAG hits, future cards)
+	// Sanitize, when non-nil, strips unwanted symbols (emoji/kaomoji/rare
+	// glyphs) from every chat turn and non-chat L2 item BEFORE it is counted
+	// toward the budget and emitted. Cleaning happens here (the single choke
+	// point) so token estimates and the emitted payload always match.
+	Sanitize *sanitize.Engine
 }
 
 // EstimateTokens is a script-aware heuristic: CJK/kana/hangul runs count
@@ -189,6 +221,7 @@ type l2List struct {
 	isChat    bool
 	tmpl      string
 	items     []Item
+	orig      []string // parallel to items: pre-sanitized text (audit before/after)
 	tok       []int
 	rank      []float64
 	protected []bool
@@ -238,6 +271,13 @@ func Assemble(in Input) AssembleResult {
 	}
 
 	var dropped []string
+
+	// Sanitize (when set) strips unwanted symbols from every L2 list item
+	// before its tokens are counted and it is emitted. Cleaning here keeps
+	// budget accounting and the emitted payload identical. L1/L3 blocks
+	// (system prompt, elastic web_search) are intentionally NOT touched.
+	cleaner := in.Sanitize
+	var cleanStats = sanitize.Stats{ByCategory: map[string]int{}} // aggregates drops across every L2 item
 
 	lockedText := map[string]string{}
 	lockedTok := map[string]int{}
@@ -344,7 +384,26 @@ func Assemble(in Input) AssembleResult {
 			l.protected = make([]bool, n)
 		}
 		for i := range l.items {
-			l.tok[i] = EstimateTokens(l.items[i].Text) + l.items[i].ImageTokens
+			origText := l.items[i].Text
+			text := origText
+			var cs sanitize.Stats
+			if cleaner != nil {
+				text, cs = cleaner.Clean(origText)
+				cleanStats.TotalDropped += cs.TotalDropped
+				for cat, n := range cs.ByCategory {
+					cleanStats.ByCategory[cat] += n
+				}
+			}
+			// Keep the pre-sanitized text for chat turns so the audit can
+			// render a before/after sample of what was stripped.
+			if cleaner != nil && l.isChat && l.orig == nil {
+				l.orig = make([]string, n)
+			}
+			if cleaner != nil && l.isChat {
+				l.orig[i] = origText
+			}
+			l.items[i].Text = text
+			l.tok[i] = EstimateTokens(text) + l.items[i].ImageTokens
 			if l.isChat {
 				l.tok[i] += msgOverhead
 			}
@@ -456,6 +515,17 @@ func Assemble(in Input) AssembleResult {
 	var usage []ModuleUsage
 	total := 0
 
+	// Report what Sanitize stripped, so audit can show "what the model saw"
+	// with before/after samples. Only populated when cleaning is active.
+	var report *SanitizeReport
+	if cleaner != nil && cleaner.Enabled() {
+		report = &SanitizeReport{
+			Enabled:      true,
+			TotalDropped: cleanStats.TotalDropped,
+			ByCategory:   cleanStats.ByCategory,
+		}
+	}
+
 	writeHeader := func(id string, order int) {
 		sb.WriteString("----- [" + id + " order=" + itoa(order) + "] -----\n")
 	}
@@ -474,6 +544,20 @@ func Assemble(in Input) AssembleResult {
 					kept += l.tok[i]
 					msgs = append(msgs, Message{Role: l.items[i].Role, Content: l.items[i].Text, ImageTokens: l.items[i].ImageTokens})
 					sb.WriteString(l.items[i].Role + ": " + l.items[i].Text + "\n")
+					if report != nil && l.orig != nil {
+						before := l.orig[i]
+						after, cs := cleaner.Clean(before)
+						if cs.TotalDropped > 0 {
+							report.PerMessage = append(report.PerMessage, SanitizeReportItem{
+								ModuleID: id,
+								Role:     l.items[i].Role,
+								Index:    i,
+								Before:   before,
+								After:    after,
+								Dropped:  cs.TotalDropped,
+							})
+						}
+					}
 				}
 				if any {
 					total += kept
@@ -536,6 +620,7 @@ func Assemble(in Input) AssembleResult {
 		Overflow:   overflow,
 		Dropped:    dropped,
 		PromptText: sb.String(),
+		Sanitize:   report,
 	}
 }
 
