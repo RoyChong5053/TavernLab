@@ -117,26 +117,36 @@ body[data-theme="paper"] .coll-item{background:rgba(255,255,255,.6)}
 .cursor::after{content:'▍';animation:blink 1s steps(1) infinite;opacity:.7;margin-left:1px}
 @keyframes blink{50%{opacity:0}}
 .chat-head-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-.chat-box{padding:12px;flex:1;min-height:0;overflow:auto;position:relative}
+/* Frosted panel no longer scrolls itself — the inner #chat is the scroller.
+   Keeping the panel non-scrolling lets backdrop-filter actually frost on
+   desktop (Chrome/Firefox skip blur on scroll containers). */
+.chat-box{display:flex;flex-direction:column;flex:1;min-height:0;overflow:hidden;position:relative;padding:12px}
+#chat{flex:1;min-height:0;overflow:auto}
 #btn-bottom{position:absolute;left:50%;transform:translateX(-50%);bottom:12px;margin:0;z-index:5;box-shadow:0 4px 16px rgba(0,0,0,.35)}
 #btn-bottom.hidden{display:none}
 #btn-bottom .newcount{display:inline-block;min-width:20px;text-align:center;background:var(--acc);color:#06222e;border-radius:10px;font-size:12px;font-weight:700;padding:0 6px;margin-left:4px}
 #btn-bottom .newcount.hidden{display:none}
 #chat{display:flex;flex-direction:column;gap:8px}
 /* ST 式通栏消息行：头像槽 + 内容列；不分左右气泡，用户也通栏（名字区分） */
-.msg{display:flex;gap:10px;align-items:flex-start;width:100%;max-width:100%;padding:10px 12px;border-radius:10px;border:1px solid var(--line);white-space:normal;background:var(--card)}
-.msg .avatar-gutter{flex:none}
+/* Bubble layout: avatar takes its own row on top, text block below — text is
+   never squeezed beside the avatar. User stacks right, assistant left. */
+.msg{display:flex;flex-direction:column;gap:6px;width:100%;max-width:100%;padding:10px 12px;border-radius:10px;border:1px solid var(--line);white-space:normal;background:var(--card)}
+.msg.ai{align-items:flex-start}
+.msg.user{align-items:flex-end}
+.msg .avatar-gutter{display:flex;justify-content:flex-start}
+.msg.user .avatar-gutter{justify-content:flex-end}
 .msg .avatar-gutter .avatar{width:var(--avatar-px);height:var(--avatar-px);border-radius:10px;object-fit:cover;border:1px solid var(--line);background:rgba(0,0,0,.4);display:block}
 .msg .avatar.user-avatar{width:var(--avatar-px);height:var(--avatar-px);border-radius:10px;background:var(--acc);color:#06222e;font-weight:700;display:flex;align-items:center;justify-content:center;font-size:calc(var(--avatar-px)*0.42)}
-.msg-content{flex:1;min-width:0}
+.msg-content{width:100%}
 .msg .who{display:flex;gap:8px;align-items:baseline;margin-bottom:4px}
 .msg .who-name{flex:none}
-.msg-actions{margin-left:auto;display:flex;gap:4px;opacity:0;transition:opacity .15s}
-.msg:hover .msg-actions,.msg:focus-within .msg-actions{opacity:1}
-.msg-actions button{background:transparent;border:1px solid transparent;border-radius:8px;padding:2px 7px;font-size:12px;color:var(--mut);cursor:pointer;line-height:1.5}
-.msg-actions button:hover{background:rgba(255,255,255,.1);color:var(--txt);border-color:var(--line)}
-.msg-actions button.danger:hover{background:rgba(255,80,80,.15);color:#ffb4b4;border-color:rgba(255,80,80,.4)}
-@media(pointer:coarse){.msg-actions{opacity:1}}
+.msg.ai .who{justify-content:flex-start}
+.msg.user .who{justify-content:flex-end}
+/* Mood pill: the character's expression for THIS message (moved from the top
+   chat-head badge). Sits at the top of the text block as its own little bubble. */
+.mood-pill{display:inline-flex;align-items:center;gap:5px;font-size:12px;padding:2px 8px;border-radius:999px;background:rgba(125,211,252,.14);border:1px solid var(--line);color:var(--mut);max-width:100%}
+.mood-pill .mood-emoji{font-size:13px;line-height:1}
+.mood-pill .mood-text{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .msg .who-name{font-size:14px;font-weight:700;color:var(--txt)}
 .msg .who-time{font-size:12px;color:var(--mut)}
 .msg.user{background:linear-gradient(180deg,rgba(125,211,252,.10),rgba(167,139,250,.06))}
@@ -242,6 +252,13 @@ button.danger{background:rgba(255,80,80,.15);border-color:rgba(255,80,80,.4);col
 .toast.err{border-left-color:#ff7b7b}
 .toast.ok{border-left-color:#86efac}
 @keyframes toastin{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+/* Wallpaper picker grid: thumbnails in the settings page. */
+.wallpaper-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:10px;margin-top:6px}
+.wpaper-tile{position:relative;border-radius:10px;overflow:border-box;border:2px solid transparent;cursor:pointer;aspect-ratio:16/10;background:center/cover no-repeat;transition:border-color .15s,transform .1s}
+.wpaper-tile:hover{transform:translateY(-2px)}
+.wpaper-tile.on{border-color:var(--acc)}
+.wpaper-tile .wpaper-name{position:absolute;left:0;right:0;bottom:0;font-size:11px;padding:3px 6px;color:#fff;background:rgba(0,0,0,.5);text-align:left}
+.wpaper-tile .wpaper-check{position:absolute;top:4px;right:6px;font-size:12px;color:#fff;text-shadow:0 0 4px #000}
 #dmem-prompt{width:100%;min-height:220px;resize:vertical;font:12px/1.5 ui-monospace,Menlo,monospace}
 #audit-blocks table{width:100%;border-collapse:collapse;font-size:12px}
 #audit-blocks th,#audit-blocks td{border-bottom:1px solid var(--line);padding:4px 6px;text-align:left}
@@ -264,16 +281,18 @@ body[data-theme="tavern-glass"] .msg.user{background:linear-gradient(180deg,rgba
   body.nav-collapsed .side-foot{display:flex}
   body.nav-collapsed .nav button{justify-content:flex-start;padding:9px 12px}
   .nav-toggle{display:none}
-  .content{width:100%}
-  .chat-head{margin-top:52px;flex-wrap:nowrap;padding:8px 10px}
-  .chat-head .avatar{width:48px;height:48px;border-radius:12px}
-  #chat-char-name{font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:46vw}
-  .mood{font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .content{width:100%;padding:2px;padding-top:52px}   /* clear the fixed hamburger; chat page resets its own margin */
+#page-chat .chat-head{margin-top:0}
+  .chat-head{background:transparent;border:none;border-radius:0;box-shadow:none;flex-wrap:nowrap;padding:8px 10px}
+  #chat-char-name{font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .chat-box{padding:12px 8%}   /* ~10% horizontal inset so user bubbles sit off the left edge */
   .msg-img{max-width:160px}
   .msg{gap:8px;padding:8px 10px}
   .msg .avatar-gutter .avatar,.msg .avatar.user-avatar{width:40px;height:40px;font-size:17px}
   #toast-wrap{left:12px;right:12px;bottom:calc(12px + env(safe-area-inset-bottom,0px));align-items:stretch}
   .toast{max-width:none}
+  *{scrollbar-width:none}*::-webkit-scrollbar{display:none!important;width:0;height:0}
+  .wallpaper-grid{grid-template-columns:repeat(auto-fill,minmax(100px,1fr))}
 }
 /* login overlay (shown only when the server gate is on and unauthenticated) */
 .login-overlay{position:fixed;inset:0;z-index:90;display:flex;align-items:center;justify-content:center;padding:16px;background:rgba(6,9,14,.82);backdrop-filter:blur(6px)}

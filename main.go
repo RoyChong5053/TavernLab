@@ -2094,6 +2094,33 @@ func main() {
 		})
 	})
 
+	// Wallpaper listing: folders under the local wallpaper/ dir, each folder
+	// holding image variants (often different resolutions). Local-only, read
+	// from disk at runtime (not baked into the binary).
+	mux.HandleFunc("/api/wallpapers", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			http.Error(w, "method not allowed", 405)
+			return
+		}
+		listWallpapers(w, "wallpaper")
+	})
+	// Serve a wallpaper image from disk: /wallpaper/<folder>/<file>
+	mux.HandleFunc("/wallpaper/", func(w http.ResponseWriter, r *http.Request) {
+		rel := strings.TrimPrefix(r.URL.Path, "/wallpaper/")
+		if rel == "" || rel == "/" {
+			http.Error(w, "missing path", 400)
+			return
+		}
+		clean := filepath.Clean("/" + rel)            // strip any leading /
+		full := filepath.Join("wallpaper", clean[1:]) // re-root under wallpaper/
+		base := filepath.Clean("wallpaper")
+		if !(strings.HasPrefix(full, base+string(filepath.Separator)) || full == base) {
+			http.Error(w, "bad path", 400)
+			return
+		}
+		http.ServeFile(w, r, full)
+	})
+
 	// Static frontend. no-cache: the embedded assets have zero modtime, so
 	// without this a browser may serve a stale app.js after an upgrade.
 	sub, _ := fs.Sub(webFS, "web")
@@ -2139,6 +2166,54 @@ func authGate(a *Auth, next http.Handler) http.Handler {
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// listWallpapers enumerates folders under dir and returns each folder's image
+// files. A missing dir yields an empty list (the settings grid shows "none").
+func listWallpapers(w http.ResponseWriter, dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		writeJSON(w, map[string]any{"wallpapers": []any{}})
+		return
+	}
+	type wp struct {
+		Name  string   `json:"name"`
+		Files []string `json:"files"`
+	}
+	var out []wp
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		files, err := os.ReadDir(filepath.Join(dir, e.Name()))
+		if err != nil {
+			continue
+		}
+		var imgs []string
+		for _, f := range files {
+			if !f.IsDir() && isImageFile(f.Name()) {
+				imgs = append(imgs, f.Name())
+			}
+		}
+		if len(imgs) == 0 {
+			continue
+		}
+		sort.Strings(imgs)
+		out = append(out, wp{Name: e.Name(), Files: imgs})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	if out == nil {
+		out = []wp{}
+	}
+	writeJSON(w, map[string]any{"wallpapers": out})
+}
+
+func isImageFile(name string) bool {
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif":
+		return true
+	}
+	return false
 }
 
 // injectChat renders {{chat_history}} into the chat module from simple turns.

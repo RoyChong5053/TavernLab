@@ -19,6 +19,7 @@ const settings = Object.assign(
     rerank_url: 'http://127.0.0.1:11437', char: 'Leer乐儿', model: '',
     stream: false, visible_turns: 10, user_name: 'RoyChong', avatar_px: 88,
     ui_scale: 100, theme: 'st-dark', theme_custom: {}, nav_collapsed: false,
+    wallpaper: {},
   },
   store.get('settings', {}),
 );
@@ -563,21 +564,8 @@ async function asyncAction(btn, fn) {
 let pendingTimer = null, pendingOn = false;
 function setPending(on) {
   pendingOn = !!on;
-  const el = document.getElementById('expr-badge');
-  if (!el) return;
-  clearInterval(pendingTimer);
-  if (on) {
-    const frames = ['Replying', 'Replying.', 'Replying..', 'Replying...'];
-    let i = 0;
-    el.classList.add('pending');
-    el.classList.remove('pending-dots');
-    el.textContent = frames[0];
-    pendingTimer = setInterval(() => { i = (i + 1) % frames.length; el.textContent = frames[i]; }, 420);
-  } else {
-    el.classList.remove('pending');
-    // mood text is restored by classifyAndBadge; fall back if it never resolves
-    if (el.textContent.startsWith('Replying')) el.textContent = 'Mood · —';
-  }
+  // The in-flight bubble carries its own cursor marker (::after ▍), so the
+  // old top "Mood · Replying…" badge is gone — no element to update here.
 }
 
 /* ---------- nav ---------- */
@@ -791,7 +779,7 @@ let pendingAssistant = null;
 // sender can tell "SSE already rendered my reply" from a legitimately repeated
 // identical reply across turns.
 let assistantSseSeq = 0;
-function chatBox() { return document.querySelector('.chat-box'); }
+function chatBox() { return document.querySelector('#chat'); }
 function isNearBottom(box, px = 120) {
   if (!box) return true;
   return box.scrollHeight - box.scrollTop - box.clientHeight < px;
@@ -893,36 +881,7 @@ function renderMsg(role, text, who, prepend, images, id, time, mood) {
     tEl.textContent = tt;
     w.appendChild(tEl);
   }
-  // Per-message actions: copy raw source, regenerate (assistant), delete.
-  // Desktop reveals on hover, touch always shows (see .msg-actions CSS).
-  if (role === 'user' || role === 'assistant') {
-    const acts = document.createElement('div');
-    acts.className = 'msg-actions';
-    const btnCopy = document.createElement('button');
-    btnCopy.type = 'button';
-    btnCopy.textContent = 'Copy';
-    btnCopy.title = 'Copy raw text';
-    btnCopy.onclick = () => {
-      copyText(text || '').then((ok) => toast(ok ? 'Copied' : 'Copy failed', ok ? 'ok' : 'err'));
-    };
-    acts.appendChild(btnCopy);
-    if (role === 'assistant') {
-      const btnRe = document.createElement('button');
-      btnRe.type = 'button';
-      btnRe.textContent = 'Regen';
-      btnRe.title = 'Regenerate the last reply (/regenerate)';
-      btnRe.onclick = () => { send(true); };
-      acts.appendChild(btnRe);
-    }
-    const btnDel = document.createElement('button');
-    btnDel.type = 'button';
-    btnDel.textContent = 'Delete';
-    btnDel.title = 'Delete this message';
-    btnDel.className = 'danger';
-    btnDel.onclick = () => deleteMsg(d, id);
-    acts.appendChild(btnDel);
-    w.appendChild(acts);
-  }
+  // (copy / regen / delete actions removed: low usage, kept the row clean)
   const b = document.createElement('div');
   b.className = 'body';
   const isUser = role === 'user';
@@ -998,6 +957,13 @@ async function loadEarlier() {
     const oldScroll = cbox ? cbox.scrollTop : 0;
     [...msgs].reverse().forEach((m) => renderMsg(m.role, m.text, null, true, m.images, m.id, m.time));
     historyShown += msgs.length;
+    // Classify mood per assistant message (best-effort, non-blocking) so each
+    // history bubble shows its own mood pill — the top badge is gone.
+    const aiBoxes = [...document.querySelectorAll('#chat .msg.ai')];
+    aiBoxes.forEach((box) => {
+      const body = box.querySelector('.body');
+      if (body && !box.dataset.moodPill) classifyAndBadge(body.dataset.raw || box.textContent || '', box).catch(() => {});
+    });
     if (cbox && anchor) {
       const newTop = anchor.getBoundingClientRect().top;
       cbox.scrollTop = oldScroll + (newTop - oldTop);
@@ -1061,6 +1027,28 @@ function subscribeChat() {
   });
   chatES.onerror = () => { /* browser auto-reconnects */ };
 }
+// A tiny "speech bubble" pill that carries the character's mood for THIS
+// message. Mood used to live in the top chat-head badge; per requirement it
+// now lives on the message that produced it, so each bubble keeps its own.
+function moodPillEmoji(label, fallback) { return (fallback || !label) ? '😐' : '😊'; }
+function applyMoodPill(msgEl, label, fallback) {
+  if (!msgEl || msgEl.dataset.moodPill) return; // already applied to this bubble
+  msgEl.dataset.moodPill = '1';
+  const pill = document.createElement('div');
+  pill.className = 'mood-pill';
+  const emoji = document.createElement('span');
+  emoji.className = 'mood-emoji';
+  emoji.textContent = moodPillEmoji(label, fallback);
+  pill.appendChild(emoji);
+  if (label && !fallback) {
+    const txt = document.createElement('span');
+    txt.className = 'mood-text';
+    txt.textContent = label;
+    pill.appendChild(txt);
+  }
+  const content = msgEl.querySelector(':scope > .msg-content');
+  (content || msgEl).insertBefore(pill, (content || msgEl).firstChild);
+}
 async function classifyAndBadge(text, msgEl) {
   try {
     const r = await api('/api/expression/classify', {
@@ -1068,8 +1056,7 @@ async function classifyAndBadge(text, msgEl) {
       body: JSON.stringify({ text: text.slice(-500), rerank_url: settings.rerank_url }),
     });
     const j = await r.json();
-    $('#expr-badge').textContent = j.fallback ? 'Mood · 😐 calm' : 'Mood · 😊 ' + j.label;
-    $('#expr-badge').title = JSON.stringify(j.scores || {});
+    applyMoodPill(msgEl, j.label, j.fallback);
     // Mood avatar: swap this bubble's avatar to the expression file when the
     // character ships one (expressions/<label>.webp...). Preload to avoid
     // flashing; fall back silently to the base avatar.
@@ -1080,9 +1067,6 @@ async function classifyAndBadge(text, msgEl) {
         probe.onload = () => {
           const img = msgEl.querySelector('.avatar-gutter img.avatar');
           if (img) { img.src = imgURL(u); delete img.dataset.base; }
-          // The head avatar follows the latest mood too.
-          const head = $('#chat-avatar');
-          if (head) head.src = imgURL(u);
         };
         probe.src = imgURL(u);
       }
@@ -1799,19 +1783,16 @@ $('#btn-reitti-live').onclick = () => asyncAction($('#btn-reitti-live'), async (
   $('#reitti-live-out').textContent = j.ok ? (j.text || '(empty window)') : ('Error: ' + (j.error || 'unknown'));
 });
 
-/* ---------- chat avatar size (global, header + per-message) ---------- */
+/* ---------- chat avatar size (per-message) ---------- */
 function applyAvatarSize() {
   const px = Math.min(240, Math.max(32, +settings.avatar_px || 88));
   document.documentElement.style.setProperty('--avatar-px', px + 'px');
-  const h = $('#chat-avatar');
-  if (h) { h.style.width = px + 'px'; h.style.height = px + 'px'; }
 }
 function syncChatHead() {
   $('#chat-char-name').textContent = settings.char;
   api('/api/characters/' + encodeURIComponent(settings.char)).then((r) => r.json()).then((j) => {
     charAvatarURL = j.avatar_url || '';
     charExpressions = j.expressions || [];
-    $('#chat-avatar').src = imgURL(charAvatarURL) || BLANK_GIF;
     // History may have rendered before this fetch landed (selectChar races
     // syncChatHead vs loadHistory): backfill base avatars, leave mood ones.
     const fresh = imgURL(charAvatarURL);
@@ -2506,11 +2487,97 @@ $('#btn-settings-save').onclick = () => asyncAction($('#btn-settings-save'), asy
     toast('My avatar removed; using name initial');
   });
 }
+/* ---------- wallpaper (local setting; images read from the project wallpaper/ folder) ---------- */
+let wallList = [];  // [{name, files:[]}]
+function pickWallpaperFile(folder) {
+  const item = wallList.find((w) => w.name === folder);
+  if (!item || !item.files.length) return null;
+  if (item.files.length === 1) return item.files[0];
+  const w = window.innerWidth;
+  const key = w <= 768 ? 'phone' : (w <= 1600 ? 'desktop' : '4k');
+  return item.files.find((f) => new RegExp(key, 'i').test(f)) || item.files[0];
+}
+function applyWallpaper() {
+  const wp = settings.wallpaper || {};
+  const body = document.body;
+  if (!wp.folder) { body.style.backgroundImage = ''; return; }
+  const file = pickWallpaperFile(wp.folder);
+  if (!file) return;
+  const url = '/wallpaper/' + encodeURIComponent(wp.folder) + '/' + encodeURIComponent(file);
+  const mode = wp.mode || 'cover';
+  body.style.backgroundImage = `url("${url}")`;
+  body.style.backgroundSize = mode === 'cover' ? 'cover' : mode === 'contain' ? 'contain' : mode === 'repeat' ? 'repeat' : 'auto';
+  body.style.backgroundRepeat = mode === 'repeat' ? 'repeat' : 'no-repeat';
+  body.style.backgroundPosition = 'center';
+  body.style.backgroundAttachment = 'scroll';
+}
+// Fetch the wallpaper folder list, render a thumbnail grid, and let the user
+// pick one. Thumbnails are generated client-side (cover-fit crop) so the
+// server stays dumb — it only serves raw images + the folder listing.
+async function loadWallpapers() {
+  const grid = $('#wallpaper-thumbs');
+  const state = $('#wallpaper-state');
+  if (!grid) return;
+  try {
+    const r = await api('/api/wallpapers');
+    const j = await r.json();
+    wallList = j.wallpapers || [];
+    grid.innerHTML = '';
+    if (!wallList.length) {
+      grid.innerHTML = '<span class="meta">No wallpapers found — add subfolders to the wallpaper/ folder.</span>';
+      return;
+    }
+    const sel = settings.wallpaper || {};
+    for (const w of wallList) {
+      const canvas = document.createElement('canvas');
+      canvas.width = 320; canvas.height = 200;
+      const tile = document.createElement('div');
+      tile.className = 'wpaper-tile';
+      const check = document.createElement('span');
+      check.className = 'wpaper-check';
+      const label = document.createElement('div');
+      label.className = 'wpaper-name';
+      label.textContent = w.name;
+      tile.append(check, label);
+      grid.appendChild(tile);
+      const img = new Image();
+      img.crossOrigin = 'anonymous';
+      img.onload = () => {
+        const ctx = canvas.getContext('2d');
+        const s = Math.min(320 / img.width, 200 / img.height);
+        const w2 = img.width * s, h2 = img.height * s;
+        ctx.drawImage(img, (320 - w2) / 2, (200 - h2) / 2, w2, h2);
+        canvas.toBlob((blob) => { tile.style.backgroundImage = `url(${URL.createObjectURL(blob)})`; });
+      };
+      img.onerror = () => { tile.style.background = 'var(--card)'; };
+      img.src = '/wallpaper/' + encodeURIComponent(w.name) + '/' + encodeURIComponent(w.files[0]);
+      tile.onclick = () => {
+        settings.wallpaper = { folder: w.name, mode: settings.wallpaper?.mode || 'cover' };
+        store.set('settings', settings);
+        applyWallpaper();
+        [...grid.children].forEach((c) => c.classList.remove('on'));
+        tile.classList.add('on');
+        check.textContent = '✓';
+        if (state) state.textContent = 'Wallpaper applied';
+      };
+    }
+  } catch (e) {
+    grid.innerHTML = '<span class="meta">Failed to load wallpapers: ' + (e && e.message ? e.message : e) + '</span>';
+  }
+}
 // Theme picker: local-only, applies instantly (no server round-trip).
 { const t = $('#set-theme'); if (t) t.addEventListener('change', () => setTheme(t.value)); }
 document.querySelectorAll('[data-themek]').forEach((el) => {
   el.addEventListener('input', () => setThemeCustom(el.dataset.themek, el.value));
 });
+// Wallpaper style select: apply instantly, persist locally.
+{ const m = $('#set-wallpaper-mode'); if (m) {
+  m.addEventListener('change', () => {
+    settings.wallpaper = { folder: settings.wallpaper?.folder || '', mode: m.value };
+    store.set('settings', settings);
+    applyWallpaper();
+  });
+} }
 // autosave: any change in the settings form persists (debounced)
 let settingsSaveTimer = null;
 function scheduleSettingsSave() {
@@ -2554,5 +2621,7 @@ async function init() {
   loadHistory();
   subscribeChat();
   loadMemoryProfile();
+  await loadWallpapers();
+  applyWallpaper();
 }
 init();

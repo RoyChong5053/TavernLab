@@ -56,11 +56,9 @@
     <div id="model-banner" class="model-banner hidden"></div>
     <!-- CHAT (default) -->
     <section class="page on" id="page-chat">
-      <div class="chat-head glass">
-        <img id="chat-avatar" class="avatar sq" alt="Character avatar" src="">
+      <div class="chat-head glass" id="chat-head">
         <div class="chat-head-info">
           <strong id="chat-char-name">Leer乐儿</strong>
-          <div id="expr-badge" class="mood" title="Latest expression label">Mood · —</div>
         </div>
       </div>
       <div class="glass chat-box">
@@ -318,6 +316,24 @@
           <button id="btn-export">📥 Export md</button>
           <button id="btn-export-all">📥 Export all archives + current</button>
           <button id="btn-archive">🗃 Archive & new floor</button>
+        </div>
+      </div>
+      <div class="glass pad form">
+        <b>Wallpaper</b>
+        <p class="meta">Background behind the chat. Images are read from the project's <code>wallpaper/</code> folder (one wallpaper per subfolder; multiple files = resolution variants). Stored in this browser only.</p>
+        <div class="row">
+          <label>Style
+            <select id="set-wallpaper-mode">
+              <option value="cover">Fill (cover)</option>
+              <option value="contain">Best fit (contain)</option>
+              <option value="center">Center (native size)</option>
+              <option value="repeat">Tiled</option>
+            </select>
+          </label>
+          <span id="wallpaper-state" class="meta"></span>
+        </div>
+        <div id="wallpaper-thumbs" class="wallpaper-grid">
+          <span class="meta">Loading wallpapers…</span>
         </div>
       </div>
       <div class="glass pad form">

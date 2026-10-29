@@ -1,6 +1,7 @@
 data/audit/
 data/chats/
 data/settings.json
+data/calibration.json
 data/sessions.json
 data/characters/
 data/user_avatar.*
