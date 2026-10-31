@@ -1,14 +1,13 @@
-:root{--bg:#0b0e14;--bg2:#111827;--glass:rgba(255,255,255,.07);--card:rgba(255,255,255,.05);--line:rgba(255,255,255,.12);--txt:#e8ecf3;--mut:#9aa4b2;--acc:#7dd3fc;--acc2:#a78bfa;--avatar-px:88px;--msg-font:15px;--glass-hi:rgba(255,255,255,.07);--radius:14px;--sidebar-w:200px}
+:root{--bg:#0b0e14;--bg2:#111827;--bg-rgb:11,14,20;--glass:rgba(255,255,255,.07);--glass-rgb:255,255,255;--glass-a:.048;--glass-blur:16px;--glass-sat:1.35;--card:rgba(255,255,255,.05);--line:rgba(255,255,255,.12);--txt:#e8ecf3;--mut:#9aa4b2;--acc:#7dd3fc;--acc2:#a78bfa;--avatar-px:88px;--msg-font:15px;--glass-hi:rgba(255,255,255,.07);--radius:14px;--sidebar-w:200px;--wall-dim:0}
 .hidden{display:none!important}
 /* ST 暗灰（默认）：中性灰底 + 克制玻璃（哑光半透明、发丝边、内高光），不放蓝渐变 */
-body[data-theme="st-dark"]{--bg:#23262d;--bg2:#23262d;--glass:rgba(255,255,255,.045);--card:rgba(255,255,255,.04);--line:rgba(255,255,255,.09);--txt:#e6e8eb;--mut:#8b909c;--acc:#7dd3fc;--acc2:#a78bfa;--glass-hi:rgba(255,255,255,.06);background:radial-gradient(1100px 700px at 78% -12%,rgba(255,255,255,.04),transparent 62%),var(--bg)}
-body[data-theme="st-dark"] .glass{background:linear-gradient(180deg,rgba(255,255,255,.055),rgba(255,255,255,.026));backdrop-filter:blur(14px) saturate(1.2);-webkit-backdrop-filter:blur(14px) saturate(1.2);border:1px solid var(--line);border-radius:var(--radius);box-shadow:inset 0 1px 0 var(--glass-hi),0 1px 2px rgba(0,0,0,.3)}
+body[data-theme="st-dark"]{--bg:#23262d;--bg2:#23262d;--bg-rgb:35,38,45;--glass:rgba(255,255,255,.045);--glass-a:.048;--glass-blur:14px;--glass-sat:1.2;--card:rgba(255,255,255,.04);--line:rgba(255,255,255,.09);--txt:#e6e8eb;--mut:#8b909c;--acc:#7dd3fc;--acc2:#a78bfa;--glass-hi:rgba(255,255,255,.06);background:radial-gradient(1100px 700px at 78% -12%,rgba(255,255,255,.04),transparent 62%),var(--bg)}
 body[data-theme="st-dark"] .msg{box-shadow:inset 0 1px 0 rgba(255,255,255,.035),0 1px 2px rgba(0,0,0,.3)}
 body[data-theme="st-dark"] .msg .body code{background:#1a1c22;border:1px solid rgba(255,255,255,.06)}
 /* 旧版玻璃（保留）：沿用 :root 默认值 */
-body[data-theme="tavern-glass"]{background:radial-gradient(1200px 600px at 20% -10%,#1e293b,transparent),linear-gradient(180deg,var(--bg),var(--bg2))}
+body[data-theme="tavern-glass"]{--bg-rgb:11,14,20;--glass-a:.07;--glass-blur:16px;--glass-sat:1.35;background:radial-gradient(1200px 600px at 20% -10%,#1e293b,transparent),linear-gradient(180deg,var(--bg),var(--bg2))}
 /* 纸白浅色 */
-body[data-theme="paper"]{--bg:#f4f1ea;--bg2:#f4f1ea;--glass:#ffffff;--card:#ffffff;--line:rgba(0,0,0,.1);--txt:#23262d;--mut:#6b7280;--acc:#0369a1;--acc2:#6d28d9;background:var(--bg)}
+body[data-theme="paper"]{--bg:#f4f1ea;--bg2:#f4f1ea;--bg-rgb:244,241,234;--glass:#ffffff;--glass-a:1;--glass-blur:0;--glass-sat:1;--card:#ffffff;--line:rgba(0,0,0,.1);--txt:#23262d;--mut:#6b7280;--acc:#0369a1;--acc2:#6d28d9;background:var(--bg)}
 body[data-theme="paper"] .glass{background:var(--card);backdrop-filter:none;-webkit-backdrop-filter:none;border:1px solid var(--line);border-radius:10px}
 body[data-theme="paper"] input,body[data-theme="paper"] textarea,body[data-theme="paper"] select{background:rgba(255,255,255,.9)}
 body[data-theme="paper"] button{background:rgba(0,0,0,.05)}
@@ -29,7 +28,17 @@ body{margin:0;background:radial-gradient(1200px 600px at 20% -10%,#1e293b,transp
 body::before{content:'';position:fixed;inset:0;z-index:9998;pointer-events:none;opacity:.04;mix-blend-mode:soft-light;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='180' height='180'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");background-size:180px 180px}
 body.no-noise::before{display:none}
 ::-webkit-scrollbar{width:10px;height:10px}::-webkit-scrollbar-thumb{background:rgba(255,255,255,.16);border-radius:8px;border:2px solid transparent;background-clip:content-box}::-webkit-scrollbar-track{background:transparent}
-.glass{background:var(--glass);backdrop-filter:blur(16px) saturate(1.35);-webkit-backdrop-filter:blur(16px) saturate(1.35);border:1px solid var(--line);border-radius:var(--radius);box-shadow:inset 0 1px 0 var(--glass-hi),0 1px 2px rgba(0,0,0,.25)}
+/* Glass is driven by theme baselines plus the Appearance sliders, which write
+   --glass-a / --glass-blur inline on <body>. */
+.glass{background:linear-gradient(180deg,rgba(var(--glass-rgb),calc(var(--glass-a) + .012)),rgba(var(--glass-rgb),var(--glass-a)));backdrop-filter:blur(var(--glass-blur)) saturate(var(--glass-sat));-webkit-backdrop-filter:blur(var(--glass-blur)) saturate(var(--glass-sat));border:1px solid var(--line);border-radius:var(--radius);box-shadow:inset 0 1px 0 var(--glass-hi),0 1px 2px rgba(0,0,0,.25)}
+/* Fixed background layers live outside #app so UI scaling never moves them.
+   Wallpaper sits under a theme-coloured scrim; the scrim opacity is the
+   "wallpaper dim" slider, and its colour is the active background colour. */
+#bg-wallpaper,#bg-scrim{position:fixed;inset:0;pointer-events:none}
+#bg-wallpaper{z-index:-2;background-position:center;background-repeat:no-repeat;background-size:cover}
+#bg-scrim{z-index:-1;background:rgb(var(--bg-rgb));opacity:0;transition:opacity .2s ease}
+body.has-wallpaper #bg-scrim{opacity:var(--wall-dim)}
+#app{position:relative;z-index:1}
 #hamburger{display:none;position:fixed;top:10px;left:10px;z-index:50}
 .nav-backdrop{position:fixed;inset:0;z-index:39;background:rgba(0,0,0,.5)}
 .nav-backdrop.hidden{display:none}
@@ -129,19 +138,19 @@ body[data-theme="paper"] .coll-item{background:rgba(255,255,255,.6)}
 #chat{display:flex;flex-direction:column;gap:8px}
 /* ST 式通栏消息行：头像槽 + 内容列；不分左右气泡，用户也通栏（名字区分） */
 /* Bubble layout: avatar takes its own row on top, text block below — text is
-   never squeezed beside the avatar. User stacks right, assistant left. */
+   never squeezed beside the avatar. Both roles align left; the tinted bubble
+   tells user and assistant apart. */
 .msg{display:flex;flex-direction:column;gap:6px;width:100%;max-width:100%;padding:10px 12px;border-radius:10px;border:1px solid var(--line);white-space:normal;background:var(--card)}
 .msg.ai{align-items:flex-start}
-.msg.user{align-items:flex-end}
+.msg.user{align-items:flex-start}
 .msg .avatar-gutter{display:flex;justify-content:flex-start}
-.msg.user .avatar-gutter{justify-content:flex-end}
 .msg .avatar-gutter .avatar{width:var(--avatar-px);height:var(--avatar-px);border-radius:10px;object-fit:cover;border:1px solid var(--line);background:rgba(0,0,0,.4);display:block}
 .msg .avatar.user-avatar{width:var(--avatar-px);height:var(--avatar-px);border-radius:10px;background:var(--acc);color:#06222e;font-weight:700;display:flex;align-items:center;justify-content:center;font-size:calc(var(--avatar-px)*0.42)}
 .msg-content{width:100%}
 .msg .who{display:flex;gap:8px;align-items:baseline;margin-bottom:4px}
 .msg .who-name{flex:none}
 .msg.ai .who{justify-content:flex-start}
-.msg.user .who{justify-content:flex-end}
+.msg.user .who{justify-content:flex-start}
 /* Mood pill: the character's expression for THIS message (moved from the top
    chat-head badge). Sits at the top of the text block as its own little bubble. */
 .mood-pill{display:inline-flex;align-items:center;gap:5px;font-size:12px;padding:2px 8px;border-radius:999px;background:rgba(125,211,252,.14);border:1px solid var(--line);color:var(--mut);max-width:100%}
@@ -253,12 +262,19 @@ button.danger{background:rgba(255,80,80,.15);border-color:rgba(255,80,80,.4);col
 .toast.ok{border-left-color:#86efac}
 @keyframes toastin{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
 /* Wallpaper picker grid: thumbnails in the settings page. */
-.wallpaper-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:10px;margin-top:6px}
-.wpaper-tile{position:relative;border-radius:10px;overflow:border-box;border:2px solid transparent;cursor:pointer;aspect-ratio:16/10;background:center/cover no-repeat;transition:border-color .15s,transform .1s}
+.wallpaper-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:10px;margin-top:6px;width:100%}
+.wpaper-tile{position:relative;border-radius:10px;overflow:hidden;border:2px solid transparent;cursor:pointer;aspect-ratio:16/10;background:center/cover no-repeat;transition:border-color .15s,transform .1s}
 .wpaper-tile:hover{transform:translateY(-2px)}
 .wpaper-tile.on{border-color:var(--acc)}
+.wpaper-tile.none{display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.25);border:2px dashed var(--line);color:var(--mut);font-size:12px}
+.wpaper-tile.none.on{border-style:solid;border-color:var(--acc);color:var(--txt)}
 .wpaper-tile .wpaper-name{position:absolute;left:0;right:0;bottom:0;font-size:11px;padding:3px 6px;color:#fff;background:rgba(0,0,0,.5);text-align:left}
 .wpaper-tile .wpaper-check{position:absolute;top:4px;right:6px;font-size:12px;color:#fff;text-shadow:0 0 4px #000}
+.setting-group{display:flex;flex-direction:column;gap:8px;width:100%;padding-top:10px;border-top:1px solid var(--line)}
+.setting-title{font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--mut)}
+input[type=range]{width:150px;accent-color:var(--acc);background:transparent;border:none;padding:0}
+output{color:var(--mut);font-size:12px;font-variant-numeric:tabular-nums;min-width:36px;display:inline-block}
+label:has(input[type=range]){display:inline-flex;align-items:center;gap:8px}
 #dmem-prompt{width:100%;min-height:220px;resize:vertical;font:12px/1.5 ui-monospace,Menlo,monospace}
 #audit-blocks table{width:100%;border-collapse:collapse;font-size:12px}
 #audit-blocks th,#audit-blocks td{border-bottom:1px solid var(--line);padding:4px 6px;text-align:left}
@@ -269,9 +285,10 @@ body[data-theme="tavern-glass"] .msg{background:linear-gradient(180deg,rgba(255,
 body[data-theme="tavern-glass"] .msg.user{background:linear-gradient(180deg,rgba(125,211,252,.16),rgba(167,139,250,.10))}
 @media(max-width:820px){
   :root{--avatar-px:40px}
-  #hamburger{display:block}
-  .shell{padding:8px}
-  .sidebar{position:fixed;z-index:40;top:0;left:0;bottom:0;border-radius:0;transform:translateX(-110%);transition:.2s;background:rgba(11,14,20,.96)}
+  #hamburger{display:block;top:calc(10px + env(safe-area-inset-top,0px));left:calc(10px + env(safe-area-inset-left,0px))}
+  /* App-style shell: no outer padding, so the chat is edge-to-edge. */
+  .shell{padding:0;gap:0}
+  .sidebar{position:fixed;z-index:40;top:0;left:0;bottom:0;border-radius:0;transform:translateX(-110%);transition:.2s;background:rgba(var(--bg-rgb),.96)}
   body.nav-open .sidebar{transform:none}
   /* 移动端抽屉忽略桌面收起态：始终完整显示 */
   body.nav-collapsed .sidebar{width:var(--sidebar-w);padding:14px}
@@ -281,14 +298,32 @@ body[data-theme="tavern-glass"] .msg.user{background:linear-gradient(180deg,rgba
   body.nav-collapsed .side-foot{display:flex}
   body.nav-collapsed .nav button{justify-content:flex-start;padding:9px 12px}
   .nav-toggle{display:none}
-  .content{width:100%;padding:2px;padding-top:52px}   /* clear the fixed hamburger; chat page resets its own margin */
-#page-chat .chat-head{margin-top:0}
-  .chat-head{background:transparent;border:none;border-radius:0;box-shadow:none;flex-wrap:nowrap;padding:8px 10px}
+  .content{width:100%;padding:0}
+  .page:not(#page-chat){padding:12px 10px calc(24px + env(safe-area-inset-bottom,0px))}
+  .model-banner{margin:8px 10px 0}
+  #page-chat .chat-head{margin-top:0}
+  /* Flat app bar: safe-area top, room for the hamburger, one hairline. */
+  .chat-head{background:transparent;border:none;border-bottom:1px solid var(--line);border-radius:0;box-shadow:none;flex-wrap:nowrap;padding:calc(env(safe-area-inset-top,0px) + 8px) 12px 8px calc(env(safe-area-inset-left,0px) + 52px)}
   #chat-char-name{font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  .chat-box{padding:12px 8%}   /* ~10% horizontal inset so user bubbles sit off the left edge */
+  /* The message list is the page, not a card inside a card. */
+  .chat-box{background:transparent;border:none;border-radius:0;box-shadow:none;backdrop-filter:none;-webkit-backdrop-filter:none;padding:8px 12px}
+  #chat{gap:10px}
+  .msg,.msg.ai,.msg.user{background:transparent;border:0;border-radius:0;box-shadow:none;padding:2px 0;gap:4px}
+  body[data-theme="st-dark"] .msg,body[data-theme="st-dark"] .msg.user,
+  body[data-theme="tavern-glass"] .msg,body[data-theme="tavern-glass"] .msg.user,
+  body[data-theme="paper"] .msg{background:transparent;border:0;box-shadow:none}
+  .msg .avatar-gutter{display:none}
+  .msg .msg-content{width:auto;max-width:82%}
+  .msg.ai .msg-content{width:100%;max-width:none}
+  .msg.user{align-items:flex-end}
+  .msg.user .msg-content{background:var(--acc);color:#06222e;border-radius:16px 16px 4px 16px;padding:8px 12px;max-width:82%}
+  .msg.user .who-name,.msg.user .who-time{color:rgba(6,34,46,.72)}
+  .msg.user .body{color:#06222e}
+  .msg.user .body a{color:#06222e}
+  .msg.user .body code,.msg.user .body pre{background:rgba(6,34,46,.14);border-color:rgba(6,34,46,.18)}
   .msg-img{max-width:160px}
-  .msg{gap:8px;padding:8px 10px}
-  .msg .avatar-gutter .avatar,.msg .avatar.user-avatar{width:40px;height:40px;font-size:17px}
+  /* Bottom toolbar: hairline + tinted glass, with the safe-area inset. */
+  .composer{background:rgba(var(--bg-rgb),.88);border:none;border-top:1px solid var(--line);border-radius:0;box-shadow:none;backdrop-filter:blur(var(--glass-blur)) saturate(var(--glass-sat));-webkit-backdrop-filter:blur(var(--glass-blur)) saturate(var(--glass-sat));padding:8px 10px calc(8px + env(safe-area-inset-bottom,0px))}
   #toast-wrap{left:12px;right:12px;bottom:calc(12px + env(safe-area-inset-bottom,0px));align-items:stretch}
   .toast{max-width:none}
   *{scrollbar-width:none}*::-webkit-scrollbar{display:none!important;width:0;height:0}

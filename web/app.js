@@ -19,7 +19,8 @@ const settings = Object.assign(
     rerank_url: 'http://127.0.0.1:11437', char: 'Leer乐儿', model: '',
     stream: false, visible_turns: 10, user_name: 'RoyChong', avatar_px: 88,
     ui_scale: 100, theme: 'st-dark', theme_custom: {}, nav_collapsed: false,
-    wallpaper: {},
+    wallpaper: {}, glass_alpha: 12, glass_blur: 16, wallpaper_dim: 30,
+    noise: true,
   },
   store.get('settings', {}),
 );
@@ -336,6 +337,13 @@ const THEMES = {
   'paper': { name: 'Paper (light)' },
   'custom': { name: 'Custom' },
 };
+function hexToRgb(hex) {
+  const m = /^#?([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(String(hex || '').trim());
+  if (!m) return '';
+  let h = m[1];
+  if (h.length === 3) h = h.split('').map((x) => x + x).join('');
+  return [0, 2, 4].map((i) => parseInt(h.slice(i, i + 2), 16)).join(',');
+}
 function applyTheme() {
   const t = settings.theme || 'st-dark';
   document.body.dataset.theme = t;
@@ -345,6 +353,10 @@ function applyTheme() {
     if (t === 'custom' && c[k]) root.style.setProperty(k, c[k]);
     else root.style.removeProperty(k);
   });
+  // --bg-rgb feeds the wallpaper scrim and the mobile composer tint, so the
+  // custom background colour keeps working even when a wallpaper is on top.
+  if (t === 'custom' && c['--bg']) root.style.setProperty('--bg-rgb', hexToRgb(c['--bg']));
+  else root.style.removeProperty('--bg-rgb');
   const sel = $('#set-theme');
   if (sel && sel.value !== t) sel.value = t;
   const box = $('#theme-custom');
@@ -353,6 +365,29 @@ function applyTheme() {
     const el = document.querySelector(`[data-themek="${k}"]`);
     if (el && el.value !== c[k]) el.value = c[k];
   });
+  syncThemeControls();
+}
+function syncThemeControls() {
+  const paper = (settings.theme || 'st-dark') === 'paper';
+  ['#set-glass-alpha', '#set-glass-blur'].forEach((id) => {
+    const el = $(id);
+    if (el) el.disabled = paper;
+  });
+  const hint = $('#glass-hint');
+  if (hint) hint.classList.toggle('hidden', !paper);
+}
+function applyGlass() {
+  const a = Math.min(100, Math.max(0, settings.glass_alpha ?? 12));
+  const b = Math.min(32, Math.max(0, settings.glass_blur ?? 16));
+  document.body.style.setProperty('--glass-a', (a / 100 * 0.4).toFixed(3));
+  document.body.style.setProperty('--glass-blur', b + 'px');
+  document.body.classList.toggle('no-noise', settings.noise === false);
+  const ai = $('#set-glass-alpha'), bi = $('#set-glass-blur');
+  if (ai) ai.value = a;
+  if (bi) bi.value = b;
+  const ao = $('#glass-alpha-out'), bo = $('#glass-blur-out');
+  if (ao) ao.textContent = a + '%';
+  if (bo) bo.textContent = b + 'px';
 }
 function setTheme(t) {
   settings.theme = THEMES[t] ? t : 'st-dark';
@@ -364,6 +399,7 @@ function setThemeCustom(k, v) {
   store.set('settings', settings);
   if ((settings.theme || 'st-dark') === 'custom') {
     document.documentElement.style.setProperty(k, v);
+    if (k === '--bg') document.documentElement.style.setProperty('--bg-rgb', hexToRgb(v));
   }
 }
 
@@ -2415,6 +2451,12 @@ function fillSettingsForm() {
   $('#set-visible').value = settings.visible_turns || 10;
   $('#set-user').value = settings.user_name || '';
   $('#set-avatar-size').value = settings.avatar_px || 88;
+  $('#set-glass-alpha').value = settings.glass_alpha ?? 12;
+  $('#set-glass-blur').value = settings.glass_blur ?? 16;
+  $('#set-wallpaper-dim').value = settings.wallpaper_dim ?? 30;
+  $('#set-noise').checked = settings.noise !== false;
+  { const m = $('#set-wallpaper-mode'); if (m) m.value = (settings.wallpaper && settings.wallpaper.mode) || 'cover'; }
+  applyGlass();
   applyTheme();
 }
 async function saveSettings(silent) {
@@ -2426,6 +2468,10 @@ async function saveSettings(silent) {
   settings.stream = $('#set-stream').checked;
   settings.visible_turns = Math.min(200, Math.max(5, +$('#set-visible').value || 10));
   settings.avatar_px = Math.min(240, Math.max(32, +$('#set-avatar-size').value || 88));
+  settings.glass_alpha = Math.min(100, Math.max(0, +$('#set-glass-alpha').value || 0));
+  settings.glass_blur = Math.min(32, Math.max(0, +$('#set-glass-blur').value || 0));
+  settings.wallpaper_dim = Math.min(100, Math.max(0, +$('#set-wallpaper-dim').value || 0));
+  settings.noise = $('#set-noise').checked;
   settings.user_name = $('#set-user').value.trim() || 'user';
   settings.model = $('#set-model').value || settings.model;
   store.set('settings', settings);
@@ -2454,6 +2500,7 @@ async function saveSettings(silent) {
   $('#set-apikey').value = '';
   applyAvatarSize();
   refreshUserAvatarGutters(); // user_name changed: refresh initial-avatars too
+  applyGlass();
   applyTheme();
   if (!silent) toast('Preferences saved');
   return r;
@@ -2497,42 +2544,80 @@ function pickWallpaperFile(folder) {
   const key = w <= 768 ? 'phone' : (w <= 1600 ? 'desktop' : '4k');
   return item.files.find((f) => new RegExp(key, 'i').test(f)) || item.files[0];
 }
+function wallpaperURL(folder, file) {
+  return '/wallpaper/' + encodeURIComponent(folder) + '/' + encodeURIComponent(file);
+}
 function applyWallpaper() {
   const wp = settings.wallpaper || {};
-  const body = document.body;
-  if (!wp.folder) { body.style.backgroundImage = ''; return; }
-  const file = pickWallpaperFile(wp.folder);
-  if (!file) return;
-  const url = '/wallpaper/' + encodeURIComponent(wp.folder) + '/' + encodeURIComponent(file);
+  const layer = $('#bg-wallpaper');
+  const file = wp.folder ? pickWallpaperFile(wp.folder) : null;
+  const has = !!(wp.folder && file);
+  document.body.classList.toggle('has-wallpaper', has);
+  const dim = Math.min(100, Math.max(0, settings.wallpaper_dim ?? 30));
+  document.body.style.setProperty('--wall-dim', (dim / 100).toFixed(2));
+  const out = $('#wallpaper-dim-out');
+  if (out) out.textContent = dim + '%';
+  if (!layer) return;
+  if (!has) { layer.style.backgroundImage = ''; return; }
   const mode = wp.mode || 'cover';
-  body.style.backgroundImage = `url("${url}")`;
-  body.style.backgroundSize = mode === 'cover' ? 'cover' : mode === 'contain' ? 'contain' : mode === 'repeat' ? 'repeat' : 'auto';
-  body.style.backgroundRepeat = mode === 'repeat' ? 'repeat' : 'no-repeat';
-  body.style.backgroundPosition = 'center';
-  body.style.backgroundAttachment = 'scroll';
+  layer.style.backgroundImage = `url("${wallpaperURL(wp.folder, file)}")`;
+  layer.style.backgroundSize = mode === 'cover' ? 'cover' : mode === 'contain' ? 'contain' : mode === 'repeat' ? 'repeat' : 'auto';
+  layer.style.backgroundRepeat = mode === 'repeat' ? 'repeat' : 'no-repeat';
+  layer.style.backgroundPosition = 'center';
+}
+function syncWallpaperSelection(grid) {
+  if (!grid) return;
+  const sel = settings.wallpaper || {};
+  [...grid.querySelectorAll('.wpaper-tile')].forEach((tile) => {
+    const on = (tile.dataset.folder || '') === (sel.folder || '');
+    tile.classList.toggle('on', on);
+    const check = tile.querySelector('.wpaper-check');
+    if (check) check.textContent = on ? '✓' : '';
+  });
+  const state = $('#wallpaper-state');
+  if (state) state.textContent = sel.folder ? ('Applied: ' + sel.folder) : 'No wallpaper';
 }
 // Fetch the wallpaper folder list, render a thumbnail grid, and let the user
 // pick one. Thumbnails are generated client-side (cover-fit crop) so the
 // server stays dumb — it only serves raw images + the folder listing.
 async function loadWallpapers() {
   const grid = $('#wallpaper-thumbs');
-  const state = $('#wallpaper-state');
   if (!grid) return;
   try {
     const r = await api('/api/wallpapers');
     const j = await r.json();
     wallList = j.wallpapers || [];
     grid.innerHTML = '';
+    // "None" is a real tile: before this there was no way to clear a wallpaper
+    // from the UI short of wiping localStorage.
+    const none = document.createElement('div');
+    none.className = 'wpaper-tile none';
+    none.dataset.folder = '';
+    const noneCheck = document.createElement('span');
+    noneCheck.className = 'wpaper-check';
+    const noneLabel = document.createElement('div');
+    noneLabel.className = 'wpaper-name';
+    noneLabel.textContent = 'None';
+    none.append(noneCheck, noneLabel);
+    none.onclick = () => {
+      settings.wallpaper = { folder: '', mode: settings.wallpaper?.mode || 'cover' };
+      store.set('settings', settings);
+      applyWallpaper();
+      syncWallpaperSelection(grid);
+    };
+    grid.appendChild(none);
     if (!wallList.length) {
-      grid.innerHTML = '<span class="meta">No wallpapers found — add subfolders to the wallpaper/ folder.</span>';
-      return;
+      const empty = document.createElement('span');
+      empty.className = 'meta';
+      empty.textContent = 'No wallpaper images found — add subfolders to the wallpaper/ folder.';
+      grid.appendChild(empty);
     }
-    const sel = settings.wallpaper || {};
     for (const w of wallList) {
       const canvas = document.createElement('canvas');
       canvas.width = 320; canvas.height = 200;
       const tile = document.createElement('div');
       tile.className = 'wpaper-tile';
+      tile.dataset.folder = w.name;
       const check = document.createElement('span');
       check.className = 'wpaper-check';
       const label = document.createElement('div');
@@ -2550,17 +2635,15 @@ async function loadWallpapers() {
         canvas.toBlob((blob) => { tile.style.backgroundImage = `url(${URL.createObjectURL(blob)})`; });
       };
       img.onerror = () => { tile.style.background = 'var(--card)'; };
-      img.src = '/wallpaper/' + encodeURIComponent(w.name) + '/' + encodeURIComponent(w.files[0]);
+      img.src = wallpaperURL(w.name, w.files[0]);
       tile.onclick = () => {
         settings.wallpaper = { folder: w.name, mode: settings.wallpaper?.mode || 'cover' };
         store.set('settings', settings);
         applyWallpaper();
-        [...grid.children].forEach((c) => c.classList.remove('on'));
-        tile.classList.add('on');
-        check.textContent = '✓';
-        if (state) state.textContent = 'Wallpaper applied';
+        syncWallpaperSelection(grid);
       };
     }
+    syncWallpaperSelection(grid);
   } catch (e) {
     grid.innerHTML = '<span class="meta">Failed to load wallpapers: ' + (e && e.message ? e.message : e) + '</span>';
   }
@@ -2578,6 +2661,54 @@ document.querySelectorAll('[data-themek]').forEach((el) => {
     applyWallpaper();
   });
 } }
+{ const d = $('#set-wallpaper-dim'); if (d) {
+  d.addEventListener('input', () => {
+    settings.wallpaper_dim = Math.min(100, Math.max(0, +d.value || 0));
+    store.set('settings', settings);
+    applyWallpaper();
+  });
+} }
+// Glass sliders: live preview, persisted locally. Paper disables them in
+// syncThemeControls because that theme is intentionally opaque.
+{ const a = $('#set-glass-alpha'); if (a) {
+  a.addEventListener('input', () => {
+    settings.glass_alpha = Math.min(100, Math.max(0, +a.value || 0));
+    store.set('settings', settings);
+    applyGlass();
+  });
+} }
+{ const b = $('#set-glass-blur'); if (b) {
+  b.addEventListener('input', () => {
+    settings.glass_blur = Math.min(32, Math.max(0, +b.value || 0));
+    store.set('settings', settings);
+    applyGlass();
+  });
+} }
+{ const n = $('#set-noise'); if (n) {
+  n.addEventListener('change', () => {
+    settings.noise = n.checked;
+    store.set('settings', settings);
+    applyGlass();
+  });
+} }
+// Display controls preview live; the existing change handler still autosaves.
+{ const u = $('#set-uiscale'); if (u) u.addEventListener('input', () => {
+  settings.ui_scale = Math.min(150, Math.max(80, +u.value || 100));
+  store.set('settings', settings);
+  applyUiScale();
+}); }
+{ const s = $('#set-avatar-size'); if (s) s.addEventListener('input', () => {
+  settings.avatar_px = Math.min(240, Math.max(32, +s.value || 88));
+  store.set('settings', settings);
+  applyAvatarSize();
+}); }
+// Re-pick the phone/desktop/4k file after rotation or a window resize.
+let wallpaperResizeTimer = null;
+window.addEventListener('resize', () => {
+  if (!(settings.wallpaper && settings.wallpaper.folder)) return;
+  clearTimeout(wallpaperResizeTimer);
+  wallpaperResizeTimer = setTimeout(applyWallpaper, 200);
+});
 // autosave: any change in the settings form persists (debounced)
 let settingsSaveTimer = null;
 function scheduleSettingsSave() {
@@ -2602,9 +2733,11 @@ if (_loginForm) _loginForm.addEventListener('submit', (e) => { e.preventDefault(
 if ($('#btn-logout')) $('#btn-logout').onclick = doLogout;
 async function init() {
   applyTheme(); // before auth gate so the login screen already wears it
+  applyGlass();
   applyNavCollapsed();
   if (!(await bootAuth())) return; // gate: stop booting until logged in
   applyTheme();
+  applyGlass();
   applyNavCollapsed();
   fillSettingsForm();
   applyUiScale();

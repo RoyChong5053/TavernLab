@@ -16,6 +16,8 @@
 <script src="vendor/highlight.min.js"></script>
 </head>
 <body>
+<div id="bg-wallpaper" aria-hidden="true"></div>
+<div id="bg-scrim" aria-hidden="true"></div>
 <svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
   <defs>
     <symbol id="i-chat" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></symbol>
@@ -265,6 +267,61 @@
     <section class="page" id="page-settings">
       <h2>Settings</h2>
       <div class="glass pad form">
+        <b>Appearance</b>
+        <p class="meta">Theme, wallpaper and glass are grouped here so they cannot fight. Changes apply immediately and are stored in this browser only.</p>
+        <div class="row">
+          <label>Theme <select id="set-theme">
+            <option value="st-dark">ST dark (default)</option>
+            <option value="tavern-glass">Tavern glass (legacy)</option>
+            <option value="paper">Paper (light)</option>
+            <option value="custom">Custom…</option>
+          </select></label>
+          <label class="meta"><input type="checkbox" id="set-noise" checked> Film grain</label>
+        </div>
+        <div id="theme-custom" class="row hidden">
+          <label>Background <input type="color" data-themek="--bg" value="#23262d"></label>
+          <label>Card <input type="color" data-themek="--card" value="#2e3138"></label>
+          <label>Text <input type="color" data-themek="--txt" value="#e6e8eb"></label>
+          <label>Accent <input type="color" data-themek="--acc" value="#7dd3fc"></label>
+        </div>
+        <div class="setting-group">
+          <div class="setting-title">Wallpaper</div>
+          <div class="row">
+            <label>Style
+              <select id="set-wallpaper-mode">
+                <option value="cover">Fill (cover)</option>
+                <option value="contain">Best fit (contain)</option>
+                <option value="center">Center (native size)</option>
+                <option value="repeat">Tiled</option>
+              </select>
+            </label>
+            <label>Dim <input id="set-wallpaper-dim" type="range" min="0" max="100" step="1" value="30"> <output id="wallpaper-dim-out">30%</output></label>
+          </div>
+          <div id="wallpaper-thumbs" class="wallpaper-grid">
+            <span class="meta">Loading wallpapers…</span>
+          </div>
+          <span id="wallpaper-state" class="meta"></span>
+          <p class="meta">The dim layer uses your background colour, so the wallpaper and the background colour work together instead of overriding each other. Images come from the project's <code>wallpaper/</code> folder (one folder per wallpaper; multiple files = phone/desktop/4k variants).</p>
+        </div>
+        <div class="setting-group">
+          <div class="setting-title">Glass</div>
+          <div class="row">
+            <label>Opacity <input id="set-glass-alpha" type="range" min="0" max="100" step="1" value="12"> <output id="glass-alpha-out">12%</output></label>
+            <label>Blur <input id="set-glass-blur" type="range" min="0" max="32" step="1" value="16"> <output id="glass-blur-out">16px</output></label>
+          </div>
+          <p class="meta">Opacity 0% = fully transparent, 100% = thickest frost. Blur 0 = no frosted backdrop.</p>
+          <p id="glass-hint" class="meta hidden">Paper is an opaque theme: glass opacity and blur are disabled.</p>
+        </div>
+        <div class="setting-group">
+          <div class="setting-title">Display</div>
+          <div class="row">
+            <label>UI scale <input id="set-uiscale" type="number" min="80" max="150" value="100" style="width:64px"> %</label>
+            <label>Chat avatar size <input id="set-avatar-size" type="number" min="32" max="240" value="88" style="width:64px"> px <span class="meta">(desktop)</span></label>
+          </div>
+        </div>
+      </div>
+      <div class="glass pad form">
+        <b>Server &amp; context</b>
         <label>Upstream One-API <input id="set-upstream" size="30" placeholder="http://192.168.10.2:3000" autocomplete="off"></label>
         <label>API Key <input id="set-apikey" type="password" size="30" placeholder="empty = keep current" autocomplete="new-password"></label>
         <span id="set-key-state" class="meta"></span>
@@ -275,36 +332,16 @@
         </div>
         <p class="meta">Input budget = context window − reply reserve (e.g. 16384 − 4096 = 12288). Locked modules are placed first; RAG and chat are evicted by tier.</p>
         <label><input type="checkbox" id="set-sanitize"> Clean symbols (emoji/kaomoji/decorative) from API context — stops local-model overfitting. chat.jsonl and the chat view are untouched; the audit shows what was stripped.</label>
-        <div class="row">
-          <label>UI scale <input id="set-uiscale" type="number" min="80" max="150" value="100" style="width:64px"> % (stored locally)</label>
-        </div>
-        <div class="row">
-          <label>Theme <select id="set-theme">
-            <option value="st-dark">ST dark (default)</option>
-            <option value="tavern-glass">Tavern glass (legacy)</option>
-            <option value="paper">Paper (light)</option>
-            <option value="custom">Custom…</option>
-          </select> (stored locally)</label>
-        </div>
-        <div id="theme-custom" class="row hidden">
-          <label>Background <input type="color" data-themek="--bg" value="#23262d"></label>
-          <label>Card <input type="color" data-themek="--card" value="#2e3138"></label>
-          <label>Text <input type="color" data-themek="--txt" value="#e6e8eb"></label>
-          <label>Accent <input type="color" data-themek="--acc" value="#7dd3fc"></label>
-        </div>
         <label>Reranker (expression) <input id="set-rerank" size="26" value="http://127.0.0.1:11437"></label>
         <label>Main model <select id="set-model" style="max-width:230px"></select> (shared with the App, stored server-side)</label>
         <label><input type="checkbox" id="set-stream"> Streaming output</label>
         <label>Show latest <input id="set-visible" type="number" value="10" min="5" max="200" style="width:60px"> turns (display window; context is unaffected)</label>
-        <div class="row">
-          <label>Chat avatar size <input id="set-avatar-size" type="number" min="32" max="240" value="88" style="width:64px"> px</label>
-        </div>
         <label>My name on export <input id="set-user" size="12" placeholder="RoyChong" autocomplete="off"></label>
         <div class="row">
           <img id="user-avatar-preview" class="avatar sq" alt="My avatar" style="width:64px;height:64px">
           <label class="filebtn">Upload my avatar <input type="file" id="user-avatar-file" accept=".webp,.png,.jpg,.jpeg,.gif" hidden></label>
           <button id="btn-user-avatar-del" class="danger">Delete</button>
-          <span class="meta">Shown left of each message; falls back to the name's initial.</span>
+          <span class="meta">Shown at the left of each message on desktop; falls back to the name's initial.</span>
         </div>
         <div class="row"><button id="btn-settings-save" class="primary">Save preferences</button><button id="btn-models-refresh">Refresh models</button></div>
         <p class="meta">upstream / key / current_char live in the backend data/settings.json (0600, not in git); the rest is stored in browser localStorage.</p>
@@ -316,24 +353,6 @@
           <button id="btn-export">📥 Export md</button>
           <button id="btn-export-all">📥 Export all archives + current</button>
           <button id="btn-archive">🗃 Archive & new floor</button>
-        </div>
-      </div>
-      <div class="glass pad form">
-        <b>Wallpaper</b>
-        <p class="meta">Background behind the chat. Images are read from the project's <code>wallpaper/</code> folder (one wallpaper per subfolder; multiple files = resolution variants). Stored in this browser only.</p>
-        <div class="row">
-          <label>Style
-            <select id="set-wallpaper-mode">
-              <option value="cover">Fill (cover)</option>
-              <option value="contain">Best fit (contain)</option>
-              <option value="center">Center (native size)</option>
-              <option value="repeat">Tiled</option>
-            </select>
-          </label>
-          <span id="wallpaper-state" class="meta"></span>
-        </div>
-        <div id="wallpaper-thumbs" class="wallpaper-grid">
-          <span class="meta">Loading wallpapers…</span>
         </div>
       </div>
       <div class="glass pad form">
