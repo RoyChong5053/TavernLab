@@ -298,12 +298,12 @@ body[data-theme="tavern-glass"] .msg.user{background:linear-gradient(180deg,rgba
   body.nav-collapsed .side-foot{display:flex}
   body.nav-collapsed .nav button{justify-content:flex-start;padding:9px 12px}
   .nav-toggle{display:none}
-  .content{width:100%;padding:0}
+  .content{width:100%;padding:0;padding-left:calc(env(safe-area-inset-left,0px) + 60px)}
   .page:not(#page-chat){padding:12px 10px calc(24px + env(safe-area-inset-bottom,0px))}
   .model-banner{margin:8px 10px 0}
   #page-chat .chat-head{margin-top:0}
   /* Flat app bar: safe-area top, room for the hamburger, one hairline. */
-  .chat-head{background:transparent;border:none;border-bottom:1px solid var(--line);border-radius:0;box-shadow:none;flex-wrap:nowrap;padding:calc(env(safe-area-inset-top,0px) + 8px) 12px 8px calc(env(safe-area-inset-left,0px) + 52px)}
+  .chat-head{background:transparent;border:none;border-bottom:1px solid var(--line);border-radius:0;box-shadow:none;flex-wrap:nowrap;padding:calc(env(safe-area-inset-top,0px) + 8px) 12px 8px calc(env(safe-area-inset-left,0px) + 60px)}
   #chat-char-name{font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   /* The message list is the page, not a card inside a card. */
   .chat-box{background:transparent;border:none;border-radius:0;box-shadow:none;backdrop-filter:none;-webkit-backdrop-filter:none;padding:8px 12px}
