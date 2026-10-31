@@ -38,7 +38,7 @@ body.no-noise::before{display:none}
 #bg-wallpaper{z-index:-2;background-position:center;background-repeat:no-repeat;background-size:cover}
 #bg-scrim{z-index:-1;background:rgb(var(--bg-rgb));opacity:0;transition:opacity .2s ease}
 body.has-wallpaper #bg-scrim{opacity:var(--wall-dim)}
-#app{position:relative;z-index:1}
+#app{position:relative}
 #hamburger{display:none;position:fixed;top:10px;left:10px;z-index:50}
 .nav-backdrop{position:fixed;inset:0;z-index:39;background:rgba(0,0,0,.5)}
 .nav-backdrop.hidden{display:none}
@@ -288,7 +288,7 @@ body[data-theme="tavern-glass"] .msg.user{background:linear-gradient(180deg,rgba
   #hamburger{display:block;top:calc(10px + env(safe-area-inset-top,0px));left:calc(10px + env(safe-area-inset-left,0px))}
   /* App-style shell: no outer padding, so the chat is edge-to-edge. */
   .shell{padding:0;gap:0}
-  .sidebar{position:fixed;z-index:40;top:0;left:0;bottom:0;border-radius:0;transform:translateX(-110%);transition:.2s;background:rgba(var(--bg-rgb),.96)}
+  .sidebar{position:fixed;z-index:40;top:0;left:0;bottom:0;border-radius:0;transform:translateX(-110%);transition:.2s}
   body.nav-open .sidebar{transform:none}
   /* 移动端抽屉忽略桌面收起态：始终完整显示 */
   body.nav-collapsed .sidebar{width:var(--sidebar-w);padding:14px}
